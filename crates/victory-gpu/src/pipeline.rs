@@ -131,11 +131,11 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data)
+    let used = match victory_shader::program_part(&c) {
+        Some(part) => victory_shader::native_programs(part)
             .map_err(|e| e.to_string())?
             .into_iter()
             .find(|p| {
