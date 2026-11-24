@@ -7174,8 +7174,10 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
-            let zero = self.s.m.f32(0);
-            vals.resize(4, zero);
+            if vals.len() < 4 {
+                let zero = self.s.m.f32(0);
+                vals.resize(4, zero);
+            }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
