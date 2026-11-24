@@ -135,11 +135,15 @@ pub(crate) fn pipeline(
 }
 
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and `SAVE_EVERY` has passed (or `now`). Without a library
+/// (the host refuses one: vkd3d-proton under Wine) the early list is still
+/// written: before, it never was, so every run made all of the world's
+/// ~1,600 pipelines during its first minutes of frames (waiting up to half
+/// a second a frame for them) instead of during loading.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -147,34 +151,41 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let blob = {
-        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !USED_CHANGED.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
-        };
-        match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                bytes
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
+    let blob = match library() {
+        Some(library) => {
+            let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+            if l.added == 0 && !USED_CHANGED.swap(false, Ordering::Relaxed) {
                 return;
             }
+            // SAFETY: a buffer of the size the library asks for.
+            let bytes = unsafe {
+                let mut bytes = vec![0u8; l.library.GetSerializedSize()];
+                l.library.Serialize(&mut bytes).map(|()| bytes)
+            };
+            match bytes {
+                Ok(bytes) => {
+                    l.added = 0;
+                    Some(bytes)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "host pipeline library not serialised");
+                    return;
+                }
+            }
         }
+        None if USED_CHANGED.swap(false, Ordering::Relaxed) => None,
+        None => return,
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+        .and_then(|()| match &blob {
+            Some(blob) => write_atomically(&dir.join(LIBRARY_FILE), blob),
+            None => Ok(()),
+        })
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
-            bytes = blob.len(),
+            bytes = blob.as_ref().map_or(0, Vec::len),
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
