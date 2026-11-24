@@ -311,7 +311,8 @@ pub fn translate_with(container: &[u8], opts: Options) -> Result<HostShader, Sha
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    crate::unspill::unspill(&mut p, &native.layout, native.stage);
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
