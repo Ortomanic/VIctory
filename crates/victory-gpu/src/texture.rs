@@ -204,13 +204,22 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+            #[cfg(feature = "diagnostics")]
+            tex_us(crate::copystat::C::TexReadUs, started);
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
-        if !committed(self.memory, size) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let is_committed = committed(self.memory, size);
+        #[cfg(feature = "diagnostics")]
+        tex_us(crate::copystat::C::TexQueryUs, started);
+        if !is_committed {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -222,7 +231,11 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let hash = blake3::hash(tiled);
+        #[cfg(feature = "diagnostics")]
+        tex_us(crate::copystat::C::TexHashUs, started);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -246,7 +259,11 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         DETILED.with_borrow_mut(|scratch| self.detile_through(tiled, scratch));
+        #[cfg(feature = "diagnostics")]
+        tex_us(crate::copystat::C::TexDetileUs, started);
     }
 
     /// [`Staging::detile`] with the thread's scratch borrowed.
@@ -285,6 +302,11 @@ impl Staging {
             }
         }
     }
+}
+
+#[cfg(feature = "diagnostics")]
+fn tex_us(c: crate::copystat::C, started: std::time::Instant) {
+    crate::copystat::add(c, started.elapsed().as_micros() as u64);
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
