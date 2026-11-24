@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -43,6 +43,14 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The wave size the program declares (`WaveSize`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub wave_size: Option<u32>,
+    /// A console wave64 compute program runs in host waves of 32
+    /// ([`Split`]).
+    pub split: bool,
+    /// Split lowering met an operation that needs the whole console wave.
+    split_refused: Option<Why>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -56,6 +64,25 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// The host has no 64-lane compute waves ([`super::Options`]).
+    pub host_wave32: bool,
+}
+
+/// A console wave64 compute program on a host without 64-lane waves
+/// (`docs/wave64-on-wave32.md`): each console wave runs as two host waves of
+/// 32 ("halves"), no `WaveSize(64)`. Only programs whose cross-lane
+/// operations stay within 32 lanes are split; lowering an operation that
+/// needs the whole console wave (a ballot read as a number, `v_readlane`, a
+/// wave reduction or prefix) refuses the split, and the program is lowered
+/// again as before (`WaveSize(64)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Split {
+    /// Host lanes must be console lanes modulo 32 (DPP, `ds_swizzle`,
+    /// `v_permlane*`): threads are relabelled so that each host wave holds
+    /// a 32-aligned run of console thread indices, and the program declares
+    /// `WaveSize(32)`. Otherwise the console thread is the host's
+    /// (`SV_GroupIndex`) and no wave size is declared.
+    relabel: bool,
 }
 
 enum Stop {
@@ -65,9 +92,22 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    if parts.host_wave32 {
+        // Split when the program allows it; any failure of the split form
+        // falls back to the console's wave size.
+        match lower_as(parts, true) {
+            Ok(l) if l.split_refused.is_none() => return Ok(l),
+            Ok(l) if !l.split => return Ok(l),
+            _ => {}
+        }
+    }
+    lower_as(parts, false)
+}
+
+fn lower_as(parts: &Parts, split: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, split).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -189,6 +229,12 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Wave64 compute in host waves of 32 (see [`Split`]).
+    split: Option<Split>,
+    /// Split: the console thread index in the group (entry block).
+    split_flat: Option<V>,
+    /// Split: the first operation found needing the whole console wave.
+    split_refused: Option<Why>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -343,7 +389,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, split_ok: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -360,6 +406,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut split = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -400,7 +447,21 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            // LDS shared within one console wave has no barriers: both
+            // halves must be one host wave.
+            let one_wave_lds = one_wave && s.lds_dwords > 0;
+            if console_lanes && split_ok && x.native.wave64 && !one_wave_lds {
+                let relabel = insts().any(|i| {
+                    let n = i.name();
+                    n.starts_with("ds_swizzle")
+                        || n.contains("permlane")
+                        || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                });
+                split = Some(Split { relabel });
+                if relabel {
+                    s.wave_size = Some(32);
+                }
+            } else if console_lanes || one_wave_lds {
                 s.wave_size = Some(wave);
             }
         }
@@ -486,6 +547,9 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            split,
+            split_flat: None,
+            split_refused: None,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -754,6 +818,11 @@ impl<'a> Lower<'a> {
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
         }
+        if self.split.is_some() {
+            // shortcut: a reduction or prefix over 64 console lanes needs
+            // the other half's partial result (not exchanged yet).
+            return Err(self.whole_wave("a wave reduction in a split wave64 program"));
+        }
         let c = self.cur;
         let &m = self
             .x
@@ -847,6 +916,11 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        if self.split.is_some() {
+            // Before any program code: the relabelling's barrier must be
+            // reached by every thread.
+            self.split_flat();
+        }
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
@@ -902,6 +976,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        let wave_size = self.s.wave_size;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -913,6 +988,9 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            wave_size,
+            split: self.split.is_some(),
+            split_refused: self.split_refused,
         })
     }
 
@@ -1193,6 +1271,11 @@ impl<'a> Lower<'a> {
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
+            None if self.split.is_some() => {
+                // shortcut: each half would need the other's ballot
+                // (an exchange through group-shared memory; not done yet).
+                return Err(self.whole_wave("a lane mask read as data in a split wave64 program"));
+            }
             None => {
                 let at = match self.def_block.get(&lo) {
                     // Program inputs (EXEC on entry).
@@ -1646,14 +1729,18 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
-        let lane = self.s.op(
-            at,
-            "waveGetLaneIndex",
-            Attr::ReadOnly,
-            self.s.t.i32,
-            111,
-            &[],
-        );
+        let lane = if self.split.is_some() {
+            self.console_lane()
+        } else {
+            self.s.op(
+                at,
+                "waveGetLaneIndex",
+                Attr::ReadOnly,
+                self.s.t.i32,
+                111,
+                &[],
+            )
+        };
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -1873,7 +1960,11 @@ impl<'a> Lower<'a> {
             return Err("a cross-lane operation outside compute");
         }
         debug_assert!(self.s.threads.is_none() || self.console_lanes);
-        self.s.flags |= flags::WAVE_OPS;
+        // Split without relabelling: console lanes come from the thread
+        // index, so no wave operation is made for this one.
+        if !self.split.is_some_and(|s| !s.relabel) {
+            self.s.flags |= flags::WAVE_OPS;
+        }
         Ok(())
     }
 
@@ -1883,34 +1974,38 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
+        if !self.console_lanes || self.split.is_some_and(|s| !s.relabel) {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        let flat = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            i32t,
-            96,
-            &[],
-        );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
-        let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index();
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
-        self.s.flags |= flags::WAVE_OPS;
+        let f = if self.split.is_some() {
+            self.split_flat()
+        } else {
+            let flat = self.s.op(
+                e,
+                "flattenedThreadIdInGroup.i32",
+                Attr::ReadNone,
+                i32t,
+                96,
+                &[],
+            );
+            let first = self.s.op(
+                e,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[flat],
+            );
+            let wave = self.s.wave_size.expect("set with console lanes");
+            let mask = self.s.m.i32(!(wave - 1));
+            let base = self.s.m.bin(e, Bin::And, first, mask);
+            let lane = self.lane_index();
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.m.bin(e, Bin::Add, base, lane)
+        };
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
             0 => self.s.m.bin(e, Bin::URem, f, xk),
@@ -1979,6 +2074,107 @@ impl<'a> Lower<'a> {
         );
         self.flat = Some(f);
         f
+    }
+
+    /// Split: the console thread index in the group, made once in the
+    /// entry block. Without relabelling it is the host's (`SV_GroupIndex`):
+    /// nothing reads another lane, so any host wave layout will do. With
+    /// relabelling each host wave takes the next 32 console threads from a
+    /// group-shared counter (the threads of a group are interchangeable,
+    /// and the host need not form its waves from consecutive indices, as
+    /// NVIDIA does not for 3-D groups): every thread zeroes the counter, a
+    /// group barrier, then the first lane of each full wave adds 32 and the
+    /// wave takes the old value; a partial wave (at most one: the group is
+    /// not a multiple of 32 threads) takes the last threads.
+    fn split_flat(&mut self) -> V {
+        if let Some(f) = self.split_flat {
+            return f;
+        }
+        let relabel = self.split.is_some_and(|s| s.relabel);
+        let e = self.s.entry;
+        let i32t = self.s.t.i32;
+        let flat = if relabel {
+            let arr = self.s.m.array(1, i32t);
+            let g = self.s.m.global("victory_wave_counter", arr, 3);
+            let z = self.s.m.i32(0);
+            let counter = self.s.m.element(e, g, z);
+            self.s.m.store(e, counter, z);
+            let mode = self.s.m.i32(1 | 8);
+            let void = self.s.t.void;
+            self.s
+                .op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            let lane = self
+                .s
+                .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let yes = self.s.m.bool(true);
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self
+                .s
+                .op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+            let lo = self.s.m.extract(e, ballot, 0);
+            let n = self
+                .s
+                .op(e, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[lo]);
+            let k32 = self.s.m.i32(32);
+            let full = self.s.m.cmp(e, pred::EQ, n, k32);
+            let first_lane = self.s.op(
+                e,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[lane],
+            );
+            let first = self.s.m.cmp(e, pred::EQ, lane, first_lane);
+            let adds = self.s.m.bin(e, Bin::And, first, full);
+            let add = self.s.m.select(e, adds, k32, z);
+            let old = self.s.m.atomic(e, Rmw::Add, counter, add);
+            let base = self.s.op(
+                e,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[old],
+            );
+            let total = self.s.threads.expect("compute").iter().product::<u32>();
+            let total = self.s.m.i32(total);
+            let tail = self.s.m.bin(e, Bin::Sub, total, n);
+            let base = self.s.m.select(e, full, base, tail);
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.m.bin(e, Bin::Add, base, lane)
+        } else {
+            self.s.op(
+                e,
+                "flattenedThreadIdInGroup.i32",
+                Attr::ReadNone,
+                i32t,
+                96,
+                &[],
+            )
+        };
+        self.split_flat = Some(flat);
+        flat
+    }
+
+    /// The console lane (0..64 in wave64): split, the console thread index
+    /// modulo 64; else the host lane, which is the console's.
+    fn console_lane(&mut self) -> V {
+        if self.split.is_some() {
+            let f = self.split_flat();
+            let m = self.s.m.i32(63);
+            return self.s.m.bin(self.s.entry, Bin::And, f, m);
+        }
+        self.lane_index()
+    }
+
+    /// Split: `what` needs the whole console wave, so the program is
+    /// lowered again with the console's wave size ([`lower`]).
+    fn whole_wave(&mut self, what: Why) -> Why {
+        if self.split.is_some() && self.split_refused.is_none() {
+            self.split_refused = Some(what);
+        }
+        what
     }
 
     /// The console wave size.
@@ -3711,6 +3907,12 @@ impl<'a> Lower<'a> {
         if let Some((rows, banks)) = masks {
             // Row (16 lanes) and bank (4 lanes of a row) write masks.
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
+            // Rows 2 and 3 are the upper half's: the console lane.
+            let lane = if self.split.is_some() {
+                self.console_lane()
+            } else {
+                lane
+            };
             let ri = self.s.m.bin(c, Bin::LShr, lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
@@ -4214,6 +4416,11 @@ impl<'a> Lower<'a> {
                 } else {
                     self.cross_lane(false)?;
                 }
+                if self.split.is_some() {
+                    // shortcut: the lane may be in the other half (an
+                    // exchange through group-shared memory; not done yet).
+                    return Err(self.whole_wave("v_readlane in a split wave64 program"));
+                }
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
@@ -4228,7 +4435,7 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 self.cross_lane(false)?;
-                let me = self.lane_index();
+                let me = self.console_lane();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -5234,7 +5441,11 @@ impl<'a> Lower<'a> {
                 } else if self.s.mesh.is_none() {
                     self.cross_lane(false)?;
                 }
-                let lane = self.lane_index();
+                let lane = if self.mask_data == MaskData::Host {
+                    self.lane_index()
+                } else {
+                    self.console_lane()
+                };
                 let below = if name == "v_mbcnt_lo_u32_b32" {
                     lane
                 } else {
@@ -6987,6 +7198,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            host_wave32: false,
         })
         .map(|_| ())
     }
@@ -7037,6 +7249,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            host_wave32: false,
         })
     }
 
@@ -7050,6 +7263,164 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    /// Lowers a wave64 compute program of `threads` (and `lds_bytes` of
+    /// LDS) for a host with or without 64-lane waves, after checking the
+    /// instruction names `words` decode to.
+    fn lower_wave64(
+        words: &[u32],
+        names: &[&str],
+        threads: [u32; 3],
+        lds_bytes: u32,
+        host_wave32: bool,
+    ) -> super::Lowered {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let decoded: Vec<_> = crate::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.name().unwrap_or("?"))
+            .collect();
+        assert_eq!(decoded, names);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (lds_bytes / 512) << 15,
+                threads,
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 8).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            host_wave32,
+        })
+        .unwrap()
+    }
+
+    // v_mbcnt_lo_u32_b32 v1, -1, 0; v_mbcnt_hi_u32_b32 v1, -1, v1: the
+    // console lane (HLSL `WaveGetLaneIndex`).
+    const LANE_ID: [u32; 4] = [0xD765_0001, 0x0001_00C1, 0xD766_0001, 0x0002_02C1];
+    const LANE_ID_NAMES: [&str; 2] = ["v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"];
+    // v_mov_b32_dpp v1, v0 row_shr:1 row_mask:0xf bank_mask:0xf
+    const DPP_MOV: [u32; 2] = [0x7E02_02FA, 0xFF01_1100];
+
+    /// Writes `dxil` to `$VICTORY_WAVE64_DUMP/name` when that is set, for
+    /// checking with `dxv` / `dxc -dumpbin`.
+    fn dump(name: &str, dxil: &[u8]) {
+        if let Some(dir) = std::env::var_os("VICTORY_WAVE64_DUMP") {
+            std::fs::write(std::path::Path::new(&dir).join(name), dxil).unwrap();
+        }
+    }
+
+    fn with_end(words: &[u32]) -> Vec<u32> {
+        let mut w = words.to_vec();
+        w.push(S_ENDPGM);
+        w
+    }
+
+    fn names<'n>(names: &[&'n str]) -> Vec<&'n str> {
+        let mut n = names.to_vec();
+        n.push("s_endpgm");
+        n
+    }
+
+    /// The console lane id from `v_mbcnt` alone, 128 threads: on a host
+    /// with 64-lane waves the program keeps `WaveSize(64)`; on a 32-lane
+    /// host it runs split, with the console lane taken from the thread's
+    /// index in the group, and declares no wave size.
+    #[test]
+    fn a_lane_id_program_is_split_on_a_wave32_host() {
+        let words = with_end(&LANE_ID);
+        let n = names(&LANE_ID_NAMES);
+        let native = lower_wave64(&words, &n, [128, 1, 1], 0, false);
+        assert_eq!((native.wave_size, native.split), (Some(64), false));
+        let split = lower_wave64(&words, &n, [128, 1, 1], 0, true);
+        assert_eq!((split.wave_size, split.split), (None, true));
+        dump("wave64_lane_split.dxil", &split.dxil);
+        assert!(split.split_refused.is_none());
+    }
+
+    /// DPP stays within rows of 16 lanes, so it runs split too: the host
+    /// waves are relabelled to 32-aligned runs of console threads and the
+    /// program declares `WaveSize(32)`; the relabelling's counter is in the
+    /// DXIL.
+    #[test]
+    fn a_dpp_program_is_split_with_relabelled_threads() {
+        let words = with_end(&[&LANE_ID[..], &DPP_MOV[..]].concat());
+        let mut n = LANE_ID_NAMES.to_vec();
+        n.push("v_mov_b32");
+        let n = names(&n);
+        let native = lower_wave64(&words, &n, [8, 8, 4], 0, false);
+        assert_eq!((native.wave_size, native.split), (Some(64), false));
+        let split = lower_wave64(&words, &n, [8, 8, 4], 0, true);
+        assert_eq!((split.wave_size, split.split), (Some(32), true));
+        dump("wave64_dpp_split.dxil", &split.dxil);
+        dump("wave64_dpp_native.dxil", &native.dxil);
+        // A group that is not a multiple of 32 threads (one partial wave).
+        let odd = lower_wave64(&words, &n, [24, 3, 1], 0, true);
+        assert_eq!((odd.wave_size, odd.split), (Some(32), true));
+        dump("wave64_dpp_odd_split.dxil", &odd.dxil);
+    }
+
+    /// Operations that need the whole console wave refuse the split: the
+    /// program keeps `WaveSize(64)` (as on any host before).
+    #[test]
+    fn whole_wave_operations_keep_wave64() {
+        // v_readlane_b32 s0, v0, 0
+        let readlane = [0xD760_0000, 0x0001_0100];
+        // v_cmp_gt_u32 vcc, 32, v0; s_bcnt1_i32_b64 s0, vcc
+        let ballot = [0x7D88_00A0, 0xBE80_106A];
+        for (words, n) in [
+            (&readlane[..], &["v_readlane_b32"][..]),
+            (&ballot[..], &["v_cmp_gt_u32", "s_bcnt1_i32_b64"][..]),
+        ] {
+            let words = with_end(words);
+            let n = names(n);
+            let l = lower_wave64(&words, &n, [256, 1, 1], 0, true);
+            assert_eq!((l.wave_size, l.split), (Some(64), false), "{n:?}");
+        }
+    }
+
+    /// A one-wave group sharing LDS relies on the console wave's lockstep
+    /// (the console compiler leaves out barriers): never split.
+    #[test]
+    fn one_wave_lds_programs_keep_wave64() {
+        let words = with_end(&LANE_ID);
+        let n = names(&LANE_ID_NAMES);
+        let l = lower_wave64(&words, &n, [64, 1, 1], 1024, true);
+        assert_eq!((l.wave_size, l.split), (Some(64), false));
+    }
+
+    /// Programs that never needed the console's wave size are unchanged by
+    /// the host's.
+    #[test]
+    fn lane_independent_programs_are_unchanged() {
+        // v_mov_b32 v1, v0
+        let words = with_end(&[0x7E02_0300]);
+        let n = names(&["v_mov_b32"]);
+        for host_wave32 in [false, true] {
+            let l = lower_wave64(&words, &n, [64, 1, 1], 0, host_wave32);
+            assert_eq!((l.wave_size, l.split), (None, false));
+        }
+        let a = lower_wave64(&words, &n, [64, 1, 1], 0, false);
+        let b = lower_wave64(&words, &n, [64, 1, 1], 0, true);
+        assert_eq!(a.dxil, b.dxil);
     }
 
     #[test]
@@ -7140,6 +7511,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            host_wave32: false,
         }).unwrap();
 
         let container =

@@ -36,13 +36,33 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// The translation options for this host: whether it lacks 64-lane
+/// compute waves (asked of the device once; `VICTORY_HOST_WAVE32`
+/// overrides it).
+fn options() -> victory_shader::emit::Options {
+    static OPTIONS: OnceLock<victory_shader::emit::Options> = OnceLock::new();
+    *OPTIONS.get_or_init(|| {
+        if let Some(host) = crate::host::host() {
+            victory_shader::emit::set_host_wave32(host.wave32_only());
+        }
+        let options = victory_shader::emit::Options::host();
+        if options.host_wave32 {
+            tracing::info!(
+                "translating wave64 compute programs for 32-lane waves where they allow it"
+            );
+        }
+        options
+    })
+}
+
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// diagnostics build can change at run time, and the host's wave sizes).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
+        let wave32 = options().host_wave32;
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -53,6 +73,9 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                if wave32 {
+                    bytes.extend_from_slice(b"wave32");
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -70,7 +93,9 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let opts = options();
+    let translate =
+        move |c: &[u8]| victory_shader::emit::translate_with(c, opts).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),

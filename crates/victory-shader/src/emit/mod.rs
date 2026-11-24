@@ -122,6 +122,56 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// How the host runs compute waves, which decides how console wave64
+/// compute programs are emitted (see `docs/wave64-on-wave32.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Options {
+    /// The host cannot run 64-lane compute waves (D3D12
+    /// `WaveLaneCountMax < 64`, e.g. NVIDIA: 32..32). A console wave64
+    /// compute program whose cross-lane operations stay within 32 lanes is
+    /// then emitted without `WaveSize(64)` (console lane and wave ids
+    /// derived from the thread's index in the group); one that needs the
+    /// whole 64-lane wave (ballots read as numbers, lane reads, wave
+    /// reductions, barrier-less LDS in a one-wave group) keeps
+    /// `WaveSize(64)` as before, and such a host refuses it.
+    pub host_wave32: bool,
+}
+
+impl Options {
+    /// The options for this host: `VICTORY_HOST_WAVE32` when it is set
+    /// (`1` on, anything else off), else what [`set_host_wave32`] said
+    /// (off by default). The value is part of the translation, so the
+    /// shader cache must key on it (`victory-gpu`'s does).
+    pub fn host() -> Options {
+        Options {
+            host_wave32: host_wave32(),
+        }
+    }
+}
+
+/// What the device said ([`set_host_wave32`]).
+static HOST_WAVE32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator whether the host lacks 64-lane compute waves
+/// (from the device's wave lane count range); `VICTORY_HOST_WAVE32`
+/// overrides it. Call it before the first translation.
+pub fn set_host_wave32(wave32: bool) {
+    HOST_WAVE32.store(wave32, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether translations target a host without 64-lane compute waves
+/// ([`Options::host`]).
+pub fn host_wave32() -> bool {
+    parse_host_wave32(std::env::var("VICTORY_HOST_WAVE32").ok().as_deref())
+        .unwrap_or_else(|| HOST_WAVE32.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// `VICTORY_HOST_WAVE32`'s value: unset none, `1` on, anything else off.
+/// Pure, for testing.
+fn parse_host_wave32(value: Option<&str>) -> Option<bool> {
+    value.map(|v| v.trim() == "1")
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -188,6 +238,11 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with(container, Options::host())
+}
+
+/// [`translate`] for a host with the given [`Options`].
+pub fn translate_with(container: &[u8], opts: Options) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -211,10 +266,11 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track_lanes(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with(&c, &native, &p, &st, &io, &res, opts)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran, for this host
+/// ([`Options::host`]).
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -222,6 +278,19 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_with(c, native, p, st, io, res, Options::host())
+}
+
+/// [`emit`] for a host with the given [`Options`].
+pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    opts: Options,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -288,6 +357,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        host_wave32: opts.host_wave32,
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -407,6 +477,17 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn the_host_wave32_switch_parses() {
+        use super::parse_host_wave32;
+        assert_eq!(parse_host_wave32(None), None);
+        assert_eq!(parse_host_wave32(Some("1")), Some(true));
+        assert_eq!(parse_host_wave32(Some(" 1\n")), Some(true));
+        for off in ["", "0", "yes", "true", "2"] {
+            assert_eq!(parse_host_wave32(Some(off)), Some(false), "{off:?}");
+        }
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {

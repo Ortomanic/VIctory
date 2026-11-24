@@ -449,6 +449,36 @@ impl Host {
         })
     }
 
+    /// Whether the host lacks 64-lane compute waves (D3D12
+    /// `WaveLaneCountMax < 64`; NVIDIA reports 32..32): console wave64
+    /// compute programs are then translated for 32-lane waves where they
+    /// allow it (`victory_shader::emit::Options`). Logged once.
+    pub(crate) fn wave32_only(&self) -> bool {
+        static WAVE32: OnceLock<bool> = OnceLock::new();
+        *WAVE32.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            // An unanswered query: assume the console's wave size runs.
+            let wave32 = ok && options.WaveLaneCountMax != 0 && options.WaveLaneCountMax < 64;
+            tracing::info!(
+                min = options.WaveLaneCountMin,
+                max = options.WaveLaneCountMax,
+                wave32,
+                "host wave lane counts"
+            );
+            wave32
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
