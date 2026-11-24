@@ -59,6 +59,11 @@ struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
     read: Vec<u8>,
+    /// The memory was found not write-watched (views): it is hashed from
+    /// then on without asking the kernel, as a buffer's copy stops asking
+    /// (`Shadow::watched`). Hashing reads all of it, so this stays right
+    /// if the memory is remapped as anything else.
+    unwatched: bool,
 }
 
 impl Last {
@@ -395,7 +400,14 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        let watched = if last.unwatched {
+            None
+        } else {
+            let watched = crate::watch::writes(start, start + size, false);
+            last.unwatched = watched.is_none();
+            watched
+        };
+        if let Some((now, written)) = watched {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
