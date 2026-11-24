@@ -93,7 +93,7 @@ fn build(kind: ResourceType) -> HostShader {
         ]
     );
     let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let res = resource::track_lanes(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
@@ -105,6 +105,9 @@ fn build(kind: ResourceType) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave32: false,
+        root_bounds: true,
+        heap_views: super::HEAP_VIEWS,
     })
     .expect("lower");
     let shader = HostShader {
@@ -115,6 +118,9 @@ fn build(kind: ResourceType) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        bindless: 0,
+        zero_filled_phis: false,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

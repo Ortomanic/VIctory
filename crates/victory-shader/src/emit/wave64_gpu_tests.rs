@@ -285,6 +285,7 @@ fn build(words: &[u32], threads: [u32; 3], host_wave32: bool) -> (HostShader, lo
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs.clone(),
         root_srvs: lowered.root_srvs.clone(),
+        root_uavs: lowered.root_uavs.clone(),
         bindless: 0,
         zero_filled_phis: false,
     };
