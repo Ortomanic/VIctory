@@ -137,16 +137,15 @@ pub fn wave64_uniform() -> bool {
     })
 }
 
-/// `VICTORY_SMEM_HEAP_RAW=1` (diagnostics): scalar buffer loads through a
-/// descriptor fetched from the heap read its slot as a raw buffer, not
-/// through a constant buffer handle. Part of the translation: the shader
-/// cache keys on it.
+/// Scalar buffer loads through a descriptor fetched from the heap read its
+/// slot as a raw buffer, not through a constant buffer handle: the host never
+/// puts a constant buffer view in a heap slot (a title CBV becomes a raw SRV
+/// there), so a CBV handle on such a slot has the wrong descriptor type. On by
+/// default; `VICTORY_SMEM_HEAP_RAW=0` restores the CBV handle for A/B. Part of
+/// the translation: the shader cache keys on it.
 pub fn smem_heap_raw() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics")
-            && std::env::var("VICTORY_SMEM_HEAP_RAW").is_ok_and(|v| v.trim() == "1")
-    })
+    *ON.get_or_init(|| std::env::var("VICTORY_SMEM_HEAP_RAW").map_or(true, |v| v.trim() != "0"))
 }
 
 /// `VICTORY_STRICT_PHIS=1`: a program that lowers only without upstream
