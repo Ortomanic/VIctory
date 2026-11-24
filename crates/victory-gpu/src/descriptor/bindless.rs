@@ -244,9 +244,13 @@ pub(crate) fn refresh(m: &Merged, all: bool, writes: bool) {
             if !shadow.write_watched() {
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BindlessWatchedCopies, 1);
             if let Some((start, end, false)) = crate::watch::allocation(from)
                 && to <= end
             {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BindlessAheadCopies, 1);
                 let hull = hulls.entry(start).or_insert((from, to));
                 *hull = (hull.0.min(from), hull.1.max(to));
             }
@@ -276,10 +280,25 @@ pub(crate) fn refresh(m: &Merged, all: bool, writes: bool) {
             {
                 ranges_asked += 1;
             }
-            let (copied, _left) = shadow.update_if(from as usize, (to - from) as usize, &mut |a, b| {
+            let (from, to) = (from as usize, to as usize);
+            // Whole pages (within the copy): a page copied only in part
+            // stays stale, so each range's end pages were copied, and asked
+            // whether committed, at every sweep.
+            let page = crate::watch::PAGE;
+            let (start, end) = (from / page * page, to.next_multiple_of(page));
+            let (copied, _left) = shadow.update_if(start, end - start, &mut |a, b| {
                 #[cfg(feature = "diagnostics")]
                 let checking = std::time::Instant::now();
-                let ok = crate::watch::committed(a, b - a);
+                // Else the part in the range itself: next to it may lie a
+                // hole.
+                let (c, d) = (a.max(from), b.min(to));
+                let ok = if crate::watch::committed(a, b - a) {
+                    Some((a, b))
+                } else if c < d && (c, d) != (a, b) && crate::watch::committed(c, d - c) {
+                    Some((c, d))
+                } else {
+                    None
+                };
                 #[cfg(feature = "diagnostics")]
                 {
                     commit_us += checking.elapsed().as_micros() as u64;

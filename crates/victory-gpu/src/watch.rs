@@ -53,18 +53,53 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// what it writes while the submission is prepared (racing it) is found at
 /// the next submission's: the kernel's bits and the guards keep it.
 struct Epoch {
-    /// Changes at each new epoch and each forgetting, so that an asking
-    /// that raced one does not note its pages.
+    /// Changes at each new epoch.
     generation: u64,
+    /// Page ranges forgotten in this epoch (remapped, or written by us),
+    /// in order: an asking that raced some of them notes its pages but
+    /// those ([`Epoch::note`]). Under streaming (~3,000 remaps a world
+    /// frame) nearly every asking raced one, and dropping all it found
+    /// sent the epoch's later askings to the kernel again.
+    forgotten: Vec<(usize, usize)>,
     watched: BTreeMap<usize, usize>,
     guarded: BTreeMap<usize, usize>,
 }
 
 static EPOCH: Mutex<Epoch> = Mutex::new(Epoch {
     generation: 0,
+    forgotten: Vec::new(),
     watched: BTreeMap::new(),
     guarded: BTreeMap::new(),
 });
+
+impl Epoch {
+    /// Where an asking starts: the epoch and how much was forgotten.
+    fn mark(&self) -> (u64, usize) {
+        (self.generation, self.forgotten.len())
+    }
+
+    /// Notes page ranges `asked` (and whether the guards answered) as
+    /// asked in the epoch, if it is still the one of `mark`, but for the
+    /// pages forgotten since.
+    fn note(&mut self, mark: (u64, usize), asked: impl IntoIterator<Item = (usize, usize, bool)>) {
+        if self.generation != mark.0 {
+            return;
+        }
+        for (a, b, by_guard) in asked {
+            let kind = if by_guard {
+                &mut self.guarded
+            } else {
+                &mut self.watched
+            };
+            insert_merged(kind, a, b);
+        }
+        for i in mark.1..self.forgotten.len() {
+            let (a, b) = self.forgotten[i];
+            cut(&mut self.watched, a, b);
+            cut(&mut self.guarded, a, b);
+        }
+    }
+}
 
 fn epoch() -> std::sync::MutexGuard<'static, Epoch> {
     EPOCH.lock().unwrap_or_else(|e| e.into_inner())
@@ -75,6 +110,7 @@ fn epoch() -> std::sync::MutexGuard<'static, Epoch> {
 pub(crate) fn new_epoch() {
     let mut e = epoch();
     e.generation += 1;
+    e.forgotten.clear();
     e.watched.clear();
     e.guarded.clear();
 }
@@ -83,10 +119,17 @@ pub(crate) fn new_epoch() {
 /// remapped or written by us).
 fn forget_asked(first: usize, last: usize) {
     let mut e = epoch();
-    if e.watched.is_empty() && e.guarded.is_empty() {
+    if e.forgotten.len() >= 1 << 14 {
+        // Long without a submission: all forgotten, askings in flight
+        // note nothing.
+        e.generation += 1;
+        e.forgotten.clear();
+        e.watched.clear();
+        e.guarded.clear();
         return;
     }
-    e.generation += 1;
+    // Kept even if nothing is noted yet: an asking in flight may note it.
+    e.forgotten.push((first, last));
     cut(&mut e.watched, first, last);
     cut(&mut e.guarded, first, last);
 }
@@ -198,16 +241,16 @@ fn writes_in(
     let j = &mut *j;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let (gaps, generation) = if reuse {
+    let (gaps, mark) = if reuse {
         let e = epoch();
         let gaps = if guarded {
             gaps(&[&e.watched, &e.guarded], first, last)
         } else {
             gaps(&[&e.watched], first, last)
         };
-        (gaps, e.generation)
+        (gaps, e.mark())
     } else {
-        (vec![(first, last)], 0)
+        (vec![(first, last)], (0, 0))
     };
     #[cfg(feature = "diagnostics")]
     match gaps.as_slice() {
@@ -228,17 +271,7 @@ fn writes_in(
         asked.push((a, b, pages.1));
     }
     if reuse && !asked.is_empty() {
-        let mut e = epoch();
-        if e.generation == generation {
-            for (a, b, by_guard) in asked {
-                let kind = if by_guard {
-                    &mut e.guarded
-                } else {
-                    &mut e.watched
-                };
-                insert_merged(kind, a, b);
-            }
-        }
+        epoch().note(mark, asked);
     }
     #[cfg(feature = "diagnostics")]
     {
@@ -274,9 +307,9 @@ pub(crate) fn ask_ahead(start: usize, end: usize) -> bool {
     #[cfg(feature = "diagnostics")]
     crate::copystat::since(crate::copystat::C::JournalWaitUs, waiting);
     let j = &mut *j;
-    let (gaps, generation) = {
+    let (gaps, mark) = {
         let e = epoch();
-        (gaps(&[&e.watched], first, last), e.generation)
+        (gaps(&[&e.watched], first, last), e.mark())
     };
     j.asked += 1;
     let now = j.asked;
@@ -290,14 +323,9 @@ pub(crate) fn ask_ahead(start: usize, end: usize) -> bool {
         for page in pages {
             j.written.insert(page, now);
         }
-        asked.push((a, b));
+        asked.push((a, b, false));
     }
-    let mut e = epoch();
-    if e.generation == generation {
-        for (a, b) in asked {
-            insert_merged(&mut e.watched, a, b);
-        }
-    }
+    epoch().note(mark, asked);
     whole
 }
 
@@ -1085,6 +1113,59 @@ mod tests {
         assert!(after.iter().any(|&(q, w)| q == p / PAGE && w > before));
         // Not freed: the journal keeps its pages, which a test allocating
         // at the same address next would find written.
+    }
+
+    /// A bindless sweep asks the kernel once for an allocation: what was
+    /// written before is reported to the epoch's askings inside it, which
+    /// the journal answers; a write after it shows at the next epoch.
+    #[test]
+    fn allocations_asked_ahead_answer_the_epochs_askings() {
+        // SAFETY: a fresh write-watched allocation, kept (as above).
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                8 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end, view) = allocation(p + 3 * PAGE + 5).expect("allocated");
+        assert!(!view);
+        assert!(start <= p && p + 8 * PAGE <= end, "{start:#x}..{end:#x} for {p:#x}");
+        let mut answered = 0;
+        for round in 0..20u8 {
+            new_epoch();
+            let (before, _) = writes(p, p + 8 * PAGE, false).expect("watched");
+            new_epoch();
+            // SAFETY: committed pages of ours.
+            unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(round) };
+            assert!(ask_ahead(p, p + 8 * PAGE));
+            // SAFETY: as above.
+            unsafe { ((p + 6 * PAGE) as *mut u8).write_volatile(round) };
+            let (_, one) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
+            assert!(
+                one.iter().any(|&(q, w)| q == p / PAGE + 1 && w > before),
+                "a write before the asking ahead is reported"
+            );
+            let (_, six) = writes(p + 6 * PAGE, p + 7 * PAGE, false).expect("watched");
+            if !six.iter().any(|&(_, w)| w > before) {
+                // From the journal (another test's new epoch may have
+                // sent it to the kernel).
+                answered += 1;
+            }
+            new_epoch();
+            let (_, later) = writes(p + 6 * PAGE, p + 7 * PAGE, false).expect("watched");
+            assert!(
+                later.iter().any(|&(q, w)| q == p / PAGE + 6 && w > before),
+                "a write after the asking ahead is reported by the next epoch"
+            );
+        }
+        assert!(answered > 0, "askings after one ahead skipped the kernel");
+        // Memory not write-watched is not asked ahead.
+        let plain = vec![0u8; 2 * PAGE];
+        let at = plain.as_ptr() as usize;
+        assert!(!ask_ahead(at, at + 2 * PAGE));
     }
 
     /// What the allocation queries found is kept for the allocation and

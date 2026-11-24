@@ -364,18 +364,19 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        self.update_if(address, len, &mut |_, _| true).0
+        self.update_if(address, len, &mut |a, b| Some((a, b))).0
     }
 
-    /// [`Shadow::update`] copying a run of stale pages (title `[from,
-    /// to)`) only where `copy_ok` allows it (bindless ranges: only memory
-    /// all committed, asked only of what is to be copied). Pages left out
-    /// stay stale. Returns the bytes copied and the runs left out.
+    /// [`Shadow::update`] copying of a run of stale pages (title `[from,
+    /// to)`) only what `copy_ok` gives (bindless ranges: memory all
+    /// committed, asked only of what is to be copied); `None`: none of it.
+    /// Pages left out stay stale. Returns the bytes copied and the runs
+    /// left out (in whole or in part).
     pub(crate) fn update_if(
         &self,
         address: usize,
         len: usize,
-        copy_ok: &mut dyn FnMut(usize, usize) -> bool,
+        copy_ok: &mut dyn FnMut(usize, usize) -> Option<(usize, usize)>,
     ) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
@@ -424,7 +425,7 @@ impl Shadow {
         &self,
         from: usize,
         to: usize,
-        copy_ok: &mut dyn FnMut(usize, usize) -> bool,
+        copy_ok: &mut dyn FnMut(usize, usize) -> Option<(usize, usize)>,
     ) -> (usize, usize) {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
@@ -440,25 +441,24 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
-        if !copy_ok(from, to) {
-            return (0, 1);
+        match copy_ok(from, to) {
+            Some((a, b)) if a < b => (self.copy(a, b), usize::from((a, b) != (from, to))),
+            _ => (0, 1),
         }
-        self.copy(from, to);
-        (to - from, 0)
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer, each run of them only if
-    /// `copy_ok` allows (the others stay stale). Returns the bytes copied
-    /// and the runs left out.
+    /// asking), whole pages within the buffer, of each run of them what
+    /// `copy_ok` gives (the rest stays stale). Returns the bytes copied
+    /// and the runs left out (in whole or in part).
     fn copy_stale(
         &self,
         from: usize,
         to: usize,
         now: u64,
         written: &[(usize, u64)],
-        copy_ok: &mut dyn FnMut(usize, usize) -> bool,
+        copy_ok: &mut dyn FnMut(usize, usize) -> Option<(usize, usize)>,
     ) -> (usize, usize) {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -490,14 +490,16 @@ impl Shadow {
         for (first, past) in runs {
             // Cut to the range: next to it shaders may be writing the copy.
             let (a, b) = ((first * PAGE).max(from), (past * PAGE).min(to));
-            if !copy_ok(a, b) {
+            let Some((a2, b2)) = copy_ok(a, b).map(|(c, d)| (c.max(a), d.min(b))).filter(|(c, d)| c < d)
+            else {
                 left += 1;
                 continue;
-            }
-            for page in first..past {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+            };
+            left += usize::from((a2, b2) != (a, b));
+            let (a, b) = (a2, b2);
+            for page in a / PAGE..b.div_ceil(PAGE) {
+                // A page only partly copied stays stale for the rest.
+                if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= b {
                     copied[page - base] = now;
                 }
             }

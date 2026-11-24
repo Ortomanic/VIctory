@@ -181,8 +181,12 @@ pub(crate) enum C {
     BindlessAheadUs,
     BindlessKernelCalls,
     BindlessFallbackUs,
+    /// Copies of write-watched memory with ranges read, and of those the
+    /// ones in an allocation asked about ahead.
+    BindlessWatchedCopies,
+    BindlessAheadCopies,
 }
-const COUNTERS: usize = C::BindlessFallbackUs as usize + 1;
+const COUNTERS: usize = C::BindlessAheadCopies as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -455,7 +459,7 @@ pub(crate) fn log(frames: f64) {
          {:.1} merges {:.2} ms, prepared {:.2} ms \
          (copy-back of all ranges {:.2} ms, {:.1} MB compared); sweep {:.2} ms in {:.1} \
          ({:.0} ranges, {:.1} MB copied; watch {:.2} ms, {:.0} kernel calls, {:.0} ahead \
-         {:.2} ms; committed {:.2} ms, {:.0} queries; fallbacks {:.2} ms)",
+         {:.2} ms for {:.0} of {:.0} write-watched copies; committed {:.2} ms, {:.0} queries; fallbacks {:.2} ms)",
         span as f64 / 1e6,
         written as f64 / 1e6,
         c[C::BindlessReadSubmissions as usize],
@@ -474,6 +478,8 @@ pub(crate) fn log(frames: f64) {
         c[C::BindlessKernelCalls as usize],
         c[C::BindlessAheadCalls as usize],
         ms(c[C::BindlessAheadUs as usize]),
+        c[C::BindlessAheadCopies as usize],
+        c[C::BindlessWatchedCopies as usize],
         ms(c[C::BindlessCommitUs as usize]),
         c[C::BindlessCommitQueries as usize],
         ms(c[C::BindlessFallbackUs as usize]),
