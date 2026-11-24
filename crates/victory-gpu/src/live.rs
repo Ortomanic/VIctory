@@ -382,6 +382,7 @@ pub(crate) fn apply(command: &Command, frame: u64) -> Result<(), String> {
             crate::descriptor::bindless::set_every_submission(value == Some("submission"));
             String::new()
         }
+        "VICTORY_ALIAS_COPY" => crate::resource::set_alias_copy(value),
         key if STARTUP_ONLY.contains(&key) => return Err(format!("{key} is read at start only")),
         key => return Err(format!("unknown key {key}")),
     };

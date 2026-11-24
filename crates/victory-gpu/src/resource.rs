@@ -1717,6 +1717,27 @@ pub(crate) fn alias_matches(placed: &ResourceDesc, source: &ResourceDesc, whole:
         && texel(source.format) == texel(placed.format)
 }
 
+/// `VICTORY_ALIAS_COPY` ([`alias_of`]): 0 off, 1 one level and one layer
+/// only, 2 (the default, any other value) every level and layer.
+fn alias_mode(value: Option<&str>) -> u64 {
+    match value.map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 1,
+        _ => 2,
+    }
+}
+
+static ALIAS_COPY: crate::live::Number = crate::live::Number::new();
+
+/// Live controls: `VICTORY_ALIAS_COPY` from now on (placed views read
+/// after it change are filled from title memory again when off).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn set_alias_copy(value: Option<&str>) -> String {
+    let mode = alias_mode(value);
+    ALIAS_COPY.set(mode);
+    ["off", "one level and layer", "every level and layer"][mode as usize].into()
+}
+
 /// For `this`, the texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if [`alias_matches`] says the view shows it.
@@ -1734,13 +1755,11 @@ pub(crate) fn alias_matches(placed: &ResourceDesc, source: &ResourceDesc, whole:
 /// of one level and one layer.
 #[cfg(windows)]
 pub(crate) fn alias_of(this: This) -> Option<This> {
-    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_ALIAS_COPY").as_deref().map(str::trim) {
-        Ok("0") => None,
-        Ok("1") => Some(false),
-        _ => Some(true),
-    });
-    let whole = mode?;
+    let whole = match ALIAS_COPY.get(|| alias_mode(std::env::var("VICTORY_ALIAS_COPY").ok().as_deref())) {
+        0 => return None,
+        1 => false,
+        _ => true,
+    };
     if this.is_null() {
         return None;
     }
@@ -2016,6 +2035,15 @@ mod tests {
         let volume = |d: ResourceDesc| ResourceDesc { dimension: TEXTURE_3D, ..d };
         assert!(alias_matches(&volume(view(1, 8)), &volume(written(1, 8)), true), "a volume");
         assert!(!alias_matches(&volume(view(1, 8)), &written(1, 8), true), "dimensions differ");
+    }
+
+    #[test]
+    fn alias_copy_switch_values() {
+        assert_eq!(alias_mode(None), 2);
+        assert_eq!(alias_mode(Some(" 0 ")), 0);
+        assert_eq!(alias_mode(Some("1")), 1);
+        assert_eq!(alias_mode(Some("2")), 2);
+        assert_eq!(alias_mode(Some("")), 2);
     }
 
     fn heap(size: u64) -> This {
