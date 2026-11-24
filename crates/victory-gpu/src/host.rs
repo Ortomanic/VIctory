@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -379,6 +379,10 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// Its title list's tables are gone (another list took the dynamic
+    /// descriptor slots it lent back): a run does its CPU work but not
+    /// its GPU commands.
+    lost: AtomicBool,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -595,6 +599,7 @@ impl Host {
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                lost: AtomicBool::new(false),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -642,6 +647,9 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            if list.lost.load(Ordering::Relaxed) {
+                continue;
+            }
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
@@ -663,6 +671,9 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
@@ -1057,9 +1068,16 @@ impl HostList {
         }
     }
 
+    /// Whether the next run leaves out the list's GPU commands (see
+    /// `lost`).
+    pub(crate) fn set_lost(&self, lost: bool) {
+        self.lost.store(lost, Ordering::Relaxed);
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.lost.store(false, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();

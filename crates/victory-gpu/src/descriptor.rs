@@ -148,17 +148,38 @@ fn mirror(handle: u64) {
     }
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// The host view heaps' dynamic slots, summed (diagnostics): in all, taken
+/// now, the most taken at once since the last call (per heap, summed),
+/// runs taken from lent slots since the last call.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn dynamic_use() -> (u64, u64, u64, u64) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sum = (0, 0, 0, 0);
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        if let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() {
+            let (all, now, high, stolen) = host.dynamic_use();
+            sum.0 += u64::from(all);
+            sum.1 += u64::from(now);
+            sum.2 += u64::from(high);
+            sum.3 += stolen;
+        }
+    }
+    sum
+}
+
+/// Runs `f` on the host heap behind the title heap at `heap`, if that heap
+/// still exists (its dynamic slots: given back, lent, reclaimed).
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn with_host_heap<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) -> Option<R> {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        return Some(f(host));
     }
+    None
 }
 
 #[cfg(windows)]

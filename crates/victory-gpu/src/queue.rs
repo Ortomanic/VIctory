@@ -123,7 +123,18 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
+        // Each list once: its dynamic descriptor slots taken back if it
+        // ran before, and lent back once this run has finished.
+        let mut once: Vec<This> = lists.iter().copied().filter(|l| !l.is_null()).collect();
+        once.sort_unstable();
+        once.dedup();
+        for &l in &once {
+            crate::list::with_state_pub(l, |host, state| host.set_lost(!state.before_run()));
+        }
         host.execute(&host_lists);
+        for &l in &once {
+            crate::list::with_state_pub(l, |_, state| state.after_run());
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);

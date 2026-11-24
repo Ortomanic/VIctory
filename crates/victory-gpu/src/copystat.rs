@@ -385,6 +385,21 @@ pub(crate) fn log(frames: f64) {
         at(C::RecFinds),
         us(C::RecFindUs),
     );
+    // Dynamic descriptor slots (tables made afresh): how many are taken
+    // and how they come back.
+    let [lent, reclaimed, lost, unmade] = crate::draw::take_slot_stats();
+    let (all, now, high, stolen) = crate::descriptor::dynamic_use();
+    tracing::info!(
+        "dynamic descriptor slots: {all} in all, {now} taken now, at most {high} at once; per \
+         frame {:.0} lent back after runs, {:.1} lent runs taken back, {:.1} runs taken from lent \
+         slots, {:.1} lists not run (lent slots taken), {:.1} draws and dispatches dropped (a \
+         table not made)",
+        lent as f64 / frames,
+        reclaimed as f64 / frames,
+        stolen as f64 / frames,
+        lost as f64 / frames,
+        unmade as f64 / frames,
+    );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

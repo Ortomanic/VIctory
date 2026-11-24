@@ -19,9 +19,6 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
-    dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -30,7 +27,9 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Which dynamic slots are taken (by lists not yet reset).
+    /// Dynamic slots past the mirrored ones (view heaps; 0 for samplers).
+    dynamic: u32,
+    /// Which dynamic slots are taken (by lists not yet run, or running).
     next: Mutex<Slots>,
 }
 
@@ -39,20 +38,44 @@ pub(crate) struct HostHeap {
 /// world frame takes thousands of runs, and when the slots ran short a
 /// slot-by-slot search of all 65,536 under the heap's lock cost recording
 /// threads up to ~0.1 ms per table.
+///
+/// A list's slots are taken while it is recorded and while it runs, and
+/// lent back once its submission has finished (`lend`): a title may run a
+/// closed list again without recording it, so a lent run keeps its
+/// descriptors (and its owner token) until another list needs the slots.
+/// Free slots nobody lent are taken first; lent ones only when those run
+/// short. A list run again takes its lent slots back (`reclaim`) if nobody
+/// took them since.
 struct Slots {
     next: usize,
     taken: Vec<u64>,
+    /// Free slots whose descriptors a list that has run still owns.
+    lent: Vec<u64>,
+    /// The token of the run last taken at each slot (0: none).
+    owner: Vec<u32>,
+    /// The last token handed out.
+    token: u32,
     len: usize,
     free: usize,
+    /// Diagnostics: the most slots taken at once, since the last ask.
+    high: usize,
+    /// Runs taken from lent slots (the lender can no longer run again).
+    stolen: u64,
 }
 
 impl Slots {
     fn new(n: usize) -> Slots {
+        let words = n.div_ceil(64);
         Slots {
             next: 0,
-            taken: vec![0; n.div_ceil(64)],
+            taken: vec![0; words],
+            lent: vec![0; words],
+            owner: vec![0; n],
+            token: 0,
             len: n,
             free: n,
+            high: 0,
+            stolen: 0,
         }
     }
 
@@ -61,16 +84,81 @@ impl Slots {
         self.taken[at / 64] >> (at % 64) & 1 == 1
     }
 
+    #[cfg(test)]
+    fn is_lent(&self, at: usize) -> bool {
+        self.lent[at / 64] >> (at % 64) & 1 == 1
+    }
+
+    fn set_lent(&mut self, at: usize, lent: bool) {
+        let bit = 1u64 << (at % 64);
+        if lent {
+            self.lent[at / 64] |= bit;
+        } else {
+            self.lent[at / 64] &= !bit;
+        }
+    }
+
+    /// The slots of `[first, first + n)` that run `token` still owns, as
+    /// runs (the rest were taken by other lists since).
+    fn owned(&self, first: usize, n: usize, token: u32) -> impl Iterator<Item = usize> + '_ {
+        let end = (first + n).min(self.len);
+        (first.min(end)..end).filter(move |&at| self.owner[at] == token)
+    }
+
+    /// After the run's submission finished: its slots are free, but keep
+    /// its descriptors until another list needs them. Slots counted.
+    fn lend(&mut self, first: usize, n: usize, token: u32) -> usize {
+        let mine: Vec<usize> = self.owned(first, n, token).collect();
+        for &at in &mine {
+            self.mark(at, at + 1, false);
+            self.set_lent(at, true);
+        }
+        mine.len()
+    }
+
+    /// A lent run taken back for another run of its list: false if
+    /// another list took any of its slots since (their descriptors are
+    /// that list's now).
+    fn reclaim(&mut self, first: usize, n: usize, token: u32) -> bool {
+        let end = first + n;
+        if end > self.len || self.owned(first, n, token).count() != n {
+            return false;
+        }
+        if (first..end).any(|at| self.taken[at / 64] >> (at % 64) & 1 == 1) {
+            return false;
+        }
+        self.mark(first, end, true);
+        (first..end).for_each(|at| self.set_lent(at, false));
+        self.high = self.high.max(self.len - self.free);
+        true
+    }
+
+    /// The run's list was reset or released: whatever of it is still its
+    /// own is free for good.
+    fn release(&mut self, first: usize, n: usize, token: u32) {
+        let mine: Vec<usize> = self.owned(first, n, token).collect();
+        for at in mine {
+            self.mark(at, at + 1, false);
+            self.set_lent(at, false);
+            self.owner[at] = 0;
+        }
+    }
+
     /// The first run of `n` free slots inside `[lo, hi)`: its start. Runs
     /// of taken and free slots are stepped over whole (bit counts), so a
     /// search costs about a step per run, not per slot: when the slots
     /// ran short and were fragmented, a slot-by-slot search of all of them
     /// at every table cost the world's recording ~0.7 s per frame.
-    fn find(&self, lo: usize, hi: usize, n: usize) -> Option<usize> {
+    fn find(&self, lo: usize, hi: usize, n: usize, spare_lent: bool) -> Option<usize> {
         let (mut run, mut start, mut at) = (0, lo, lo);
         while at < hi {
             let bit = at % 64;
-            let word = self.taken[at / 64] >> bit;
+            let blocked = if spare_lent {
+                self.taken[at / 64] | self.lent[at / 64]
+            } else {
+                self.taken[at / 64]
+            };
+            let word = blocked >> bit;
             let avail = (64 - bit).min(hi - at);
             if word & 1 == 1 {
                 // Taken slots from `at` on.
@@ -113,15 +201,42 @@ impl Slots {
     /// `n` consecutive free slots, taken: the first's index. Searched from
     /// where the last search ended on, then from the start; a run does not
     /// wrap past the end.
+    #[cfg(test)]
     fn take(&mut self, n: usize) -> Option<usize> {
+        self.take_run(n).map(|(first, _)| first)
+    }
+
+    /// [`Slots::take`], with the run's owner token. Slots nobody lent
+    /// first; lent ones (their lenders' descriptors overwritten) only when
+    /// no run of those fits.
+    fn take_run(&mut self, n: usize) -> Option<(usize, u32)> {
         let end = self.len;
         if n == 0 || n > self.free {
             return None;
         }
-        let first = self.find(self.next, end, n).or_else(|| self.find(0, self.next, n))?;
+        let next = self.next;
+        let first = match self
+            .find(next, end, n, true)
+            .or_else(|| self.find(0, next, n, true))
+        {
+            Some(first) => first,
+            None => {
+                let first = self
+                    .find(next, end, n, false)
+                    .or_else(|| self.find(0, next, n, false))?;
+                self.stolen += 1;
+                first
+            }
+        };
         self.mark(first, first + n, true);
+        self.token = self.token.wrapping_add(1).max(1);
+        for at in first..first + n {
+            self.set_lent(at, false);
+            self.owner[at] = self.token;
+        }
         self.next = (first + n) % end;
-        Some(first)
+        self.high = self.high.max(self.len - self.free);
+        Some((first, self.token))
     }
 }
 
@@ -155,14 +270,32 @@ const PORTABLE_VIEWS: u32 = victory_shader::emit::HEAP_VIEWS;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
-/// took until it is reset (its submissions have run) or released.
-/// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
-/// each a device removal shortly after; #59).
-const DYNAMIC: u32 = 1 << 18;
+/// took until its submission has run (then lends them back, see
+/// [`Slots`]), and gives them back for good when it is reset or released.
+/// At least this many; when the host's heap limit is above the portable
+/// one, all the room past the mirrored title slots.
+const DYNAMIC: u32 = 1 << 16;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
+/// The host's largest shader-visible view heap (D3D12 options 19), or the
+/// portable limit if the host does not say. vkd3d-proton with
+/// `VK_EXT_descriptor_heap` reports what the driver's heap holds (RTX
+/// 5080, driver 620: 1,041,451); without it, 1,000,000.
+fn max_views(device: &ID3D12Device) -> u32 {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    // SAFETY: the query writes its own structure of the given size.
+    let ok = unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .is_ok()
+    };
+    let max = if ok { options.MaxViewDescriptorHeapSize } else { 0 };
+    tracing::info!(max, "host view heap limit");
+    max.max(PORTABLE_VIEWS)
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -184,32 +317,47 @@ impl HostHeap {
                     })
             }
         };
-        // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
-        let (heap, count, extra) = if sampler {
-            match make(count) {
-                Ok(heap) => (heap, count, 0),
+        let mut extra = if sampler { 0 } else { DYNAMIC };
+        let max = if sampler { u32::MAX } else { max_views(&host.device) };
+        let (heap, count) = if count.saturating_add(extra) <= max {
+            match make(count + extra) {
+                Ok(heap) => (heap, count),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
-            (heap, count, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+            // shortcut: descriptors past the host's limit are left out (the
+            // tables reaching them are made afresh in dynamic slots); a title
+            // that indexes them directly needs remapping. The title slots
+            // mirrored stay those below the portable limit less the minimum
+            // of dynamic slots (translated shaders clamp direct indices below
+            // the portable limit); a larger host heap gives the rest to
+            // dynamic slots.
+            let mirrored = count.min(PORTABLE_VIEWS - DYNAMIC);
+            let mut total = max;
+            let heap = loop {
+                match make(total) {
+                    Ok(heap) => break heap,
+                    Err(e) if total > PORTABLE_VIEWS => {
+                        tracing::warn!(error = %e, total, "host view heap refused; the portable size instead");
+                        total = PORTABLE_VIEWS;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, "no host view heap");
+                        return None;
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
-            }
+            };
+            extra = total - mirrored;
+            tracing::warn!(
+                count,
+                mirrored,
+                dynamic = extra,
+                "host view heap capped at {total}"
+            );
+            (heap, mirrored)
         };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -313,13 +461,14 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
-    pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+    /// [`HostHeap::lend`] or [`HostHeap::release`]: the first's index and
+    /// the run's owner token.
+    pub(crate) fn dynamic(&self, n: u32) -> Option<(u32, u32)> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
-        let found = self.next.lock().unwrap_or_else(|e| e.into_inner()).take(n as usize);
-        let Some(first) = found else {
+        let found = self.next.lock().unwrap_or_else(|e| e.into_inner()).take_run(n as usize);
+        let Some((first, token)) = found else {
             static MISSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let missed = MISSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if missed.is_power_of_two() {
@@ -327,7 +476,41 @@ impl HostHeap {
             }
             return None;
         };
-        Some(self.count + first as u32)
+        Some((self.count + first as u32, token))
+    }
+
+    /// The dynamic slots: in all, taken now, the most taken at once since
+    /// the last call, and runs taken from lent slots since the last call.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn dynamic_use(&self) -> (u32, u32, u32, u64) {
+        let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let now = slots.len - slots.free;
+        let high = std::mem::replace(&mut slots.high, now);
+        let stolen = std::mem::take(&mut slots.stolen);
+        (self.dynamic, now as u32, high as u32, stolen)
+    }
+
+    /// The run of `n` from `first` (an index [`dynamic`] returned with
+    /// `token`) has finished running: lent back, its descriptors kept
+    /// until another list needs the slots. The slots lent.
+    ///
+    /// [`dynamic`]: HostHeap::dynamic
+    pub(crate) fn lend(&self, first: u32, n: u32, token: u32) -> u32 {
+        let Some(at) = first.checked_sub(self.count) else {
+            return 0;
+        };
+        let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        slots.lend(at as usize, n as usize, token) as u32
+    }
+
+    /// A lent run taken back to run its list again; false if another list
+    /// took any of its slots.
+    pub(crate) fn reclaim(&self, first: u32, n: u32, token: u32) -> bool {
+        let Some(at) = first.checked_sub(self.count) else {
+            return false;
+        };
+        let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        slots.reclaim(at as usize, n as usize, token)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -337,18 +520,16 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned with `token`) for good: those another list took since it
+    /// was lent are left to that list.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, first: u32, n: u32, token: u32) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
         let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if (at as usize) < end {
-            slots.mark(at as usize, end, false);
-        }
+        slots.release(at as usize, n as usize, token);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -1209,14 +1390,58 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let a = heap.dynamic(heap.dynamic - 100).unwrap();
-        let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
+        let all = heap.dynamic;
+        let (a, ta) = heap.dynamic(all - 100).unwrap();
+        let (b, _) = heap.dynamic(60).unwrap();
+        assert_eq!((a, b), (4, 4 + all - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+        heap.release(a, 50, ta);
+        assert_eq!(heap.dynamic(50).map(|d| d.0), Some(4));
+        assert_eq!(heap.dynamic(40).map(|d| d.0), Some(4 + all - 40));
+    }
+
+    /// A run lent back keeps its slots for its list until another list
+    /// needs them: free slots nobody lent go first, then lent ones, and a
+    /// list whose lent run was taken cannot take it back.
+    #[test]
+    fn lent_slots_are_taken_last_and_reclaimed_if_untouched() {
+        let mut slots = Slots::new(256);
+        let (a, ta) = slots.take_run(100).unwrap();
+        let (b, tb) = slots.take_run(100).unwrap();
+        assert_eq!((a, b), (0, 100));
+        assert_ne!(ta, tb);
+        // Run a finished: lent, free, but not handed out while others are.
+        assert_eq!(slots.lend(a, 100, ta), 100);
+        assert_eq!(slots.free, 156);
+        assert!(slots.is_lent(0) && !slots.is_taken(0));
+        let (c, _) = slots.take_run(50).unwrap();
+        assert_eq!(c, 200);
+        assert_eq!(slots.stolen, 0);
+        // Run a again: taken back whole.
+        assert!(slots.reclaim(a, 100, ta));
+        assert!(!slots.is_lent(0) && slots.is_taken(99));
+        assert_eq!(slots.free, 6);
+        // A taken run cannot be reclaimed (it is not lent).
+        assert!(!slots.reclaim(a, 100, ta));
+        // Lent again, then needed: the 6 unlent slots are too few, so a
+        // lent run is taken.
+        slots.lend(a, 100, ta);
+        let (d, td) = slots.take_run(30).unwrap();
+        assert_eq!(slots.stolen, 1);
+        assert!(d < 100);
+        assert!(!slots.reclaim(a, 100, ta), "part of it is another run's now");
+        // Released for good: what is still a's is free and not lent; d
+        // keeps its own.
+        slots.release(a, 100, ta);
+        assert!((0..100).all(|at| !slots.is_lent(at)));
+        assert!((d..d + 30).all(|at| slots.is_taken(at) && slots.owner[at] == td));
+        assert_eq!(slots.free, 256 - 100 - 50 - 30);
+        // Lending a run another list took part of lends only its own.
+        assert_eq!(slots.lend(d, 30, td), 30);
+        assert_eq!(slots.lend(b, 100, tb), 100);
+        assert_eq!(slots.free, 256 - 50);
+        assert_eq!(slots.high, 256 - 6);
     }
 
     /// A structured view whose start in its host copy is not on an element

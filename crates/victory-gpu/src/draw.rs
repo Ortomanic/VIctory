@@ -74,17 +74,45 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap, first, count, owner
+    /// token; lent back when a run of the list has finished, given back
+    /// when the list is reset or released.
+    dynamic: Vec<(usize, u32, u32, u32)>,
+    /// Runs of the list since it was recorded.
+    runs: u32,
+    /// Whether its dynamic slots are lent back (it has run).
+    lent: bool,
+    /// Another list took some of its lent slots: its tables are gone, and
+    /// it cannot run again until it is recorded again.
+    lost: bool,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, first, n, token) in &self.dynamic {
+            crate::descriptor::with_host_heap(heap, |h| h.release(first, n, token));
         }
     }
+}
+
+/// Dynamic slots lent back by lists that ran, lent runs taken back for
+/// another run, and runs of lists not run because other lists took their
+/// lent slots, since the last call (diagnostics).
+static LENT: AtomicU64 = AtomicU64::new(0);
+static RECLAIMED: AtomicU64 = AtomicU64::new(0);
+static LOST_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// Since the last call: dynamic slots lent back, lent runs reclaimed,
+/// lists not run (their slots were taken), and draws and dispatches
+/// dropped because a table to make afresh could not be made.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn take_slot_stats() -> [u64; 4] {
+    [
+        LENT.swap(0, Ordering::Relaxed),
+        RECLAIMED.swap(0, Ordering::Relaxed),
+        LOST_RUNS.swap(0, Ordering::Relaxed),
+        UNMADE_SINCE.swap(0, Ordering::Relaxed),
+    ]
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -172,6 +200,7 @@ macro_rules! once {
 /// be made (no free dynamic slots): all, and those past the host heap.
 static UNMADE: AtomicU64 = AtomicU64::new(0);
 static UNMADE_PAST_HEAP: AtomicU64 = AtomicU64::new(0);
+static UNMADE_SINCE: AtomicU64 = AtomicU64::new(0);
 
 /// `VICTORY_KEEP_UNMADE_TABLES=1`: run such draws anyway, reading the
 /// title's slots (the behaviour before; hangs the GPU within minutes).
@@ -181,6 +210,7 @@ fn keep_unmade() -> bool {
 }
 
 fn unmade_table(past_heap: bool) {
+    UNMADE_SINCE.fetch_add(1, Ordering::Relaxed);
     let n = UNMADE.fetch_add(1, Ordering::Relaxed) + 1;
     let past = UNMADE_PAST_HEAP.fetch_add(u64::from(past_heap), Ordering::Relaxed)
         + u64::from(past_heap);
@@ -205,6 +235,45 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    /// Before the list runs: its lent dynamic slots taken back. False if
+    /// another list took some of them (the list's tables are gone): the
+    /// list must not run on the GPU.
+    pub(crate) fn before_run(&mut self) -> bool {
+        if self.lent {
+            self.lent = false;
+            for &(heap, first, n, token) in &self.dynamic {
+                let back = crate::descriptor::with_host_heap(heap, |h| h.reclaim(first, n, token));
+                if back == Some(false) {
+                    self.lost = true;
+                }
+            }
+            RECLAIMED.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.lost {
+            let n = LOST_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(n, "a list run again lost its dynamic descriptor slots: not run on the GPU");
+            }
+        }
+        !self.lost
+    }
+
+    /// After a run of the list finished on the GPU: its dynamic slots lent
+    /// back, unless it has run before since it was recorded (a list the
+    /// title runs again and again keeps them).
+    pub(crate) fn after_run(&mut self) {
+        self.runs += 1;
+        if self.runs > 1 || self.lent || self.lost {
+            return;
+        }
+        let mut lent = 0;
+        for &(heap, first, n, token) in &self.dynamic {
+            lent += crate::descriptor::with_host_heap(heap, |h| h.lend(first, n, token)).unwrap_or(0);
+        }
+        LENT.fetch_add(u64::from(lent), Ordering::Relaxed);
+        self.lent = true;
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -242,8 +311,8 @@ impl State {
             let heap: &'static crate::descriptor::Heap = crate::descriptor::heap(h as This);
             (!heap.samplers()).then(|| heap.host()).flatten().map(|host| (h, host))
         })?;
-        let first = host.dynamic(n)?;
-        self.dynamic.push((title, first, n));
+        let (first, token) = host.dynamic(n)?;
+        self.dynamic.push((title, first, n, token));
         if self.host_heaps != self.heaps {
             let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
@@ -859,7 +928,7 @@ impl State {
                 rec_timed!(RecDynamicUs);
                 host.dynamic(n)
             };
-            let Some(first) = first else {
+            let Some((first, token)) = first else {
                 unmade_table(past.contains(&slot));
                 if keep_unmade() {
                     continue;
@@ -875,7 +944,7 @@ impl State {
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, first, n, token));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
