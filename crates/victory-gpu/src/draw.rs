@@ -180,8 +180,9 @@ fn share_tables() -> bool {
 /// lists not run (their slots were taken), and draws and dispatches
 /// dropped because a table to make afresh could not be made.
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
-pub(crate) fn take_slot_stats() -> [u64; 11] {
+pub(crate) fn take_slot_stats() -> [u64; 12] {
     [
+        NULL_UAV.swap(0, Ordering::Relaxed),
         SLOT_WAITED.swap(0, Ordering::Relaxed),
         SLOT_WAIT_US.swap(0, Ordering::Relaxed),
         MADE_SHARED[0].swap(0, Ordering::Relaxed),
@@ -288,6 +289,23 @@ static UNMADE_SINCE: AtomicU64 = AtomicU64::new(0);
 fn keep_unmade() -> bool {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_UNMADE_TABLES").is_ok_and(|v| v == "1"))
+}
+
+/// Draws and dispatches dropped because a table made afresh names a UAV
+/// the shader uses that has no view of ours (the title wrote a console
+/// descriptor we never recorded), since the last call.
+static NULL_UAV: AtomicU64 = AtomicU64::new(0);
+
+/// A table to make afresh names a used UAV without a view: the host slot
+/// would be a null UAV. The world's visibility passes (compute 3cf39f44,
+/// e06a21f3: a constant buffer table whose UAV at +56 has none) then hung
+/// the GPU (Xid 109) or faulted (Xid 13) within seconds of the world, once
+/// their tables were no longer dropped for want of dynamic slots.
+fn null_uav_table() {
+    let n = NULL_UAV.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(n, "a draw or dispatch dropped: a table made afresh names a used UAV without a view");
+    }
 }
 
 fn unmade_table(past_heap: bool) {
@@ -983,6 +1001,14 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
+            let null_uav = entries.iter().any(|u| {
+                u.kind == ResourceType::Uav
+                    && crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4).is_none()
+            });
+            if null_uav && !keep_unmade() {
+                null_uav_table();
+                return None;
+            }
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
