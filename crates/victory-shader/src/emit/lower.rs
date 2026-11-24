@@ -48,6 +48,9 @@ pub(crate) struct Lowered {
     /// A console wave64 compute program runs in host waves of 32
     /// ([`Split`]).
     pub split: bool,
+    /// The uniform form ([`Split::uniform`]): control flow uniform per
+    /// console wave.
+    pub uniform: bool,
     /// Split lowering met an operation that needs the whole console wave.
     split_refused: Option<Why>,
     /// UAV handles made `globallycoherent` (read by tests).
@@ -113,6 +116,21 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    let l = lower_forms(parts)?;
+    if std::env::var_os("VICTORY_AUDIT_BARRIERS").is_some()
+        && matches!(parts.native.io, StageIo::Cs(_))
+        && !l.uniform
+        && !divergent_barriers(parts.p, parts.st).is_empty()
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "audit: a barrier under lane-divergent control flow",
+        });
+    }
+    Ok(l)
+}
+
+fn lower_forms(parts: &Parts) -> Result<Lowered, ShaderError> {
     if !parts.host_wave32 {
         return lower_as(parts, Form::Plain);
     }
@@ -370,6 +388,13 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+/// Heap indices are clamped below these (see [`Lower::heap_index`]): the
+/// most view and sampler slots a host heap has (`victory-gpu` caps its view
+/// heaps at 1,000,000, the D3D12 minimum for resource binding tier 2;
+/// sampler heaps hold at most 2,048).
+pub const HEAP_VIEWS: u32 = 1_000_000;
+pub const HEAP_SAMPLERS: u32 = 2048;
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -626,6 +651,85 @@ fn on_cycle(st: &Structured) -> Vec<bool> {
                 }
             }
             false
+        })
+        .collect()
+}
+
+/// Audit (`VICTORY_AUDIT_BARRIERS`, shader-lab): blocks holding an
+/// `s_barrier` that depend on a lane branch: between a branch on a lane
+/// condition and its immediate post-dominator (loops whose exit is a lane
+/// branch included). The console's wave runs `s_barrier` whatever EXEC is;
+/// a host thread that branches around it does not arrive, and the group
+/// waits for it until the driver resets the GPU.
+pub(crate) fn divergent_barriers(p: &Program, st: &Structured) -> Vec<usize> {
+    let n = st.exits.len();
+    let succs = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    // Post-dominator sets over blocks plus a virtual exit `n`.
+    let all: Vec<bool> = vec![true; n + 1];
+    let mut pdom: Vec<Vec<bool>> = (0..=n).map(|_| all.clone()).collect();
+    pdom[n] = (0..=n).map(|i| i == n).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            let mut s = succs(b);
+            if s.is_empty() {
+                s.push(n);
+            }
+            let mut next = all.clone();
+            for &q in &s {
+                for i in 0..=n {
+                    next[i] &= pdom[q][i];
+                }
+            }
+            next[b] = true;
+            if next != pdom[b] {
+                pdom[b] = next;
+                changed = true;
+            }
+        }
+    }
+    let lane = |when: Bool| {
+        st.bools
+            .support(when)
+            .iter()
+            .any(|a| !matches!(a, Atom::Uniform(_)))
+    };
+    let mut divergent = vec![false; n];
+    for b in 0..n {
+        let LaneExit::Branch { when, .. } = st.exits[b] else {
+            continue;
+        };
+        if !lane(when) {
+            continue;
+        }
+        // The region: reachable from the branch's targets short of the
+        // nearest strict post-dominator that every path meets.
+        let stop: Vec<bool> = (0..n).map(|q| q != b && pdom[b][q]).collect();
+        let mut stack = succs(b);
+        let mut seen = vec![false; n];
+        while let Some(q) = stack.pop() {
+            if stop[q] || std::mem::replace(&mut seen[q], true) {
+                continue;
+            }
+            divergent[q] = true;
+            stack.extend(succs(q));
+        }
+    }
+    (0..n)
+        .filter(|&b| {
+            divergent[b]
+                && p.blocks
+                    .get(b)
+                    .is_some_and(|blk| blk.insts.iter().any(|i| i.name() == "s_barrier"))
         })
         .collect()
 }
@@ -1384,6 +1488,7 @@ impl<'a> Lower<'a> {
             samplers: self.samplers,
             wave_size,
             split: self.split.is_some(),
+            uniform: self.split.is_some_and(|s| s.uniform),
             split_refused: self.split_refused,
             coherent: self.coherent_handles,
         })
@@ -4794,7 +4899,18 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        // An index from data (bindless tables, waterfall loops) can be
+        // anything; past the host heap the host reads whatever memory
+        // follows it as a descriptor (NVIDIA: MMU faults and hangs). The
+        // last slot the host can have stands in.
+        let last = self.s.m.i32(if sampler {
+            HEAP_SAMPLERS - 1
+        } else {
+            HEAP_VIEWS - 1
+        });
+        let past = self.s.m.cmp(c, pred::IUGT, index, last);
+        Ok(self.s.m.select(c, past, last, index))
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
