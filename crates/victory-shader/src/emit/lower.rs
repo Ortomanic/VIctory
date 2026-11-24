@@ -4036,6 +4036,29 @@ impl<'a> Lower<'a> {
         )))
     }
 
+    /// The byte offset of element `index` at `off` in a buffer whose
+    /// descriptor the code builds around a root descriptor; none for other
+    /// descriptors. GFX10 addresses base + offset + stride * index with
+    /// swizzling off, the stride in dword 1 bits 16-29 (the constant bits the
+    /// code sets there), swizzling in dword 1 bit 31 and the lane id added to
+    /// the index in dword 3 bit 23.
+    fn built_element(&mut self, src: &Source, index: V, off: V) -> Result<Option<V>, Why> {
+        let Source::Built { bits, words, .. } = src else {
+            return Ok(None);
+        };
+        if bits >> 31 != 0 {
+            return Err("a swizzled buffer");
+        }
+        if words[1] >> 23 & 1 != 0 {
+            return Err("a buffer indexed by lane");
+        }
+        let stride = bits >> 16 & 0x3FFF;
+        let c = self.cur;
+        let s = self.s.m.i32(stride);
+        let rows = self.s.m.bin(c, Bin::Mul, index, s);
+        Ok(Some(self.s.m.bin(c, Bin::Add, rows, off)))
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -7155,6 +7178,16 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // A dword access by index through a descriptor built in code: the
+        // stride is the code's own, so the element becomes a byte offset in
+        // the raw root view.
+        let (index, off) = match index {
+            Some(i) if !typed && format.is_none() => match self.built_element(src, i, off)? {
+                Some(byte) => (None, byte),
+                None => (Some(i), off),
+            },
+            x => (x, off),
+        };
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
@@ -7874,7 +7907,7 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
-        lowered_rsrc2(words, false, false, rsrc2).map(|_| ())
+        lower_full(words, false, false, vec![], vec![], rsrc2).map(|_| ())
     }
 
     /// The container a one-lane compute program of constants lowers to,
@@ -7895,23 +7928,36 @@ mod tests {
         wave64: bool,
         host_wave32: bool,
     ) -> Result<super::Lowered, crate::ShaderError> {
-        lowered_rsrc2(words, wave64, host_wave32, 0)
+        lower_full(words, wave64, host_wave32, vec![], vec![], 0)
     }
 
-    /// [`lowered_on`] with the compute registers `rsrc2`.
-    fn lowered_rsrc2(
+    /// Lowers a compute program with the root parameters `layout` and the
+    /// used resources `used`, two user SGPRs and 512 bytes of LDS.
+    fn lower_with(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+    ) -> Result<Lowered, crate::ShaderError> {
+        lower_full(words, false, false, layout, used, 1 << 15 | 2 << 1)
+    }
+
+    /// [`lowered_on`] with the root parameters `layout`, the used resources
+    /// `used` and the compute registers `rsrc2`.
+    fn lower_full(
         words: &[u32],
         wave64: bool,
         host_wave32: bool,
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
         rsrc2: u32,
-    ) -> Result<super::Lowered, crate::ShaderError> {
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64,
             vgprs: 256,
-            layout: vec![],
-            used: vec![],
+            layout,
+            used,
             io: StageIo::Cs(ComputeIo {
                 rsrc2,
                 threads: [1, 1, 1],
@@ -8956,6 +9002,71 @@ mod tests {
             assert_ne!(checked.dxil, unchecked.dxil, "{name}");
             dump(&format!("root_unbounded_{name}.dxil"), &unchecked.dxil);
         }
+    }
+
+    /// A dword load by index through a descriptor built around the root
+    /// descriptor in s[0:1] with dword 1 bits `hi` and dword 3 `w3`, stored
+    /// to LDS so the load is needed.
+    fn indexed_root_load(hi: u32, w3: u32) -> Result<Lowered, crate::ShaderError> {
+        let words = [
+            0x8805_FF01,
+            hi,          // s_or_b32 s5, s1, hi
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE86_03C1, // s_mov_b32 s6, -1
+            0xBE87_03FF,
+            w3, // s_mov_b32 s7, w3
+            0xE030_2000,
+            0x8001_0100, // buffer_load_dword v1, v0, s[4:7], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let root = RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 3,
+        };
+        // The container lists the root SRV without a stride.
+        let used = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 3,
+        };
+        lower_with(&words, vec![root], vec![used])
+    }
+
+    #[test]
+    fn indexed_loads_through_built_descriptors_use_their_stride() {
+        // No used-resource entry gives a stride: the descriptor's own (12,
+        // and 1 as vertex fetch builds them) addresses the root view raw.
+        for stride in [12, 1] {
+            let l = indexed_root_load(stride << 16, 0x1101_4FAC).unwrap();
+            assert_eq!(l.root_srvs, [3]);
+        }
+    }
+
+    #[test]
+    fn indexed_loads_through_swizzled_or_lane_indexed_descriptors_stop() {
+        let why = |r: Result<Lowered, crate::ShaderError>| match r {
+            Err(crate::ShaderError::Unsupported { what, .. }) => what,
+            r => panic!("{:?}", r.map(|l| l.root_srvs)),
+        };
+        assert_eq!(
+            why(indexed_root_load(0x8010_0000, 0x1101_4FAC)),
+            "a swizzled buffer"
+        );
+        assert_eq!(
+            why(indexed_root_load(0x0010_0000, 0x1181_4FAC)),
+            "a buffer indexed by lane"
+        );
     }
 
     #[test]

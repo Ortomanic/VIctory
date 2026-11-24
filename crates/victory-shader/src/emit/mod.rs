@@ -44,7 +44,9 @@
 //!   use): the host's byte length behind the address it binds (saturated
 //!   at `u32::MAX`; 0 when it binds none), for root CBVs read by row a
 //!   multiple of 16. Root CBV reads at constant offsets (the compiler's
-//!   own layout of the title's constants) are not checked.
+//!   own layout of the title's constants) are not checked. An indexed access through a
+//!   descriptor the code builds around one reads at the index times the
+//!   stride the code puts in the descriptor.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
