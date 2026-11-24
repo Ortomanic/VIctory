@@ -273,12 +273,47 @@ extern "system" fn present(
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     if crate::capture::listed(frame) {
+        if !plane_parameters.is_null() && planes <= 16 {
+            // Only the prefix is modeled by Plane; Scarlett records have a 0x48-byte stride.
+            for index in 0..planes as usize {
+                let plane = unsafe {
+                    &*plane_parameters
+                        .cast::<u8>()
+                        .add(index * 0x48)
+                        .cast::<Plane>()
+                };
+                if plane.count > 0 && !plane.resources.is_null() {
+                    // SAFETY: A nonempty plane provides at least one resource pointer.
+                    let first = unsafe { *plane.resources };
+                    tracing::info!(
+                        frame,
+                        index,
+                        planes,
+                        token = plane.token,
+                        count = plane.count,
+                        ?first,
+                        "PresentX plane"
+                    );
+                }
+            }
+        }
         crate::capture::dump_targets(frame);
     }
     #[cfg(windows)]
+    let selected_plane = if cfg!(feature = "diagnostics")
+        && planes == 2
+        && std::env::var_os("VICTORY_PRESENT_PLANE").is_some_and(|n| n == "1")
+        && !plane_parameters.is_null()
+    {
+        // A diagnostic A/B only: show the second Scarlett plane without composition.
+        unsafe { plane_parameters.cast::<u8>().add(0x48).cast::<Plane>() }
+    } else {
+        plane_parameters
+    };
+    #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
+        && let Some(plane) = unsafe { selected_plane.as_ref() }
         && plane.count > 0
         && !plane.resources.is_null()
         // SAFETY: the plane lists `count` resources.
@@ -403,7 +438,9 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
