@@ -147,8 +147,10 @@ impl Shader {
 /// hung the GPU (Xid 13 at CSComputeSkinningDefaultVelocity after
 /// CSComputeSkinningRigidVelocity, Xid 109 at CSGenerateHairIB).
 ///
-/// They run again; `VICTORY_BVH_SKINNING=0` drops them (diagnostics A/B,
-/// or if they fault the GPU again).
+/// With those views made they still fault the GPU (bindless, 2026-11-24:
+/// Xid 13 in 2 of 3 world runs within seconds of their first dispatch, 1
+/// run clean for 5.5 min), so they still do not run by default;
+/// `VICTORY_BVH_SKINNING=1` runs them.
 #[cfg(windows)]
 const BVH_SKINNING_SHADERS: [&str; 43] = [
     "81dc252c4d183e30", // CSComputeCable
@@ -198,14 +200,14 @@ const BVH_SKINNING_SHADERS: [&str; 43] = [
 
 #[cfg(windows)]
 const BVH_SKINNING: &str =
-    "BVH skinning: VICTORY_BVH_SKINNING=0 drops it (nothing on the host reads it: no ray tracing)";
+    "BVH skinning: nothing on the host reads it (no ray tracing) and it faults the GPU; VICTORY_BVH_SKINNING=1 runs it";
 
 /// Whether the shader with `hash` is one of [`BVH_SKINNING_SHADERS`] and
-/// they are not to run (`VICTORY_BVH_SKINNING=0`).
+/// they are not to run (unless `VICTORY_BVH_SKINNING=1`).
 #[cfg(windows)]
 fn bvh_skinning(hash: &str) -> bool {
     static RUN: OnceLock<bool> = OnceLock::new();
-    let run = *RUN.get_or_init(|| !std::env::var("VICTORY_BVH_SKINNING").is_ok_and(|v| v == "0"));
+    let run = *RUN.get_or_init(|| std::env::var("VICTORY_BVH_SKINNING").is_ok_and(|v| v == "1"));
     !run && BVH_SKINNING_SHADERS.contains(&hash)
 }
 
