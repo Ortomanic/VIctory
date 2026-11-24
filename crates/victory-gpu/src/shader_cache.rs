@@ -94,6 +94,10 @@ fn build() -> &'static [u8; 32] {
                     tracing::warn!("VICTORY_WAVE64_UNIFORM=0: no uniform wave64 form");
                     bytes.extend_from_slice(b"no uniform wave64");
                 }
+                if victory_shader::emit::smem_heap_raw() {
+                    tracing::warn!("VICTORY_SMEM_HEAP_RAW=1: scalar loads read heap-fetched descriptors raw");
+                    bytes.extend_from_slice(b"smem heap raw");
+                }
                 if victory_shader::emit::strict_phis() {
                     tracing::warn!("VICTORY_STRICT_PHIS=1: no zero-filled joins (#612 stopgap off)");
                     bytes.extend_from_slice(b"strict phis");

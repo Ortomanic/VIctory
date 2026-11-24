@@ -4264,8 +4264,18 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv || table_cbv(Some(u))) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        // `VICTORY_SMEM_HEAP_RAW=1` (diagnostics A/B): a descriptor of no
+        // listed kind (fetched from the heap by index) is read raw, as an
+        // SRV, or as a UAV when vector accesses write through it: the host
+        // never puts a constant buffer view in a heap slot (a title CBV
+        // becomes a raw SRV there), so a CBV handle on the slot is a
+        // descriptor of the wrong type.
+        let heap_raw = (kind.is_none() && super::smem_heap_raw())
+            .then(|| if self.written_through(src) { 11 | UAV } else { 11 });
+        if heap_raw.is_some()
+            || matches!(kind, Some(u) if u.kind == ResourceType::Srv || table_cbv(Some(u)))
+        {
+            let h = self.handle(site, src, false, (heap_raw.unwrap_or(11), 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -4943,6 +4953,23 @@ impl<'a> Lower<'a> {
         let s = self.s.m.i32(stride);
         let rows = self.s.m.bin(c, Bin::Mul, index, s);
         Ok(Some(self.s.m.bin(c, Bin::Add, rows, off)))
+    }
+
+    /// Whether a vector buffer access writes through descriptor `src`
+    /// (a store or an atomic: the heap slot is a UAV).
+    fn written_through(&self, src: &Source) -> bool {
+        self.descriptors.iter().any(|(&((b, i), sampler), &other)| {
+            !sampler
+                && other == src
+                && self.x.p.blocks[b].insts.get(i).is_some_and(|inst| {
+                    matches!(inst.fields, Fields::Buffer { .. }) && {
+                        let name = inst.name();
+                        name.starts_with("buffer_store")
+                            || name.starts_with("tbuffer_store")
+                            || name.starts_with("buffer_atomic")
+                    }
+                })
+        })
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.

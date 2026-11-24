@@ -137,6 +137,18 @@ pub fn wave64_uniform() -> bool {
     })
 }
 
+/// `VICTORY_SMEM_HEAP_RAW=1` (diagnostics): scalar buffer loads through a
+/// descriptor fetched from the heap read its slot as a raw buffer, not
+/// through a constant buffer handle. Part of the translation: the shader
+/// cache keys on it.
+pub fn smem_heap_raw() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_SMEM_HEAP_RAW").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
 /// `VICTORY_STRICT_PHIS=1`: a program that lowers only without upstream
 /// #612's transitive phi liveness is refused, as upstream does, instead of
 /// lowered with those joins zero-filled (the stopgap in `lower`). Part of
