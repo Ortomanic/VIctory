@@ -499,7 +499,12 @@ impl<'a> Lower<'a> {
             // LDS shared within one console wave has no barriers: both
             // halves must be one host wave.
             let one_wave_lds = one_wave && s.lds_dwords > 0;
-            if console_lanes && split_ok && x.native.wave64 && !one_wave_lds {
+            // A wave64 group of at most 32 threads fits one host wave of 32
+            // with every lane where the console has it (its lanes 32..63
+            // are never populated): `WaveSize(32)` is exact, no split.
+            let one_half =
+                x.host_wave32 && x.native.wave64 && cs.threads.iter().product::<u32>() <= 32;
+            if console_lanes && split_ok && x.native.wave64 && !one_wave_lds && !one_half {
                 // Exchanges between the halves need each host wave to be
                 // one half: ballots read as numbers, `v_readlane`, wave
                 // reductions and prefixes.
@@ -517,7 +522,7 @@ impl<'a> Lower<'a> {
                     s.wave_size = Some(32);
                 }
             } else if console_lanes || one_wave_lds {
-                s.wave_size = Some(wave);
+                s.wave_size = Some(if one_half { 32 } else { wave });
             }
         }
         let mut no_barrier = HashSet::new();
@@ -7841,6 +7846,22 @@ mod tests {
         let n = names(&LANE_ID_NAMES);
         let l = lower_wave64(&words, &n, [64, 1, 1], 1024, true);
         assert_eq!((l.wave_size, l.split), (Some(64), false));
+    }
+
+    /// A wave64 group of at most 32 threads is one host wave of 32 with the
+    /// console's lanes: `WaveSize(32)` on a 32-lane host, even with LDS
+    /// shared in the wave or whole-wave operations in divergent code.
+    #[test]
+    fn groups_of_one_half_declare_wave32() {
+        let words = with_end(&LANE_ID);
+        let n = names(&LANE_ID_NAMES);
+        for (threads, lds) in [([32, 1, 1], 1024), ([4, 4, 2], 0), ([1, 1, 1], 0)] {
+            let native = lower_wave64(&words, &n, threads, lds, false);
+            assert_eq!((native.wave_size, native.split), (Some(64), false));
+            let l = lower_wave64(&words, &n, threads, lds, true);
+            assert_eq!((l.wave_size, l.split), (Some(32), false), "{threads:?}");
+            dump(&format!("wave64_half_{}.dxil", threads[0]), &l.dxil);
+        }
     }
 
     /// Programs that never needed the console's wave size are unchanged by
