@@ -77,8 +77,6 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
-    /// A fresh table of the stage being bound could not be made.
-    table_failed: bool,
 }
 
 impl Drop for State {
@@ -160,6 +158,20 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Draws and dispatches dropped because a table past the host heap could
+/// not be made (no free dynamic slots).
+static UNMADE_PAST_HEAP: AtomicU64 = AtomicU64::new(0);
+
+fn unmade_past_heap() {
+    let n = UNMADE_PAST_HEAP.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            n,
+            "a draw or dispatch dropped: a table past the host heap could not be made"
+        );
+    }
 }
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -468,8 +480,8 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a table it reads could
-    /// not be made.
+    /// False when a stage's tables cannot be bound safely (see
+    /// [`State::tables`]): the draw or dispatch is dropped.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
@@ -513,19 +525,9 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
-            if self.table_failed {
-                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
-                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::warn!(
-                        dropped = n,
-                        "a draw or dispatch dropped: no dynamic slots for its tables"
-                    );
-                }
+            let Some(made) = self.tables(list, &t.used, compute) else {
                 return false;
-            }
+            };
             // Root views first: the user data holds their lengths.
             let mut lengths: Vec<(u8, u32)> = Vec::new();
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
@@ -607,6 +609,8 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -720,7 +724,17 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    ///
+    /// `None` when a table reaching past the host heap could not be made
+    /// (no free dynamic slots): the shader would index the title's slot,
+    /// past the end of the host heap, and read whatever memory follows it
+    /// as descriptors (NVIDIA: MMU faults, hangs). The draw must not run.
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+    ) -> Option<Vec<(u8, u32)>> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -728,6 +742,8 @@ impl State {
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
+        // Tables that must be made: without a host slot of their own.
+        let mut past: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -747,6 +763,7 @@ impl State {
             };
             if index >= host.count() {
                 fresh.push(u.slot);
+                past.push(u.slot);
             }
         }
         fresh.sort_unstable();
@@ -804,8 +821,10 @@ impl State {
                 // view: a texture or null descriptor read as a buffer gives
                 // a wild address on AMD and the device is removed (#59).
                 // The draw or dispatch is dropped instead.
-                self.table_failed = true;
-                continue;
+                if past.contains(&slot) {
+                    unmade_past_heap();
+                }
+                return None;
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
@@ -840,7 +859,7 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        made
+        Some(made)
     }
 
     /// The first draws, at debug level: what they bind and read

@@ -248,8 +248,11 @@ impl HostHeap {
             }
         }
         let Some(first) = found else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            static MISSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let missed = MISSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if missed.is_power_of_two() {
+                tracing::warn!(n, missed, "no free dynamic descriptor slots: a table is not made");
+            }
             return None;
         };
         taken[first..first + n].fill(true);
