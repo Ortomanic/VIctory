@@ -352,6 +352,8 @@ fn ask(
     // wineserver calls: a microsecond alone, tens to thousands of them
     // with four threads mapping views (/tmp/wwbench2 `contend`).
     let view = guarded && known_view(first * PAGE);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = ahead;
     #[cfg(feature = "diagnostics")]
     if view {
         crate::copystat::add(crate::copystat::C::KernelSkips, 1);
@@ -1159,6 +1161,30 @@ mod tests {
         assert!(after.iter().any(|&(q, w)| q == p / PAGE && w > before));
         // Not freed: the journal keeps its pages, which a test allocating
         // at the same address next would find written.
+    }
+
+    /// A pass's region queries answer its later checks in the same regions,
+    /// committed or not.
+    #[test]
+    fn a_pass_keeps_the_regions_it_queried() {
+        // SAFETY: a fresh reservation with its first two blocks committed,
+        // freed at the end.
+        let p = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!p.is_null());
+            assert!(!VirtualAlloc(p, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            p as usize
+        };
+        let mut pass = Regions::new();
+        assert_eq!(committed_in(p + 8, PAGE, Some(&mut pass)), (true, true));
+        assert!(pass.values().any(|&(_, committed)| committed));
+        // Inside what was found: no query.
+        assert_eq!(committed_in(p + PAGE, PAGE, Some(&mut pass)), (true, false));
+        assert_eq!(committed_in(p + PAGE, 2 * PAGE, Some(&mut pass)), (false, true));
+        assert!(pass.values().any(|&(_, committed)| !committed));
+        assert_eq!(committed_in(p + 3 * PAGE, 8, Some(&mut pass)), (false, false));
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A bindless sweep asks the kernel once for an allocation: what was
