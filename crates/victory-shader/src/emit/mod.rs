@@ -409,9 +409,21 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] for a host with the given [`Options`].
 pub fn translate_with(container: &[u8], opts: Options) -> Result<HostShader, ShaderError> {
+    translate_patched(container, opts, &[])
+}
+
+/// [`translate_with`] with console code words replaced first, each
+/// `(byte offset in the program's code, old word, new word)`; an old word
+/// that is not there fails the translation. For diagnostics only
+/// (`victory-gpu`'s `VICTORY_PATCH_CODE`), e.g. a culling test forced true.
+pub fn translate_patched(
+    container: &[u8],
+    opts: Options,
+    patches: &[(usize, u32, u32)],
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let part = crate::program_part(&c).ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(part)?
+    let mut native = crate::native_programs(part)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -423,6 +435,13 @@ pub fn translate_with(container: &[u8], opts: Options) -> Result<HostShader, Sha
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    for &(at, old, new) in patches {
+        let word = native.code.get(at..at + 4).ok_or(ShaderError::Malformed("patch past the code"))?;
+        if u32::from_le_bytes(word.try_into().unwrap()) != old {
+            return Err(ShaderError::Malformed("patch: old word not found"));
+        }
+        native.code[at..at + 4].copy_from_slice(&new.to_le_bytes());
+    }
     let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     crate::unspill::unspill(&mut p, &native.layout, native.stage);
     // Structurisation first: tracing per-lane descriptors needs it (its

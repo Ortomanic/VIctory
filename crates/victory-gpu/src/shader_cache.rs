@@ -39,7 +39,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// The translation options for this host: whether it lacks 64-lane
 /// compute waves (asked of the device once; `VICTORY_HOST_WAVE32`
 /// overrides it).
-fn options() -> victory_shader::emit::Options {
+pub(crate) fn options() -> victory_shader::emit::Options {
     static OPTIONS: OnceLock<victory_shader::emit::Options> = OnceLock::new();
     *OPTIONS.get_or_init(|| {
         if let Some(host) = crate::host::host() {

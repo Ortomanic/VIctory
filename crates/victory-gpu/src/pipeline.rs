@@ -107,8 +107,12 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                let patches = code_patches(&self.hash);
                 let done = if bvh_skinning(&self.hash) {
                     Err(BVH_SKINNING.to_owned())
+                } else if !patches.is_empty() {
+                    tracing::warn!(hash = %self.hash, ?patches, "VICTORY_PATCH_CODE: console words replaced");
+                    translate_patched(&self.container, &patches)
                 } else {
                     translate(&self.container)
                 };
@@ -218,6 +222,62 @@ fn bvh_skinning(hash: &str) -> bool {
     static RUN: OnceLock<bool> = OnceLock::new();
     let run = *RUN.get_or_init(|| std::env::var("VICTORY_BVH_SKINNING").is_ok_and(|v| v == "1"));
     !run && BVH_SKINNING_SHADERS.contains(&hash)
+}
+
+/// With the `diagnostics` feature, `VICTORY_PATCH_CODE` replaces console
+/// code words before translation: `hash@offset=old>new` entries (hex: the
+/// 16-digit shader hash, the byte offset in its code as shader-lab's `.s`
+/// listing gives it, the words), separated by commas. E.g. a culling
+/// shader's visibility test forced true, to see what culling removes.
+/// Patched shaders bypass the shader cache.
+#[cfg(windows)]
+fn code_patches(hash: &str) -> Vec<(usize, u32, u32)> {
+    static ALL: OnceLock<Vec<(String, usize, u32, u32)>> = OnceLock::new();
+    let all = ALL.get_or_init(|| {
+        if !cfg!(feature = "diagnostics") {
+            return Vec::new();
+        }
+        let value = std::env::var("VICTORY_PATCH_CODE").unwrap_or_default();
+        value
+            .split(',')
+            .filter(|e| !e.trim().is_empty())
+            .filter_map(|e| {
+                let parse = || {
+                    let (hash, rest) = e.trim().split_once('@')?;
+                    let (at, words) = rest.split_once('=')?;
+                    let (old, new) = words.split_once('>')?;
+                    Some((
+                        hash.to_ascii_lowercase(),
+                        usize::from_str_radix(at.trim_start_matches("0x"), 16).ok()?,
+                        u32::from_str_radix(old.trim_start_matches("0x"), 16).ok()?,
+                        u32::from_str_radix(new.trim_start_matches("0x"), 16).ok()?,
+                    ))
+                };
+                let p = parse();
+                if p.is_none() {
+                    tracing::warn!(entry = e, "VICTORY_PATCH_CODE expects hash@offset=old>new");
+                }
+                p
+            })
+            .collect()
+    });
+    all.iter()
+        .filter(|(h, ..)| h == hash)
+        .map(|&(_, at, old, new)| (at, old, new))
+        .collect()
+}
+
+#[cfg(windows)]
+fn translate_patched(container: &[u8], patches: &[(usize, u32, u32)]) -> Result<Translated, String> {
+    let host = victory_shader::emit::translate_patched(
+        container,
+        crate::shader_cache::options(),
+        patches,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut t = translate(container)?;
+    t.host = host;
+    Ok(t)
 }
 
 #[cfg(windows)]
