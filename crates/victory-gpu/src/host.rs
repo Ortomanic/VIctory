@@ -654,9 +654,13 @@ impl Host {
             if list.lost.load(Ordering::Relaxed) {
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            let preluding = crate::copystat::timed(crate::copystat::C::PreludeUs);
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
+            #[cfg(feature = "diagnostics")]
+            drop(preluding);
             lists.push(list.list.cast().ok());
         }
         // Buffer views shaders may read bindlessly (`descriptor::bindless`):
@@ -702,11 +706,12 @@ impl Host {
             }
             for (shadow, _, writes) in m.shadows.iter().filter(|_| writes_bindless) {
                 for &(from, to) in writes {
-                    shadow.writing(from as usize, (to - from) as usize);
+                    batch.gpu_write(shadow, from as usize, (to - from) as usize);
                 }
             }
         }
         batch.flush();
+        batch.snapshot();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -1517,11 +1522,7 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
-                    #[cfg(feature = "diagnostics")]
-                    let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::since(C::SnapshotUs, snapshot);
+                    batch.gpu_write(shadow, *address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -1554,9 +1555,36 @@ struct Batch {
     /// big ones share threads ([`crate::texture::refresh_all`]). Nothing
     /// before the flush writes title memory or the staging buffers.
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// The ranges shaders write (title start, length), by copy: kept by
+    /// [`Batch::snapshot`] once the submission is prepared.
+    gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
 }
 
 impl Batch {
+    /// Shaders of the submission write `[address, address + len)` of
+    /// `shadow`: no refresh copies title memory over it from now on.
+    fn gpu_write(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        shadow.writing(address, len);
+        match self
+            .gpu_writes
+            .iter_mut()
+            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
+        {
+            Some((_, ranges)) => ranges.push((address, len)),
+            None => self.gpu_writes.push((shadow.clone(), vec![(address, len)])),
+        }
+    }
+
+    /// After the last flush: what the ranges shaders write hold before the
+    /// submission runs ([`crate::shadow::Shadow::snapshot`]).
+    fn snapshot(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        let _snapshot = crate::copystat::timed(crate::copystat::C::SnapshotUs);
+        for (shadow, ranges) in self.gpu_writes.drain(..) {
+            shadow.snapshot(&ranges);
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         match self
@@ -2082,6 +2110,8 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        #[cfg(feature = "diagnostics")]
+        let readying = std::time::Instant::now();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -2122,6 +2152,8 @@ impl Host {
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
             };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::since(crate::copystat::C::PresentReadyUs, readying);
             p.copy.reset();
             let list = &p.copy.list;
             list.ResourceBarrier(&[
@@ -2171,10 +2203,14 @@ impl Host {
             ]);
             p.copy.close();
             #[cfg(feature = "diagnostics")]
-            let executing = std::time::Instant::now();
+            let (executing, gpu) = (std::time::Instant::now(), crate::copystat::get(crate::copystat::C::GpuUs));
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::since(crate::copystat::C::PresentExecUs, executing);
+            {
+                crate::copystat::since(crate::copystat::C::PresentExecUs, executing);
+                let gpu = crate::copystat::get(crate::copystat::C::GpuUs).saturating_sub(gpu);
+                crate::copystat::add(crate::copystat::C::PresentGpuUs, gpu);
+            }
             #[cfg(feature = "diagnostics")]
             let completed = (capture.is_some() || new_preview.is_some()) && self.capture_completed();
             #[cfg(feature = "diagnostics")]
@@ -2207,6 +2243,8 @@ impl Host {
                     p.saved_preview_frames[usize::from(color)] += 1;
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            let _metering = crate::copystat::timed(crate::copystat::C::PresentMeterUs);
             p.meter.frame(p.hwnd, shown_preview);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -2221,6 +2259,8 @@ impl Host {
     /// [`Host::present`]; `None` if nothing was shown.
     pub(crate) fn compose(&self, layers: &[crate::compose::Layer], frame: u64) -> Option<bool> {
         use crate::compose::OUTPUT;
+        #[cfg(feature = "diagnostics")]
+        let readying = std::time::Instant::now();
         if !crate::compose::available() {
             return None;
         }
@@ -2248,6 +2288,10 @@ impl Host {
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let back = p.swap_chain.GetBuffer::<ID3D12Resource>(index).ok()?;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::since(crate::copystat::C::PresentReadyUs, readying);
+            #[cfg(feature = "diagnostics")]
+            let composing = std::time::Instant::now();
             p.copy.reset();
             let list = &p.copy.list;
             list.ResourceBarrier(&[transition(
@@ -2256,6 +2300,8 @@ impl Host {
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
             )]);
             composer.record(&self.device, list, &back, (width, height), layers);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::since(crate::copystat::C::PresentComposeUs, composing);
             #[cfg(feature = "diagnostics")]
             let (capture, probe) = {
                 list.ResourceBarrier(&[transition(
@@ -2285,10 +2331,14 @@ impl Host {
             }
             p.copy.close();
             #[cfg(feature = "diagnostics")]
-            let executing = std::time::Instant::now();
+            let (executing, gpu) = (std::time::Instant::now(), crate::copystat::get(crate::copystat::C::GpuUs));
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::since(crate::copystat::C::PresentExecUs, executing);
+            {
+                crate::copystat::since(crate::copystat::C::PresentExecUs, executing);
+                let gpu = crate::copystat::get(crate::copystat::C::GpuUs).saturating_sub(gpu);
+                crate::copystat::add(crate::copystat::C::PresentGpuUs, gpu);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
@@ -2298,6 +2348,8 @@ impl Host {
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             #[cfg(feature = "diagnostics")]
             crate::copystat::since(crate::copystat::C::SwapUs, swapping);
+            #[cfg(feature = "diagnostics")]
+            let _metering = crate::copystat::timed(crate::copystat::C::PresentMeterUs);
             p.meter.frame(p.hwnd, None);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

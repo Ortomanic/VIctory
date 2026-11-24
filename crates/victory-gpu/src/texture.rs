@@ -238,7 +238,7 @@ pub(crate) fn refresh_all(due: Vec<Arc<Staging>>) {
 
 /// Threads a big batch of textures is refreshed on, the submitting one
 /// among them: half the cores, at most 8 (`VICTORY_TEXTURE_THREADS`).
-fn threads() -> usize {
+pub(crate) fn threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_THREADS")
@@ -252,7 +252,7 @@ fn threads() -> usize {
 }
 
 /// A texture's refresh, returning the bytes of title memory read.
-type Task = Box<dyn Fn() -> usize + Send + Sync>;
+pub(crate) type Task = Box<dyn Fn() -> usize + Send + Sync>;
 
 /// Tasks shared by the submitting thread and the pool's.
 struct Job {
@@ -325,7 +325,7 @@ fn pool() -> Option<&'static Pool> {
 /// Runs `tasks` on up to `threads` threads, this one among them, and
 /// returns the sum of what they return. Pool threads busy elsewhere leave
 /// their share to the others.
-fn run_tasks(tasks: Vec<Task>, threads: usize) -> usize {
+pub(crate) fn run_tasks(tasks: Vec<Task>, threads: usize) -> usize {
     let pool = if threads > 1 && tasks.len() > 1 {
         pool()
     } else {

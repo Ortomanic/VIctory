@@ -107,14 +107,108 @@ fn cover<'a>(
     let mut grown = pooled(end - start);
     let mut at = start;
     for (taken, bytes) in merged {
-        grown.extend_from_slice(host(at, taken));
-        grown.extend_from_slice(&bytes);
+        extend_par(&mut grown, host(at, taken));
+        extend_par(&mut grown, &bytes);
         at = taken + bytes.len();
         give_back(bytes);
     }
-    grown.extend_from_slice(host(at, end));
+    extend_par(&mut grown, host(at, end));
     before.insert(first, (start, grown));
     end - start - kept
+}
+
+/// What copy-back compares and writes at a time: title memory's 64 KiB
+/// pieces.
+const PIECE: usize = 64 << 10;
+
+/// Bytes from which a copy or compare is split over threads, and the bytes
+/// of each part.
+const PARALLEL: usize = 8 << 20;
+const PART: usize = 4 << 20;
+
+/// Runs `part(offset, n)` over `[0, len)` in parts of `step`, on the
+/// texture refresh threads when `len` is `big` or more (the submitting
+/// thread is one of them; all are done when it returns).
+fn in_parts(len: usize, step: usize, big: usize, part: impl Fn(usize, usize) + Send + Sync + 'static) {
+    if len < big || step == 0 {
+        part(0, len);
+        return;
+    }
+    let part = Arc::new(part);
+    let tasks = (0..len.div_ceil(step))
+        .map(|i| {
+            let part = part.clone();
+            let at = i * step;
+            Box::new(move || {
+                part(at, step.min(len - at));
+                0usize
+            }) as crate::texture::Task
+        })
+        .collect();
+    crate::texture::run_tasks(tasks, crate::texture::threads());
+}
+
+/// `v.extend_from_slice(src)`, big ones on several threads.
+fn extend_par(v: &mut Vec<u8>, src: &[u8]) {
+    let n = src.len();
+    if n < PARALLEL {
+        v.extend_from_slice(src);
+        return;
+    }
+    v.reserve(n);
+    let (dst, from) = (v.as_mut_ptr() as usize + v.len(), src.as_ptr() as usize);
+    in_parts(n, PART, PARALLEL, move |at, len| {
+        // SAFETY: `[at, at + len)` lies in `src` and in the reserved room
+        // after `v`'s bytes; the parts do not overlap, and all are done
+        // before `in_parts` returns.
+        unsafe { std::ptr::copy_nonoverlapping((from + at) as *const u8, (dst + at) as *mut u8, len) };
+    });
+    // SAFETY: the `n` bytes after the old length were written above.
+    unsafe { v.set_len(v.len() + n) };
+}
+
+/// The pieces (offset, length) where `host` differs from `old` (same
+/// length), cut at title memory's [`PIECE`] boundaries (`phase`: the first
+/// byte's offset in its piece), big ranges compared on several threads.
+fn differing_pieces(host: &[u8], old: &[u8], phase: usize) -> Vec<(usize, usize)> {
+    let len = host.len().min(old.len());
+    let first = (PIECE - phase % PIECE).min(len);
+    // Piece `k` starts at `first + (k - 1) * PIECE` (piece 0 at 0).
+    let pieces = if len == 0 { 0 } else { 1 + (len - first).div_ceil(PIECE) };
+    let bounds = move |k: usize| {
+        let a = if k == 0 { 0 } else { first + (k - 1) * PIECE };
+        let b = if k == 0 { first } else { (a + PIECE).min(len) };
+        (a, b)
+    };
+    let differs: Arc<Vec<std::sync::atomic::AtomicBool>> =
+        Arc::new((0..pieces).map(|_| Default::default()).collect());
+    let (h, o) = (host.as_ptr() as usize, old.as_ptr() as usize);
+    let marks = differs.clone();
+    // Parts in whole pieces: piece `k` is compared by the part its start
+    // falls in.
+    in_parts(pieces, PART / PIECE, PARALLEL / PIECE, move |k0, n| {
+        for k in k0..k0 + n {
+            let (a, b) = bounds(k);
+            // SAFETY: `[a, b)` lies in both slices, which outlive
+            // `in_parts`; only read.
+            let (hs, os) = unsafe {
+                (
+                    std::slice::from_raw_parts((h + a) as *const u8, b - a),
+                    std::slice::from_raw_parts((o + a) as *const u8, b - a),
+                )
+            };
+            if hs != os {
+                marks[k].store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+    (0..pieces)
+        .filter(|&k| differs[k].load(std::sync::atomic::Ordering::Relaxed))
+        .map(|k| {
+            let (a, b) = bounds(k);
+            (a, b - a)
+        })
+        .collect()
 }
 
 /// Merges the GPU's writes into title memory, 8 bytes at a time: where
@@ -230,26 +324,52 @@ impl Shadow {
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
-    /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
+    /// write this range. From now on no refresh copies title memory over
+    /// it, so the copy's bytes there stay as they are until the submission
+    /// runs; [`Shadow::snapshot`] keeps them once preparing is done.
     pub(crate) fn writing(&self, address: usize, len: usize) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
-        let (from, to) = self.inside(address, len);
-        if from >= to {
-            return;
+    }
+
+    /// When the submission is prepared, before it runs: the bytes of the
+    /// ranges its shaders write (`ranges`, title start and length, each
+    /// declared by [`Shadow::writing`] before) are kept to tell later what
+    /// the GPU wrote. The world declares overlapping views of its 174 MB
+    /// heap dozens of times per submission: they are merged first and each
+    /// byte is taken once (taken range by range as declared, a snapshot
+    /// that grew was copied again whole each time), big ones on several
+    /// threads, in reused memory (fresh snapshots cost ~2.3 million page
+    /// faults per world frame).
+    ///
+    /// Taking them here instead of at each declaration takes the same
+    /// bytes: a declared range is pending from its declaration on, and
+    /// nothing but refreshes, which skip pending ranges, writes the copy
+    /// before the submission runs.
+    pub(crate) fn snapshot(&self, ranges: &[(usize, usize)]) {
+        let mut inside: Vec<(usize, usize)> = ranges
+            .iter()
+            .map(|&(address, len)| self.inside(address, len))
+            .filter(|(from, to)| from < to)
+            .collect();
+        inside.sort_unstable();
+        let mut union: Vec<(usize, usize)> = Vec::with_capacity(inside.len());
+        for (from, to) in inside {
+            match union.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => union.push((from, to)),
+            }
         }
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let _taken = cover(&mut before, from, to, host);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::SnapshotBytes, _taken as u64);
+        for (from, to) in union {
+            let _taken = cover(&mut before, from, to, host);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SnapshotBytes, _taken as u64);
+        }
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -276,26 +396,27 @@ impl Shadow {
         {
             let before = &before[from - taken..to - taken];
             // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
+            // submission (big ranges on several threads), title memory read
+            // only where the GPU wrote.
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
-            let mut at = from;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
-            while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
+            #[cfg(feature = "diagnostics")]
+            let compared = std::time::Instant::now();
+            // SAFETY: inside the mapping; nothing writes it while compared.
+            let host_all = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
+            let differing = differing_pieces(host_all, before, (start + from) % PIECE);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::since(crate::copystat::C::BackCompareUs, compared);
+            for (at, n) in differing {
+                let at = from + at;
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
-                #[cfg(feature = "diagnostics")]
-                let compared = std::time::Instant::now();
-                let differs = host != old;
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::since(crate::copystat::C::BackCompareUs, compared);
-                if differs && crate::host::read_into((start + at) as *const u8, title) {
+                if crate::host::read_into((start + at) as *const u8, title) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::BackPieces, 1);
                     // Title memory with the GPU's bytes put in; the copy
@@ -309,13 +430,18 @@ impl Shadow {
                     }
                     synced.push((start + at) / PAGE);
                 }
-                at += n;
             }
             #[cfg(feature = "diagnostics")]
             let _fresh = crate::copystat::timed(crate::copystat::C::BackFreshUs);
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
+            //
+            // The asking also takes the bits of title writes made since a
+            // page was merged: a page is marked current only if title
+            // memory, read again after the asking, still holds what the
+            // copy does (a title write after the asking shows at the next
+            // one). From Marvisak/VIctory#722 (Dufftwt).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if first < last
                 && !synced.is_empty()
@@ -324,8 +450,14 @@ impl Shadow {
             {
                 let base = start / PAGE;
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let title = &mut title[..PAGE];
                 for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
+                    let at = page * PAGE - start;
+                    // SAFETY: a whole page inside the range, in the mapping.
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(at), PAGE) };
+                    if crate::host::read_into((page * PAGE) as *const u8, title) && *title == *host {
+                        copied[page - base] = now;
+                    }
                 }
             }
         } else if from < to {

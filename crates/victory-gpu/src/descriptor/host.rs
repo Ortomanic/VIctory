@@ -914,7 +914,11 @@ impl HostHeap {
         if let Some(seen) = self.seen.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
             *seen = if tag == VIEW_TAG { key } else { 0 };
         }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        let waiting = std::time::Instant::now();
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::copystat::since(crate::copystat::C::RecMirrorLockUs, waiting);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the

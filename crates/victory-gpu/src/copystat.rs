@@ -92,6 +92,17 @@ pub(crate) enum C {
     PresentUs,
     PresentExecUs,
     SwapUs,
+    /// Of the present (frame-perf2): the presenter's lock, swap chain
+    /// checks and back buffer; the GPU part of its execute; recording the
+    /// composition; the frame meter (and the log lines it writes).
+    PresentReadyUs,
+    PresentGpuUs,
+    PresentComposeUs,
+    PresentMeterUs,
+    /// Of the preparing: the lists' preludes (texture state transitions).
+    PreludeUs,
+    /// Of the host slots: waiting for the heap's made-slot lock.
+    RecMirrorLockUs,
     /// Recording draws and dispatches (title threads, summed) and their count.
     RecordUs,
     Records,
@@ -356,9 +367,9 @@ pub(crate) fn log(frames: f64) {
          preparing {:.1}: title copies {:.1} in {:.0} steps, fills {:.1}, refresh flushes {:.1} \
          [watch {:.1}: kernel {:.1} in {:.0} calls ({:.0} for textures {:.1} ms), guard {:.1}, \
          journal wait {:.1}; {:.0} askings from the submission's earlier ones, {:.0} in part], \
-         texture batches {:.1}, snapshots {:.1} ms {:.1} MB; on the GPU {:.1}; copying back \
+         texture batches {:.1}, bindless {:.1} (sweep {:.1}), preludes {:.1}, snapshots {:.1} ms {:.1} MB; on the GPU {:.1}; copying back \
          {:.1} ({:.1} MB compared in {:.1} ms, {:.0} pieces written by the GPU, written in {:.1} ms, \
-         asked after {:.1} ms, {:.0} ranges without a snapshot); after {:.1}); presenting {:.1} (swap chain {:.1}); recording {:.1} ms in {:.0} \
+         asked after {:.1} ms, {:.0} ranges without a snapshot); after {:.1}); presenting {:.1} (ready {:.1}, execute {:.1} of it GPU {:.1}, compose {:.1}, meter {:.1}, swap chain {:.1}); recording {:.1} ms in {:.0} \
          draws and dispatches (title threads); {:.0} remaps; fallback queries {:.0}, {:.0} \
          known views; slowest fallback {:.2} ms at {slow_src:#x}+{slow_len:#x}; outside executing \
          and presenting {:.1} ms",
@@ -379,6 +390,9 @@ pub(crate) fn log(frames: f64) {
         at(C::EpochSkips),
         at(C::EpochPartial),
         us(C::TexBatchUs),
+        us(C::BindlessPrepUs),
+        us(C::BindlessSweepUs),
+        us(C::PreludeUs),
         us(C::SnapshotUs),
         mb(at(C::SnapshotBytes)),
         us(C::GpuUs),
@@ -391,6 +405,11 @@ pub(crate) fn log(frames: f64) {
         at(C::BackMissed),
         us(C::AfterUs),
         us(C::PresentUs),
+        us(C::PresentReadyUs),
+        us(C::PresentExecUs),
+        us(C::PresentGpuUs),
+        us(C::PresentComposeUs),
+        us(C::PresentMeterUs),
         us(C::SwapUs),
         us(C::RecordUs),
         at(C::Records),
@@ -403,7 +422,7 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "recording per frame: {:.1} ms in {:.0} draws and dispatches: pipeline waits {:.1}, bind \
-         {:.1} (tables {:.1}: host slots {:.1}, what they read {:.1}, fresh tables keyed {:.1}, \
+         {:.1} (tables {:.1}: host slots {:.1} (lock wait {:.1}), what they read {:.1}, fresh tables keyed {:.1}, \
          {:.0} found made {:.1}, slots taken {:.1}, {:.0} made with {:.0} entries {:.1}; root \
          views {:.1}), vertex \
          and index {:.1}, notes {:.1}; buffer lookups {:.0} in {:.1} ms (all threads)",
@@ -413,6 +432,7 @@ pub(crate) fn log(frames: f64) {
         us(C::RecBindUs),
         us(C::RecTablesUs),
         us(C::RecMirrorUs),
+        us(C::RecMirrorLockUs),
         us(C::RecReadableUs),
         us(C::RecKeyUs),
         at(C::RecTableHits),
