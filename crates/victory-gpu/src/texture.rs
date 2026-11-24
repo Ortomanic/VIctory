@@ -57,6 +57,15 @@ struct Last {
     read: Vec<u8>,
 }
 
+thread_local! {
+    /// A subresource's rows before they go to the staging mapping, which
+    /// is upload heap memory (write-combined, often across the bus): the
+    /// detiling's small scattered writes land in cached memory, and the
+    /// mapping gets whole rows in order. One per thread, not per texture,
+    /// so it costs the largest subresource once.
+    static DETILED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -226,7 +235,8 @@ impl Staging {
         size
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
+    /// Detiles `tiled` (the texture's memory) into the staging buffer,
+    /// each subresource through [`DETILED`].
     fn detile(&self, tiled: &[u8]) {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
@@ -236,21 +246,42 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        DETILED.with_borrow_mut(|scratch| self.detile_through(tiled, scratch));
+    }
+
+    /// [`Staging::detile`] with the thread's scratch borrowed.
+    fn detile_through(&self, tiled: &[u8], scratch: &mut Vec<u8>) {
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            let depth_pitch = pitch * rows as usize;
+            let len = depth_pitch * f.Depth as usize;
+            if scratch.len() < len {
+                scratch.resize(len, 0);
+            }
+            let linear = &mut scratch[..len];
+            if let Err(e) = self.layout.detile(tiled, mip, slice, linear, pitch, depth_pitch) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
+            }
+            // The bytes the detiling wrote: each row's elements.
+            let m = &self.layout.mips[mip as usize];
+            let bytes = m.width as usize * self.layout.desc.element_bytes as usize;
+            for z in 0..m.depth as usize {
+                for y in 0..m.height as usize {
+                    let at = z * depth_pitch + y * pitch;
+                    // SAFETY: the detiling checked the row lies inside the
+                    // subresource's `len` bytes, in the scratch and in its
+                    // part of the mapped staging buffer.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            scratch.as_ptr().add(at),
+                            self.data.add(footprint.Offset as usize + at),
+                            bytes,
+                        );
+                    }
+                }
             }
         }
     }
