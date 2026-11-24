@@ -363,6 +363,16 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::capture::sample_scene_depth(frame);
     #[cfg(windows)]
+    if crate::debug_view::enabled()
+        && debug_compose(
+            if plane_parameters.is_null() { 0 } else { planes },
+            plane_parameters,
+            frame,
+        )
+    {
+        return S_OK;
+    }
+    #[cfg(windows)]
     if planes == 2
         && forced_plane().is_none()
         && !plane_parameters.is_null()
@@ -475,6 +485,86 @@ fn compose(planes: &[Plane; 2], frame: u64) -> bool {
     if shown.is_some() {
         blinks(frame, top, states[1], shown);
     }
+    shown.is_some()
+}
+
+/// `VICTORY_DEBUG_VIEW` ([`crate::debug_view`]): the G-buffer's chosen
+/// texture over the whole screen in place of plane 0, with plane 1 (the UI)
+/// blended over it when the title presents two planes. False if there is
+/// nothing to show yet (no G-buffer pass lately): the caller presents as
+/// usual.
+#[cfg(windows)]
+fn debug_compose(planes: u32, plane_parameters: *const Plane, frame: u64) -> bool {
+    use crate::compose::{Layer, sampled_format};
+    use std::sync::atomic::Ordering::Relaxed;
+    const SAMPLED: u32 = 0x80;
+    let Some((view, format, mode)) = crate::debug_view::take(frame) else {
+        return false;
+    };
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let (width, height) = {
+        let d = unsafe { view.texture.GetDesc() };
+        (d.Width as u32, d.Height)
+    };
+    let view_state = view.state.swap(SAMPLED, Relaxed);
+    let base = Layer {
+        texture: &view.texture,
+        state: view_state,
+        format,
+        source: [0, 0, width, height],
+        destination: [0.0, 0.0, 1.0, 1.0],
+        mode: mode as u32,
+    };
+    let overlay = (planes == 2)
+        // SAFETY: the title passes two plane records.
+        .then(|| unsafe { &*plane_parameters.add(1) })
+        .and_then(|plane| {
+            let resource = plane.first()?;
+            let texture = crate::resource::host_resource(resource)?;
+            // SAFETY: a live resource.
+            let d = unsafe { texture.GetDesc() };
+            (d.Dimension
+                == windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && d.SampleDesc.Count == 1
+                && d.Flags.0
+                    & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE
+                        .0
+                    == 0
+                && !std::ptr::eq(texture, &view.texture))
+            .then_some((plane, resource, texture, d))
+        });
+    // No per-frame allocation: one or two layers on the stack.
+    let shown = match overlay {
+        Some((plane, resource, texture, d)) => {
+            let state = crate::resource::host_transition(resource, SAMPLED)
+                .map_or(SAMPLED, |(_, before)| before);
+            let (w, h) = (d.Width as u32, d.Height);
+            let top = Layer {
+                texture,
+                state,
+                format: sampled_format(
+                    crate::resource::view_format(resource).unwrap_or(d.Format.0 as u32),
+                ),
+                source: plane
+                    .source_rect()
+                    .and_then(|r| sensible_source(r, w, h))
+                    .unwrap_or([0, 0, w, h]),
+                destination: plane
+                    .placement()
+                    .filter(|&p| sensible_placement(p))
+                    .unwrap_or([0.0, 0.0, 1.0, 1.0]),
+                mode: 0,
+            };
+            let shown = host.compose(&[base, top], frame);
+            crate::resource::host_transition(resource, state);
+            shown
+        }
+        None => host.compose(&[base], frame),
+    };
+    view.state.store(view_state, Relaxed);
     shown.is_some()
 }
 

@@ -567,6 +567,7 @@ impl State {
             }
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
+        crate::debug_view::note_targets(&self.targets, self.depth);
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(

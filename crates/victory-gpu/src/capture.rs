@@ -54,9 +54,11 @@ fn after_scene(n: u64) -> bool {
             .contains(&(n - first))
 }
 
-/// Whether frame `n` is saved.
+/// Whether frame `n` is saved: powers of two, listed frames, and every
+/// 64th frame of a debug view ([`crate::debug_view::capture_wanted`]).
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    folder().is_some()
+        && (n.is_power_of_two() || listed(n) || crate::debug_view::capture_wanted(n))
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
