@@ -390,6 +390,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_GPU_BREADCRUMBS`: the number the list's breadcrumbs
+    /// carry, new at each recording.
+    #[cfg(feature = "diagnostics")]
+    serial: AtomicU32,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -596,6 +600,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                serial: AtomicU32::new(next_serial()),
             })
         }
     }
@@ -667,6 +673,18 @@ impl Host {
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
+                    #[cfg(feature = "diagnostics")]
+                    Ok(()) if breadcrumbs().is_some() => {
+                        let mut reported = false;
+                        while WaitForSingleObject(self.event, 2000)
+                            == windows::Win32::Foundation::WAIT_TIMEOUT
+                        {
+                            if !reported {
+                                reported = true;
+                                report_hang(runs);
+                            }
+                        }
+                    }
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
                     }
@@ -1033,6 +1051,8 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.serial.store(next_serial(), Ordering::Relaxed);
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1142,6 +1162,24 @@ impl HostList {
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+            }
+            if let Some(crumbs) = breadcrumbs()
+                && let Ok(list) = self.list.cast::<ID3D12GraphicsCommandList2>()
+            {
+                // Written once every command before it has finished.
+                let params = [
+                    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                        Dest: crumbs.va,
+                        Value: self.serial.load(Ordering::Relaxed),
+                    },
+                    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                        Dest: crumbs.va + 4,
+                        Value: at,
+                    },
+                ];
+                let modes = [D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT; 2];
+                // SAFETY: an open list; our live buffer.
+                unsafe { list.WriteBufferImmediate(2, params.as_ptr(), Some(modes.as_ptr())) };
             }
             let what = what();
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
@@ -2362,6 +2400,128 @@ impl Host {
 /// For adapters without device-removed data (the software one): the last
 /// commands each list of the failed submission noted (diagnostics, with
 /// `VICTORY_D3D12_DRED`).
+/// `VICTORY_GPU_BREADCRUMBS` (with `VICTORY_D3D12_DRED`, diagnostics):
+/// each noted command first writes (list serial, command index) to
+/// CPU-visible memory once all before it finished; a submission still
+/// running after 2 s logs the commands around the last one written.
+#[cfg(feature = "diagnostics")]
+struct Crumbs {
+    _buffer: ID3D12Resource,
+    va: u64,
+    at: *const u32,
+}
+// SAFETY: the buffer is free-threaded; the pointer is its persistent map.
+#[cfg(feature = "diagnostics")]
+unsafe impl Send for Crumbs {}
+// SAFETY: as above.
+#[cfg(feature = "diagnostics")]
+unsafe impl Sync for Crumbs {}
+
+#[cfg(feature = "diagnostics")]
+fn breadcrumbs() -> Option<&'static Crumbs> {
+    static CRUMBS: OnceLock<Option<Crumbs>> = OnceLock::new();
+    CRUMBS
+        .get_or_init(|| {
+            if !dred_on() || std::env::var_os("VICTORY_GPU_BREADCRUMBS").is_none() {
+                return None;
+            }
+            let device = &host()?.device;
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and a persistent map of our buffer.
+            unsafe {
+                device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut buffer,
+                    )
+                    .inspect_err(|e| tracing::warn!(error = %e, "no breadcrumb buffer"))
+                    .ok()?;
+                let buffer = buffer?;
+                buffer.Map(0, None, Some(&mut data)).ok()?;
+                tracing::info!("GPU breadcrumbs on");
+                Some(Crumbs {
+                    va: buffer.GetGPUVirtualAddress(),
+                    _buffer: buffer,
+                    at: data.cast(),
+                })
+            }
+        })
+        .as_ref()
+}
+
+#[cfg(feature = "diagnostics")]
+fn next_serial() -> u32 {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Logs where a submission that is taking long is (breadcrumbs).
+#[cfg(feature = "diagnostics")]
+fn report_hang(runs: &[&HostList]) {
+    let Some(crumbs) = breadcrumbs() else { return };
+    // SAFETY: the persistent map; the GPU writes it concurrently.
+    let (serial, at) = unsafe {
+        (
+            std::ptr::read_volatile(crumbs.at),
+            std::ptr::read_volatile(crumbs.at.add(1)),
+        )
+    };
+    let serials: Vec<u32> = runs
+        .iter()
+        .map(|r| r.serial.load(Ordering::Relaxed))
+        .collect();
+    tracing::warn!(
+        serial,
+        at,
+        ?serials,
+        "GPU submission running for 2 s: last breadcrumb"
+    );
+    let Some(i) = serials.iter().position(|&s| s == serial) else {
+        return;
+    };
+    let run = runs[i];
+    let notes = run.notes.lock().unwrap_or_else(|e| e.into_inner());
+    let at = at as usize;
+    for (n, (text, _)) in notes.iter().enumerate().skip(at.saturating_sub(3)).take(8) {
+        let mark = if n == at { ">>" } else { "  " };
+        tracing::warn!(
+            "hang breadcrumb {mark} list {i} of {}, command {n} of {}: {text}",
+            runs.len(),
+            notes.len()
+        );
+    }
+    if at + 1 >= notes.len() && i + 1 < runs.len() {
+        let next = runs[i + 1].notes.lock().unwrap_or_else(|e| e.into_inner());
+        for (n, (text, _)) in next.iter().enumerate().take(3) {
+            tracing::warn!("hang breadcrumb, next list {}, command {n}: {text}", i + 1);
+        }
+    }
+}
+
 fn last_notes(runs: &[&HostList]) -> String {
     #[cfg(feature = "diagnostics")]
     {
