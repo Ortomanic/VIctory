@@ -30,9 +30,105 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Which dynamic slots are taken (by lists not yet reset).
+    next: Mutex<Slots>,
+}
+
+/// Dynamic slots: which are taken (a bit each), how many are free, and
+/// where the search for free ones starts. Searched a word at a time: a
+/// world frame takes thousands of runs, and when the slots ran short a
+/// slot-by-slot search of all 65,536 under the heap's lock cost recording
+/// threads up to ~0.1 ms per table.
+struct Slots {
+    next: usize,
+    taken: Vec<u64>,
+    len: usize,
+    free: usize,
+}
+
+impl Slots {
+    fn new(n: usize) -> Slots {
+        Slots {
+            next: 0,
+            taken: vec![0; n.div_ceil(64)],
+            len: n,
+            free: n,
+        }
+    }
+
+    fn is_taken(&self, at: usize) -> bool {
+        self.taken[at / 64] >> (at % 64) & 1 == 1
+    }
+
+    /// The first run of `n` free slots inside `[lo, hi)`: its start.
+    fn find(&self, lo: usize, hi: usize, n: usize) -> Option<usize> {
+        let (mut run, mut start, mut at) = (0, lo, lo);
+        while at < hi {
+            if at % 64 == 0 && at + 64 <= hi {
+                match self.taken[at / 64] {
+                    u64::MAX => {
+                        run = 0;
+                        at += 64;
+                        continue;
+                    }
+                    0 => {
+                        if run == 0 {
+                            start = at;
+                        }
+                        run += 64;
+                        if run >= n {
+                            return Some(start);
+                        }
+                        at += 64;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if self.is_taken(at) {
+                run = 0;
+            } else {
+                if run == 0 {
+                    start = at;
+                }
+                run += 1;
+                if run >= n {
+                    return Some(start);
+                }
+            }
+            at += 1;
+        }
+        None
+    }
+
+    /// Marks `[from, to)` taken or free.
+    fn mark(&mut self, from: usize, to: usize, taken: bool) {
+        for at in from..to {
+            let (word, bit) = (at / 64, 1u64 << (at % 64));
+            if (self.taken[word] & bit != 0) != taken {
+                self.taken[word] ^= bit;
+                if taken {
+                    self.free -= 1;
+                } else {
+                    self.free += 1;
+                }
+            }
+        }
+    }
+
+    /// `n` consecutive free slots, taken: the first's index. Searched from
+    /// where the last search ended on, then from the start; a run does not
+    /// wrap past the end.
+    fn take(&mut self, n: usize) -> Option<usize> {
+        let end = self.len;
+        if n == 0 || n > self.free {
+            return None;
+        }
+        let first = self.find(self.next, end, n).or_else(|| self.find(0, self.next, n))?;
+        self.mark(first, first + n, true);
+        self.next = (first + n) % end;
+        Some(first)
+    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -146,7 +242,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(Slots::new(extra as usize)),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -228,26 +324,7 @@ impl HostHeap {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = self.next.lock().unwrap_or_else(|e| e.into_inner()).take(n as usize);
         let Some(first) = found else {
             static MISSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let missed = MISSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -256,8 +333,6 @@ impl HostHeap {
             }
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -275,10 +350,10 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
+        if (at as usize) < end {
+            slots.mark(at as usize, end, false);
         }
     }
 
@@ -1063,6 +1138,33 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The word-at-a-time search finds what a slot-by-slot first fit does.
+    #[test]
+    fn slot_search_is_first_fit_from_the_last_end() {
+        let mut slots = Slots::new(1000);
+        assert_eq!(slots.take(130), Some(0));
+        assert_eq!(slots.take(3), Some(130));
+        slots.mark(10, 20, false);
+        slots.mark(64, 200, false);
+        // From 133 on first, then from the start.
+        assert_eq!(slots.take(850), Some(133));
+        assert_eq!(slots.take(70), None);
+        assert_eq!(slots.take(67), Some(64));
+        assert_eq!(slots.take(10), Some(983));
+        assert_eq!(slots.take(10), Some(10));
+        assert_eq!(slots.free, 2 + 7);
+        assert!(!slots.is_taken(131) && !slots.is_taken(132) && slots.is_taken(133));
+        // A run does not wrap past the end.
+        let mut slots = Slots::new(256);
+        slots.mark(0, 256, true);
+        slots.mark(250, 256, false);
+        slots.mark(0, 4, false);
+        assert_eq!(slots.take(8), None);
+        assert_eq!(slots.take(6), Some(250));
+        assert_eq!(slots.take(4), Some(0));
+        assert_eq!(slots.free, 0);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
