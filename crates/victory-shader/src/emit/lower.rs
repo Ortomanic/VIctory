@@ -5789,7 +5789,9 @@ impl<'a> Lower<'a> {
             let Fields::Image { cache, .. } = &inst.fields else {
                 unreachable!()
             };
-            if *d16 || *a16 {
+            // With a16 the coordinates are 16-bit integers, unpacked as
+            // for loads; 16-bit data has no atomic form.
+            if *d16 {
                 return Err("a 16-bit image atomic");
             }
             // dmask: the data dwords (cmpswap: twice the value's).
