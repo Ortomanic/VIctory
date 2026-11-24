@@ -107,7 +107,11 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = if bvh_skinning(&self.hash) {
+                    Err(BVH_SKINNING.to_owned())
+                } else {
+                    translate(&self.container)
+                };
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -127,6 +131,85 @@ impl Shader {
             })
             .as_ref()
     }
+}
+
+/// Grand Theft Auto VI's skinning for its ray-tracing structures
+/// (`bvh_skinning` and `bvh_skinning_smh` in shaders.rpf: skinned, rope,
+/// cable, tree and hair vertices and indices that `XboxBvhBuilder.dll`
+/// builds the BVH from), by shader hash.
+///
+/// The host does not run them. Nothing on the host reads what they write:
+/// VIctory does no ray tracing (the BVH builder's own shaders do not
+/// translate either). They cannot run right on the host today: every
+/// vertex buffer a job record names is a buffer view in the heap read
+/// bindlessly, and the host makes buffer views only for tables, so all of
+/// them read zeros through null slots (probe, bisect-fault, 2026-11-24:
+/// 6,144 records, every slot named unmade). And run, they fault or hang
+/// the GPU (Xid 13 at CSComputeSkinningDefaultVelocity after
+/// CSComputeSkinningRigidVelocity, Xid 109 at CSGenerateHairIB) in every
+/// world run since their tables are made (dynamic descriptor slots); run
+/// without them, the world runs clean.
+///
+/// `VICTORY_BVH_SKINNING=1` runs them (for whoever makes bindless buffer
+/// views).
+#[cfg(windows)]
+const BVH_SKINNING_SHADERS: [&str; 43] = [
+    "81dc252c4d183e30", // CSComputeCable
+    "6b39336022e5e663", // CSComputeCableVelocity
+    "ced45910ad577dcb", // CSComputeCrossCardTree
+    "207bf7d2f14a87e6", // CSComputeRope
+    "2cb480030989538a", // CSComputeRopeVelocity
+    "c7aef9c89f12051f", // CSComputeSkinningDefault
+    "3cf39f4495b908d0", // CSComputeSkinningDefaultVelocity
+    "9db486cee396e315", // CSComputeSkinningDeformable
+    "96d1ef386a0ddcfb", // CSComputeSkinningDeformableRigid
+    "cb90a66c7fe122aa", // CSComputeSkinningDeformableRigidVelocity
+    "d28b4922384831fe", // CSComputeSkinningDeformableSecMotion
+    "822e62ded676ef45", // CSComputeSkinningDeformableSecMotionRigid
+    "ca2c77616107b128", // CSComputeSkinningDeformableSecMotionRigidVelocity
+    "c7213dc64c67638b", // CSComputeSkinningDeformableSecMotionVelocity
+    "cd34b8dd52ee5c0c", // CSComputeSkinningDeformableVelocity
+    "60b09004fef7f2f1", // CSComputeSkinningPed
+    "9ffcaff533995118", // CSComputeSkinningPedBlendShapes
+    "827b309e779552d7", // CSComputeSkinningPedBlendShapesSecMotion
+    "82a2ad6d07417d36", // CSComputeSkinningPedBlendShapesSecMotionVelocity
+    "90a0692af4320129", // CSComputeSkinningPedBlendShapesVelocity
+    "b8e420aac4197681", // CSComputeSkinningPedSecMotion
+    "904e7a51e3fab26c", // CSComputeSkinningPedSecMotionVelocity
+    "dd24ff46af3ae6ee", // CSComputeSkinningPedVelocity
+    "71ab19b0a4669299", // CSComputeSkinningRigid
+    "8f9eb68d0c6dd5cf", // CSComputeSkinningRigidVelocity
+    "c968414adaaeb93d", // CSComputeSkinningSecMotion
+    "77edaab306206e9a", // CSComputeSkinningSecMotionRigid
+    "d3022ba8427bc72c", // CSComputeSkinningSecMotionRigidVelocity
+    "4518151afe8c6c09", // CSComputeSkinningSecMotionVelocity
+    "e06a21f3cea46973", // CSComputeSkinningSlodPed
+    "b5a672a450b321e2", // CSComputeSkinningStaticPedProp
+    "878933b499cfa14d", // CSComputeSkinningTreeAnim
+    "f16876929fa64f9f", // CSComputeSkinningTreeAnimVelocity
+    "023439f44041b689", // CSComputeSkinningUmWind
+    "75bd00da58a1615c", // CSComputeSkinningUmWindVelocity
+    "a567b9ef845fb680", // CSComputeTreeAnim
+    "aff8936db59182b7", // CSComputeTreeAnimVelocity
+    "409e2cddc90b6d0d", // CSComputeVSplitTree
+    "952fd529dd779b27", // CSUnpackIB_CCW
+    "1a77e876755eff12", // CSUnpackIB
+    "64fe9fa3cb71d57f", // CSUnpackVB
+    "48426bae580a080c", // CSGenerateHairIB (bvh_skinning_smh)
+    "72f552f4553fb5f9", // CSGenerateHairVB (bvh_skinning_smh)
+];
+
+#[cfg(windows)]
+const BVH_SKINNING: &str =
+    "BVH skinning: nothing on the host reads it (no ray tracing) and it faults the GPU; VICTORY_BVH_SKINNING=1 runs it";
+
+/// Whether the shader with `hash` is one of [`BVH_SKINNING_SHADERS`] and
+/// they are not to run.
+#[cfg(windows)]
+fn bvh_skinning(hash: &str) -> bool {
+    static RUN: OnceLock<bool> = OnceLock::new();
+    let run = *RUN.get_or_init(|| std::env::var("VICTORY_BVH_SKINNING").is_ok_and(|v| v == "1"));
+    !run && BVH_SKINNING_SHADERS.contains(&hash)
 }
 
 #[cfg(windows)]
