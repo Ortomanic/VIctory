@@ -3,7 +3,8 @@
 //! with its UI plane still blended over it.
 //!
 //! The G-buffer is found by its pass: the render-target set bound with a
-//! depth target that has the most colour targets of the depth's size (GTA
+//! depth target that has the most colour targets of the depth's size, a
+//! landscape one before a square one, then the largest (GTA
 //! VI's main pass binds six at 1280x720 with its R32G8X24 depth: slot 0
 //! R8G8B8A8 typeless, flat albedo; slot 1 R8G8B8A8, packed normals (shown
 //! as stored, in bands); slots 2, 3, 5 R8G8B8A8; slot 4 R16G16 float). The
@@ -115,7 +116,9 @@ struct Pass {
     key: [usize; SLOTS + 1],
     colors: [Option<Held>; SLOTS],
     depth: Held,
-    area: u64,
+    /// Wider than tall, then the area: the main view beats square passes
+    /// of the same targets (GTA VI also binds six at 1024x1024 some frames).
+    rank: (bool, u64),
     /// The presented frame it was last bound before.
     frame: u64,
 }
@@ -225,7 +228,7 @@ pub(crate) fn note_targets(targets: &[usize], depth: usize) {
         key,
         colors,
         depth: depth_held,
-        area: size.0 * u64::from(size.1),
+        rank: (size.0 > u64::from(size.1), size.0 * u64::from(size.1)),
         frame,
     };
     if pass.count() < MIN_TARGETS {
@@ -234,7 +237,7 @@ pub(crate) fn note_targets(targets: &[usize], depth: usize) {
     let better = state
         .building
         .as_ref()
-        .is_none_or(|best| (pass.count(), pass.area) > (best.count(), best.area));
+        .is_none_or(|best| (pass.count(), pass.rank) > (best.count(), best.rank));
     if better {
         state.building = Some(pass);
     }
