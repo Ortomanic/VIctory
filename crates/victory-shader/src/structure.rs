@@ -715,6 +715,38 @@ impl<'a> Lanes<'a> {
         Some((lo, hi))
     }
 
+    /// Whether SCC value `scc` is clear wherever it is read: the
+    /// instruction before an `s_cbranch_execnz` that closes a loop wrote it
+    /// as "the EXEC it leaves is not empty" (a bitwise operation on EXEC,
+    /// `s_andn2_wrexec` say), and the wave leaves `do { .. } while (EXEC)`
+    /// with EXEC empty. A read inside the loop, or behind another way out
+    /// of it, sees a join of this value, not the value itself.
+    fn clear_after_loop(&self, scc: Value) -> bool {
+        let Some(&(b, i)) = self.defs.get(&scc) else {
+            return false;
+        };
+        let block = &self.p.blocks[b];
+        let (Some(writer), Some(last)) = (block.insts.get(i), block.insts.last()) else {
+            return false;
+        };
+        let exec = writer.write(Reg::S(EXEC));
+        let back = match block.exit {
+            Exit::Branch { taken, .. } => self.index[taken] <= self.index[b],
+            _ => false,
+        };
+        // SCC = (result != 0), and the result is the new EXEC.
+        let bitwise = ["s_and", "s_or", "s_xor", "s_nand", "s_nor", "s_xnor", "s_not"]
+            .iter()
+            .any(|p| writer.name().starts_with(p));
+        back && i + 2 == block.insts.len()
+            && bitwise
+            && exec.is_some()
+            && writer.write(Reg::Scc) == Some(scc)
+            && last.name() == "s_cbranch_execnz"
+            && last.read(Reg::S(EXEC)) == exec
+            && (!self.p.wave64 || last.read(Reg::S(EXEC + 1)) == writer.write(Reg::S(EXEC + 1)))
+    }
+
     fn born(&self, v: Value) -> usize {
         match (self.defs.get(&v), self.phis.get(&v)) {
             (Some(&(b, _)), _) | (_, Some(&(b, _))) => self.index[b],
@@ -919,9 +951,13 @@ impl<'a> Lanes<'a> {
             "cselect" => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
-                let born = self.born(scc);
-                let u = self.b.atom(Atom::Uniform(scc), born);
-                (self.b.ite(u, a, c), None)
+                if self.clear_after_loop(scc) {
+                    (c, None)
+                } else {
+                    let born = self.born(scc);
+                    let u = self.b.atom(Atom::Uniform(scc), born);
+                    (self.b.ite(u, a, c), None)
+                }
             }
             _ => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
@@ -1175,6 +1211,40 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
+    }
+
+    /// `s_cselect` on the SCC a lane loop ended with (the blend-shape
+    /// skinning programs): the loop is left when no lane remains, so the
+    /// select takes its second operand; it was a uniform atom whose value no
+    /// lane has. (Test from fxceless/victory-gta6 578d459.)
+    #[test]
+    fn a_select_on_the_condition_a_lane_loop_ended_with_takes_its_second_operand() {
+        let cnd = 256 | (256 << 9) | (3 << 18);
+        let p = build(
+            &[
+                0xBE83_037E, // 0: s_mov_b32 s3, exec_lo
+                0xBE9C_037E, // s_mov_b32 s28, exec_lo
+                0x7E3A_0507, // 8: v_readfirstlane_b32 s29, v7
+                0x7DA4_0E1D, // v_cmpx_eq_u32 exec_lo, s29, v7
+                0xBE9C_471C, // s_andn2_wrexec_b32 s28, s28
+                0xBF89_FFFC, // s_cbranch_execnz -> 8
+                0xBEFE_0303, // s_mov_b32 exec_lo, s3
+                0x8503_807E, // s_cselect_b32 s3, exec_lo, 0
+                0xD501_0001,
+                cnd, // v_cndmask_b32 v1, v0, v0, s3
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let select = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "s_cselect_b32")
+            .expect("the select");
+        let mask = select.write(Reg::S(3)).unwrap();
+        assert_eq!(s.masks.get(&mask), Some(&Bool::FALSE));
     }
 
     #[test]
