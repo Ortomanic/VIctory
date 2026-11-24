@@ -660,7 +660,33 @@ fn still_hole(g: &mut Guards, block: usize, frame: u64) -> bool {
 pub(crate) static REMAPPINGS: AtomicU64 = AtomicU64::new(0);
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    let mut g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    let remapped = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+    for (at, end) in remapped {
+        unguard(&mut g, at, end);
+    }
+    g
+}
+
+/// Title memory `[start, end)` the runtime remapped since [`GUARDS`] was
+/// last taken: no longer guarded, applied when it is next taken
+/// ([`guards`]). The runtime's mapping threads leave it here rather than
+/// wait for [`GUARDS`], which copies hold across host protection calls
+/// (frame-perf3; each such wait held every other mapping thread back).
+static REMAPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Forgets the guards and holes of the blocks of `[at, end)` (remapped).
+fn unguard(g: &mut Guards, at: usize, end: usize) {
+    let span = at / BLOCK..end.div_ceil(BLOCK);
+    let blocks: Vec<usize> = g.protected.range(span.clone()).copied().collect();
+    for block in blocks {
+        g.protected.remove(&block);
+        g.clean.remove(&block);
+    }
+    let holes: Vec<usize> = g.holes.range(span).map(|(&b, _)| b).collect();
+    for block in holes {
+        g.holes.remove(&block);
+    }
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -937,16 +963,16 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let to = at.saturating_add(len.max(1));
     forget_kinds(&mut KINDS.lock().unwrap_or_else(|e| e.into_inner()), at, to);
     forget(&mut COMMITTED.lock().unwrap_or_else(|e| e.into_inner()), at, to, |&e| e);
-    let mut g = guards();
-    let span = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let blocks: Vec<usize> = g.protected.range(span.clone()).copied().collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-    }
-    let holes: Vec<usize> = g.holes.range(span).map(|(&b, _)| b).collect();
-    for block in holes {
-        g.holes.remove(&block);
+    // Without waiting for the guards where a copy holds them.
+    match GUARDS.try_lock() {
+        Ok(mut g) => unguard(&mut g, at, at.saturating_add(len)),
+        Err(std::sync::TryLockError::Poisoned(e)) => unguard(&mut e.into_inner(), at, at.saturating_add(len)),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            REMAPPED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((at, at.saturating_add(len)));
+        }
     }
 }
 
@@ -1084,6 +1110,28 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A remapping while a copy holds the guards does not wait for them;
+    /// it is applied when they are next taken.
+    #[test]
+    fn remappings_do_not_wait_for_the_guards() {
+        // Blocks no other test uses (nothing is mapped there).
+        let block = (0x7e00_0000_0000usize) / BLOCK;
+        let mut g = guards();
+        g.protected.insert(block);
+        g.clean.insert(block);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            title_memory_remapped(block * BLOCK, BLOCK);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the remapping waited for the guards");
+        assert!(g.protected.contains(&block));
+        drop(g);
+        let g = guards();
+        assert!(!g.protected.contains(&block) && !g.clean.contains(&block));
     }
 
     #[test]
