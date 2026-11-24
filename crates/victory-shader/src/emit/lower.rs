@@ -7701,6 +7701,47 @@ mod tests {
         lowers(&words, group_ids_xy).expect("dead timestamp");
     }
 
+    /// `v_mov_b32 vdst, src0` (VOP1).
+    const fn v_mov(vdst: u32, src0: u32) -> u32 {
+        0x7E00_0000 | vdst << 17 | 0x01 << 9 | src0
+    }
+
+    /// `v_readfirstlane_b32 s0, vsrc` (VOP1).
+    const fn v_readfirstlane_s0(vsrc: u32) -> u32 {
+        0x7E00_0000 | 0x02 << 9 | (256 + vsrc)
+    }
+
+    /// Runs `body` over v1 = 2 and v3 = 3, then branches on the first lane of
+    /// v2: the branch is the effect that needs `v2` translated.
+    fn lowers_v2(body: &[u32]) -> Result<(), crate::ShaderError> {
+        let mut words = vec![v_mov(1, 130), v_mov(3, 131), v_mov(2, 128)];
+        words.extend_from_slice(body);
+        words.extend([
+            v_readfirstlane_s0(2),
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ]);
+        lowers(&words, 0)
+    }
+
+    #[test]
+    fn v_xnor_b32_translates() {
+        // v_xnor_b32 v2, v1, v3
+        lowers_v2(&[0x1E << 25 | 2 << 17 | 3 << 9 | 257]).unwrap();
+    }
+
+    #[test]
+    fn v_swap_b32_translates() {
+        // v_swap_b32 v1, v3; v_sub_nc_u32 v2, v1, v3
+        lowers_v2(&[
+            0x7E00_0000 | 1 << 17 | 0x65 << 9 | (256 + 3),
+            0x26 << 25 | 2 << 17 | 3 << 9 | 257,
+        ])
+        .unwrap();
+    }
+
     #[test]
     fn buffer_formats_by_number() {
         // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
