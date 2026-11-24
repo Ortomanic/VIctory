@@ -154,15 +154,75 @@ static KINDS: Mutex<BTreeMap<usize, (usize, bool)>> = Mutex::new(BTreeMap::new()
 /// Forgets the entries of `kinds` overlapping `[from, to)` (they do not
 /// overlap each other).
 fn forget_kinds(kinds: &mut BTreeMap<usize, (usize, bool)>, from: usize, to: usize) {
-    let hit: Vec<usize> = kinds
+    forget(kinds, from, to, |&(end, _)| end);
+}
+
+/// Forgets the extents of `map` (start → value holding the end, as `end`
+/// reads it; they do not overlap each other) overlapping `[from, to)`.
+fn forget<V>(map: &mut BTreeMap<usize, V>, from: usize, to: usize, end: impl Fn(&V) -> usize) {
+    let hit: Vec<usize> = map
         .range(..to)
         .rev()
-        .take_while(|(_, (end, _))| *end > from)
+        .take_while(|(_, v)| end(v) > from)
         .map(|(&start, _)| start)
         .collect();
     for start in hit {
-        kinds.remove(&start);
+        map.remove(&start);
     }
+}
+
+/// View regions found committed, start → end, until the runtime remaps
+/// them ([`title_memory_remapped`]): a view's pages stay committed until it
+/// is unmapped, and the runtime reports that before it unmaps. Private
+/// memory is asked every time (it may be decommitted unreported).
+static COMMITTED: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Whether `[at, at + len)` is committed memory (streamed textures may be
+/// unmapped until their pages arrive; copies into title memory must not
+/// meet a hole). Asked of the host once per view region: textures are
+/// checked at every submission that samples them, and under Wine each
+/// query takes the process's virtual-memory lock and walks the region
+/// (~80 us for a 4 GiB view of uniform protection).
+pub(crate) fn committed(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let end = at.saturating_add(len);
+    let mut p = at;
+    while p < end {
+        let known = COMMITTED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(..=p)
+            .next_back()
+            .map(|(_, &e)| e)
+            .filter(|&e| p < e);
+        if let Some(e) = known {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::CommitHits, 1);
+            p = e;
+            continue;
+        }
+        let remappings = REMAPPINGS.load(Ordering::Acquire);
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::CommitQueries, 1);
+        if n == 0 || info.State != MEM_COMMIT || info.RegionSize == 0 {
+            return false;
+        }
+        let (from, to) = (info.BaseAddress as usize, (info.BaseAddress as usize).saturating_add(info.RegionSize));
+        if info.Type == MEM_MAPPED {
+            let mut known = COMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+            // A remapping since the query may have changed what it found.
+            if REMAPPINGS.load(Ordering::Acquire) == remappings {
+                forget(&mut known, from, to, |&e| e);
+                known.insert(from, to);
+            }
+        }
+        p = to;
+    }
+    true
 }
 
 /// A frame was presented: holes are looked at again (once a frame, not at
@@ -447,11 +507,9 @@ pub fn writing(at: usize, len: usize) {
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
     REMAPPINGS.fetch_add(1, Ordering::AcqRel);
-    forget_kinds(
-        &mut KINDS.lock().unwrap_or_else(|e| e.into_inner()),
-        at,
-        at.saturating_add(len.max(1)),
-    );
+    let to = at.saturating_add(len.max(1));
+    forget_kinds(&mut KINDS.lock().unwrap_or_else(|e| e.into_inner()), at, to);
+    forget(&mut COMMITTED.lock().unwrap_or_else(|e| e.into_inner()), at, to, |&e| e);
     let mut g = guards();
     let span = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let blocks: Vec<usize> = g.protected.range(span.clone()).copied().collect();
@@ -734,6 +792,55 @@ mod tests {
             };
         }
         title_memory_remapped(base, 4 * BLOCK);
+    }
+
+    /// View regions found committed are kept until remapped; private
+    /// memory is asked each time.
+    #[test]
+    fn committed_views_are_kept_until_remapped() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_DECOMMIT, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let kept = |at: usize| {
+            COMMITTED
+                .lock()
+                .unwrap()
+                .range(..=at)
+                .next_back()
+                .is_some_and(|(_, &end)| at < end)
+        };
+        assert!(committed(view + 5, BLOCK));
+        assert!(kept(view + BLOCK));
+        assert!(committed(view, 2 * BLOCK));
+        title_memory_remapped(view, 2 * BLOCK);
+        assert!(!kept(view));
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        assert!(!committed(view, BLOCK));
+        // SAFETY: a fresh private allocation, partly decommitted, freed.
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            assert!(committed(p, 2 * BLOCK));
+            assert!(!kept(p));
+            VirtualFree((p + BLOCK) as *mut _, BLOCK, MEM_DECOMMIT);
+            assert!(!committed(p, 2 * BLOCK));
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+        }
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

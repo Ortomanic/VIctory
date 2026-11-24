@@ -371,22 +371,10 @@ fn detile_subresource(
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
-/// unmapped until their pages arrive).
+/// unmapped until their pages arrive), as [`crate::watch::committed`] keeps
+/// it for views.
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let mut p = at as usize;
-    let end = p + len;
-    while p < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
-            return false;
-        }
-        p = info.BaseAddress as usize + info.RegionSize;
-    }
-    true
+    crate::watch::committed(at as usize, len)
 }
 
 /// The staging state of a title texture, made on first use.
