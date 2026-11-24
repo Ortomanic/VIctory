@@ -31,7 +31,20 @@
 //! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
-//!   address the title sets is the buffer's.
+//!   address the title sets is the buffer's. The host binds them as raw
+//!   device addresses without bounds checks (vkd3d-proton: root SRVs
+//!   always, root CBVs with descriptor heaps), so with
+//!   [`Options::root_bounds`] the shader checks every read through one
+//!   whose offset it computes: a read of n bytes at byte `off` happens only
+//!   when `off + n <= len` and reads 0 otherwise (as the console's
+//!   out-of-range buffer reads do). `len` is a user-data dword, listed in
+//!   [`HostShader::user_data`] with `root: Descriptor`, `slot` the root
+//!   view's root parameter, at the view's own console user-data index (the
+//!   address's low dword, which the host's user data does not otherwise
+//!   use): the host's byte length behind the address it binds (saturated
+//!   at `u32::MAX`; 0 when it binds none), for root CBVs read by row a
+//!   multiple of 16. Root CBV reads at constant offsets (the compiler's
+//!   own layout of the title's constants) are not checked.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -127,7 +140,7 @@ pub fn loop_limit() -> u32 {
 
 /// How the host runs compute waves, which decides how console wave64
 /// compute programs are emitted (see `docs/wave64-on-wave32.md`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
     /// The host cannot run 64-lane compute waves (D3D12
     /// `WaveLaneCountMax < 64`, e.g. NVIDIA: 32..32). A console wave64
@@ -138,18 +151,50 @@ pub struct Options {
     /// reductions, barrier-less LDS in a one-wave group) keeps
     /// `WaveSize(64)` as before, and such a host refuses it.
     pub host_wave32: bool,
+    /// Reads through root CBVs and SRVs are bounds-checked against the
+    /// length of the host's copy (see the module notes on root views): on by
+    /// default, off only for diagnostics ([`root_bounds`]).
+    pub root_bounds: bool,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            host_wave32: false,
+            root_bounds: true,
+        }
+    }
 }
 
 impl Options {
     /// The options for this host: `VICTORY_HOST_WAVE32` when it is set
     /// (`1` on, anything else off), else what [`set_host_wave32`] said
-    /// (off by default). The value is part of the translation, so the
-    /// shader cache must key on it (`victory-gpu`'s does).
+    /// (off by default); root view bounds per [`root_bounds`]. The values
+    /// are part of the translation, so the shader cache must key on them
+    /// (`victory-gpu`'s does).
     pub fn host() -> Options {
         Options {
             host_wave32: host_wave32(),
+            root_bounds: root_bounds(),
         }
     }
+}
+
+/// Whether reads through root views are bounds-checked: yes, unless a
+/// `diagnostics` build runs with `VICTORY_ROOT_BOUNDS=0` (to compare with
+/// the unchecked reads, which can fault the host GPU).
+pub fn root_bounds() -> bool {
+    static BOUNDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BOUNDS.get_or_init(|| {
+        !cfg!(feature = "diagnostics")
+            || parse_root_bounds(std::env::var("VICTORY_ROOT_BOUNDS").ok().as_deref())
+    })
+}
+
+/// `VICTORY_ROOT_BOUNDS`'s value: `0` off, anything else (or unset) on.
+/// Pure, for testing.
+fn parse_root_bounds(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 /// What the device said ([`set_host_wave32`]).
@@ -232,7 +277,9 @@ pub struct UserData {
     pub index: u32,
     /// Root parameter index in the title's root signature.
     pub slot: u8,
-    /// `Constants` or `Table` (see the module notes for the value).
+    /// `Constants` or `Table` (see the module notes for the value), or
+    /// `Descriptor`: the byte length of the root view `slot` (see the
+    /// module notes on root views).
     pub root: RootType,
     /// Dword within the parameter.
     pub dword: u32,
@@ -361,6 +408,7 @@ pub fn emit_with(
         prims,
         mesh_stride,
         host_wave32: opts.host_wave32,
+        root_bounds: opts.root_bounds,
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -490,6 +538,18 @@ mod tests {
         for off in ["", "0", "yes", "true", "2"] {
             assert_eq!(parse_host_wave32(Some(off)), Some(false), "{off:?}");
         }
+    }
+
+    #[test]
+    fn the_root_bounds_switch_parses() {
+        use super::parse_root_bounds;
+        assert!(parse_root_bounds(None));
+        assert!(!parse_root_bounds(Some("0")));
+        assert!(!parse_root_bounds(Some(" 0\n")));
+        for on in ["", "1", "yes", "2"] {
+            assert!(parse_root_bounds(Some(on)), "{on:?}");
+        }
+        assert!(super::Options::default().root_bounds);
     }
 
     #[test]

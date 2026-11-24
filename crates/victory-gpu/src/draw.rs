@@ -133,22 +133,26 @@ pub(crate) fn dispatched() -> u64 {
 
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
-/// copy in upload memory.
+/// copy in upload memory. Also the bytes there translated shaders may read
+/// (their root view bounds, `victory_shader::emit::Options::root_bounds`):
+/// to the copy's end for SRVs, the constant buffer's 64 KiB for CBVs (both
+/// cut at the buffer's end, CBVs rounded up to whole 16-byte rows).
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
-/// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+/// other views as 1 MiB (both cut at their buffer's end) for refreshes.
+fn root_view(list: &HostList, address: u64, srv: bool) -> Option<(u64, u32)> {
     let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
+    let left = shadow.left(address);
+    let len = left.min(if srv { 1 << 20 } else { 1 << 16 });
+    let bounds = if srv { left } else { len.next_multiple_of(16) };
+    let bounds = u32::try_from(bounds).unwrap_or(u32::MAX);
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
-        return Some(gpu);
+        return Some((gpu, bounds));
     }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    Some((gpu, bounds))
 }
 
 macro_rules! once {
@@ -471,6 +475,30 @@ impl State {
                 }
                 return false;
             }
+            // Root views first: the user data holds their lengths.
+            let mut lengths: Vec<(u8, u32)> = Vec::new();
+            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+                for &(slot, param) in views {
+                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    else {
+                        once!(slot, "a shader reads a root view the title did not set");
+                        continue;
+                    };
+                    let Some((gpu, len)) = root_view(list, *address, srv) else {
+                        continue;
+                    };
+                    lengths.push((slot, len));
+                    // SAFETY: an open list; the address is in live memory.
+                    unsafe {
+                        match (compute, srv) {
+                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
+                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        }
+                    }
+                }
+            }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -479,6 +507,11 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        // A root view's length (0, reading nothing, when
+                        // none is bound).
+                        None if u.root == RootType::Descriptor => {
+                            lengths.iter().find(|v| v.0 == u.slot).map_or(0, |v| v.1)
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -488,27 +521,6 @@ impl State {
                         l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     } else {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    }
-                }
-            }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
-                for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
-                    };
-                    let Some(gpu) = root_view(list, *address, srv) else {
-                        continue;
-                    };
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
                     }
                 }
             }
@@ -566,7 +578,13 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
-            for u in &t.host.user_data {
+            // Root view lengths show with the root views' host addresses.
+            for u in t
+                .host
+                .user_data
+                .iter()
+                .filter(|u| u.root != RootType::Descriptor)
+            {
                 let v = self.user_value(compute, u.slot, u.root, u.dword);
                 let _ = write!(text, " u{}={v:#x}", u.index);
                 let index = if u.root == RootType::Table { v / 32 } else { v };

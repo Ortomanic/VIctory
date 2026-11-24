@@ -66,6 +66,8 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// The host has no 64-lane compute waves ([`super::Options`]).
     pub host_wave32: bool,
+    /// Reads through root views are bounds-checked ([`super::Options`]).
+    pub root_bounds: bool,
 }
 
 /// A console wave64 compute program on a host without 64-lane waves
@@ -690,6 +692,7 @@ impl<'a> Lower<'a> {
                 None => l.code_dword(byte),
                 Some(h) => {
                     let c = l.cur;
+                    let (byte, inside) = l.root_bounds(h, byte, 4);
                     let (u, mask, al) = (l.s.m.undef(l.s.t.i32), l.s.m.i8(1), l.s.m.i32(4));
                     let r = l.s.op(
                         c,
@@ -700,7 +703,8 @@ impl<'a> Lower<'a> {
                         &[h, byte, u, mask, al],
                     );
                     let x = l.s.m.extract(c, r, 0);
-                    Ok(l.as_int(x))
+                    let x = l.as_int(x);
+                    Ok(l.zero_outside(inside, x))
                 }
             }
         };
@@ -1225,16 +1229,18 @@ impl<'a> Lower<'a> {
             RootType::Constants | RootType::Table => {}
             _ => return Val::Missing("a root descriptor"),
         }
-        let index = u32::from(rp.user_data) + dword;
-        self.user_reads.insert(
-            index,
-            UserData {
-                index,
-                slot: rp.slot,
-                root: rp.root,
-                dword,
-            },
-        );
+        Val::I32(self.user_dword(UserData {
+            index: u32::from(rp.user_data) + dword,
+            slot: rp.slot,
+            root: rp.root,
+            dword,
+        }))
+    }
+
+    /// The user-data dword `u` lists, read in the entry block.
+    fn user_dword(&mut self, u: UserData) -> V {
+        let index = u.index;
+        self.user_reads.insert(index, u);
         self.s.user_data = self.s.user_data.max(index + 1);
         let h = match self.user_data {
             Some(h) => h,
@@ -1254,7 +1260,65 @@ impl<'a> Lower<'a> {
             59,
             &[h, row],
         );
-        Val::I32(self.s.m.extract(entry, r, index % 4))
+        self.s.m.extract(entry, r, index % 4)
+    }
+
+    /// Bounds of a read of `bytes` bytes at byte `off` through handle `h`
+    /// (see the module notes on root views). The host binds root views as
+    /// raw device addresses without bounds checks, so a read past its copy
+    /// of the buffer faults the GPU. Through a root view (when
+    /// [`Parts::root_bounds`]): whether the read lies inside the view,
+    /// `off + bytes <= len` with `len` the view's host length from user data
+    /// (computed without wrapping), and the offset to read at, 0 outside so
+    /// that the load itself stays in the buffer; [`Self::zero_outside`]
+    /// then makes what it read 0. Otherwise: none, and `off`.
+    // shortcut: a view shorter than `bytes` still reads at its offset 0 (up
+    // to 15 bytes past its length, inside the host allocation except for a
+    // view in a buffer's last bytes).
+    fn root_bounds(&mut self, h: V, off: V, bytes: u32) -> (V, Option<V>) {
+        if !self.x.root_bounds {
+            return (off, None);
+        }
+        let views = self.s.root_cbvs.iter().chain(&self.s.root_srvs);
+        let Some(slot) = views.copied().find(|r| r.1 == h).map(|r| r.0) else {
+            return (off, None);
+        };
+        let Some(rp) = self
+            .x
+            .native
+            .layout
+            .iter()
+            .find(|p| p.root == RootType::Descriptor && p.slot == slot)
+            .copied()
+        else {
+            return (off, None);
+        };
+        let len = self.user_dword(UserData {
+            index: u32::from(rp.user_data),
+            slot,
+            root: RootType::Descriptor,
+            dword: 0,
+        });
+        let c = self.cur;
+        let n = self.s.m.i32(bytes);
+        let fits = self.s.m.cmp(c, pred::IUGE, len, n);
+        let last = self.s.m.bin(c, Bin::Sub, len, n);
+        let below = self.s.m.cmp(c, pred::IULE, off, last);
+        let inside = self.s.m.bin(c, Bin::And, fits, below);
+        let zero = self.s.m.i32(0);
+        (self.s.m.select(c, inside, off, zero), Some(inside))
+    }
+
+    /// `x` (an `i32` read), or 0 where [`Self::root_bounds`] said the read
+    /// lies outside its view.
+    fn zero_outside(&mut self, inside: Option<V>, x: V) -> V {
+        match inside {
+            Some(inside) => {
+                let zero = self.s.m.i32(0);
+                self.s.m.select(self.cur, inside, x, zero)
+            }
+            None => x,
+        }
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -3062,6 +3126,7 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let (a, inside) = self.root_bounds(h, a, 4);
                 let mask = self.s.m.i8(1);
                 let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
                 let r = self.s.op(
@@ -3074,6 +3139,7 @@ impl<'a> Lower<'a> {
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
+                let x = self.zero_outside(inside, x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -3301,11 +3367,15 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// The dword at a computed byte address of a constant buffer.
+    /// The dword at a computed byte address of a constant buffer (its
+    /// 16-byte row bounds-checked through a root view).
     fn cbuffer_dword(&mut self, h: V, a: V) -> V {
         let c = self.cur;
         let four = self.s.m.i32(4);
-        let ri = self.s.m.bin(c, Bin::LShr, a, four);
+        let not15 = self.s.m.i32(!15);
+        let row = self.s.m.bin(c, Bin::And, a, not15);
+        let (row, inside) = self.root_bounds(h, row, 16);
+        let ri = self.s.m.bin(c, Bin::LShr, row, four);
         let r = self.s.op(
             c,
             "cbufferLoadLegacy.i32",
@@ -3325,7 +3395,7 @@ impl<'a> Lower<'a> {
             let is = self.s.m.cmp(c, pred::EQ, comp, jc);
             x = self.s.m.select(c, is, e, x);
         }
-        x
+        self.zero_outside(inside, x)
     }
 
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
@@ -3343,6 +3413,7 @@ impl<'a> Lower<'a> {
         let total: u32 = bits.iter().sum();
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
+            let (at, inside) = l.root_bounds(h, at, 4 * n);
             let mask = l.s.m.i8((1u8 << n) - 1);
             let r = l.s.op(
                 c,
@@ -3355,7 +3426,8 @@ impl<'a> Lower<'a> {
             (0..n)
                 .map(|k| {
                     let x = l.s.m.extract(c, r, k);
-                    l.as_int(x)
+                    let x = l.as_int(x);
+                    l.zero_outside(inside, x)
                 })
                 .collect()
         };
@@ -6680,6 +6752,8 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // Bounds of a raw read through a root view.
+        let mut inside = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -6718,6 +6792,8 @@ impl<'a> Lower<'a> {
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let (off, bounds) = self.root_bounds(h, off, 4 * count);
+                    inside = bounds;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
@@ -6751,13 +6827,15 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                let x = self.zero_outside(inside, x.expect("a channel"));
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);
+            let x = self.zero_outside(inside, x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -7267,6 +7345,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             host_wave32: false,
+            root_bounds: true,
         })
         .map(|_| ())
     }
@@ -7318,6 +7397,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             host_wave32: false,
+            root_bounds: true,
         })
     }
 
@@ -7377,6 +7457,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             host_wave32,
+            root_bounds: true,
         })
         .unwrap()
     }
@@ -7580,6 +7661,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             host_wave32: false,
+            root_bounds: true,
         }).unwrap();
 
         let container =
@@ -7864,6 +7946,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             host_wave32: false,
+            root_bounds: true,
         })
         .map(|_| ())
     }
@@ -7932,6 +8015,106 @@ mod tests {
             0x26 << 25 | 2 << 17 | 3 << 9 | 257,
         ])
         .unwrap();
+    }
+
+    /// Lowers a compute program whose root parameter 2 is a root SRV in
+    /// user data 0..1 (`s[0:1]`), runs `body` (its result in v1, offsets
+    /// from v0, the thread id) and branches on v1.
+    fn lower_root_srv(body: &[u32], root_bounds: bool) -> super::Lowered {
+        let mut words = body.to_vec();
+        words.extend([
+            v_readfirstlane_s0(1),
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 2,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 2,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            host_wave32: false,
+            root_bounds,
+        })
+        .unwrap()
+    }
+
+    // global_load_dword v1, v0, s[0:1] (a global load at a computed offset).
+    const GLOBAL_LOAD: [u32; 2] = [0xDC30_8000, 0x0100_0000];
+    // s_mov_b32 s2, -1; s_mov_b32 s3, 0x27fac (a descriptor built around
+    // the root SRV, no record limit); tbuffer_load_format_x v1, v0,
+    // s[0:3], 0 offen format:8_8_8_8_UNORM (vertex fetch).
+    const FORMAT_LOAD: [u32; 5] = [
+        0xBE82_03C1,
+        0xBE83_03FF,
+        0x0002_7FAC,
+        0xE9C0_1000,
+        0x8000_0100,
+    ];
+
+    /// Reads through a root SRV at offsets the shader computes (global
+    /// loads, typed-format vertex fetch) are bounds-checked against the
+    /// view's length, which the host passes in the user data of the root
+    /// SRV's own address dword; without root bounds nothing is added.
+    #[test]
+    fn root_srv_reads_are_bounds_checked() {
+        use crate::emit::UserData;
+        let length = UserData {
+            index: 0,
+            slot: 2,
+            root: RootType::Descriptor,
+            dword: 0,
+        };
+        for (name, body) in [("global", &GLOBAL_LOAD[..]), ("format", &FORMAT_LOAD[..])] {
+            let checked = lower_root_srv(body, true);
+            assert_eq!(checked.root_srvs, [2], "{name}");
+            assert_eq!(checked.user_data, [length], "{name}");
+            dump(&format!("root_bounds_{name}.dxil"), &checked.dxil);
+            let unchecked = lower_root_srv(body, false);
+            assert_eq!(unchecked.root_srvs, [2], "{name}");
+            assert!(unchecked.user_data.is_empty(), "{name}");
+            assert_ne!(checked.dxil, unchecked.dxil, "{name}");
+            dump(&format!("root_unbounded_{name}.dxil"), &unchecked.dxil);
+        }
     }
 
     #[test]

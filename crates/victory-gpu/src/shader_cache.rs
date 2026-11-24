@@ -51,18 +51,25 @@ fn options() -> victory_shader::emit::Options {
                 "translating wave64 compute programs for 32-lane waves where they allow it"
             );
         }
+        if !options.root_bounds {
+            tracing::warn!(
+                "VICTORY_ROOT_BOUNDS=0: reads through root views are not bounds-checked"
+            );
+        }
         options
     })
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time, and the host's wave sizes).
+/// the translation settings it runs with (the loop limit and root view
+/// bounds, which a diagnostics build can change at run time, and the
+/// host's wave sizes).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
         let wave32 = options().host_wave32;
+        let root_bounds = options().root_bounds;
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -75,6 +82,9 @@ fn build() -> &'static [u8; 32] {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 if wave32 {
                     bytes.extend_from_slice(b"wave32");
+                }
+                if !root_bounds {
+                    bytes.extend_from_slice(b"unbounded root views");
                 }
                 *blake3::hash(&bytes).as_bytes()
             }
