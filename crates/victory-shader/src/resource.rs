@@ -2012,6 +2012,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_loaded_buffer_descriptor_viewed_raw_is_the_loaded_one() {
+        // As the FidelityFX upscaler's programs do (FSPX).
+        let mut words = vec![
+            0xBE8A_0304, // s_mov_b32 s10, s4
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF408_0305,
+            0xFA00_0160, // s_load_dwordx4 s[12:15], s[10:11], 0x160
+            0x938A_FF0D,
+            0x000E_0010, // s_bfe_u32 s10, s13, 0x000e0010 (the stride)
+            0x848A_810A, // s_max_u32 s10, s10, 1
+            0x870F_FF0F,
+            0xCFFF_FFFF, // s_and_b32 s15, s15, 0xcfffffff
+            0x930E_0A0E, // s_mul_i32 s14, s14, s10
+            0x880F_FF0F,
+            0x3000_0000, // s_or_b32 s15, s15, 0x30000000
+            0x870D_FF0D,
+            0xC000_FFFF, // s_and_b32 s13, s13, 0xc000ffff
+            0xE038_1000,
+            0x8003_0802, // buffer_load_dwordx4 v[8:11], v2, s[12:15], 0 offen
+            S_ENDPGM,
+        ];
+        let layout = [param(Table, 4, 1)];
+        let r = track_words(&words, &layout, HwStage::Cs);
+        assert_eq!(r.scalar, [((0, 2), at(0, 0x160))]);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (0, 2),
+                first: 0
+            }
+        );
+        // A moved base address is another buffer.
+        words.insert(14, 0x800C_900C); // s_add_u32 s12, s12, 16
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        assert!(track(&p, &layout, HwStage::Cs).is_err());
+    }
+
+    #[test]
     fn root_descriptors_are_built_in_code() {
         let r = track_words(
             &[

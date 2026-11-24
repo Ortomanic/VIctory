@@ -196,3 +196,145 @@ fn root_map(
     layout.sort_by_key(|p| p.user_data);
     Ok((layout, used))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    fn words(w: &[u32]) -> Vec<u8> {
+        w.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// An image as the upscaler's 32-lane passes have it: a UAV table in
+    /// user SGPR 4 (u11 at table dword 88), a root CBV (b0, slot 2) in
+    /// SGPRs 6-7, a code-built immediate sampler.
+    fn image() -> Vec<u8> {
+        let config = words(&[
+            0x4005_cf00,
+            0x6c09_0102,
+            0,
+            0x1_0020,
+            0x10_0001,
+            0x402c_0341,
+            0x9c,
+        ]);
+        let code = words(&[S_ENDPGM]);
+        let mut entries = vec![
+            0x41,
+            0x303,
+            88,
+            11,
+            1,
+            0x404,
+            u32::MAX,
+            0, // u11, slot 0, user data 4
+            0x41,
+            0x102,
+            0,
+            0,
+            0,
+            0x2_0602,
+            u32::MAX,
+            0, // b0, slot 2, user data 6
+            0x41,
+            0x401,
+            0,
+            0,
+            0,
+            0x4,
+            u32::MAX,
+            0, // s0, immediate
+            0x42,
+            0,
+            0x2_0101,
+            11,
+            0,
+            0,
+            u32::MAX,
+            0, // declaration
+        ];
+        entries.extend([0x43, 1, 2, 3, 4, 0, 0, 0]);
+        let mut map = vec![MAP_VERSION, 0, 1, 0, 0, 3 << 16 | 0x440];
+        map.extend(entries);
+        map[1] = (4 * map.len() - 20) as u32;
+        let map = words(&map);
+        let sections = [(KIND_CONFIG, config), (KIND_CODE, code), (KIND_MAP, map)];
+        let mut at = 16 + 16 * sections.len();
+        let mut dir = Vec::new();
+        let mut body: Vec<u8> = Vec::new();
+        for (kind, data) in &sections {
+            dir.extend(words(&[*kind, at as u32, data.len() as u32, 0]));
+            body.extend(data);
+            at += data.len();
+        }
+        let mut out = MAGIC.to_vec();
+        out.extend(words(&[VERSION, sections.len() as u32, at as u32]));
+        out.extend(dir);
+        out.extend(body);
+        out
+    }
+
+    #[test]
+    fn reads_config_code_and_root_map() {
+        let p = program(&image()).unwrap();
+        assert_eq!(p.stage, HwStage::Cs);
+        assert!(!p.wave64);
+        assert_eq!(p.vgprs, 16);
+        assert_eq!(p.code, S_ENDPGM.to_le_bytes());
+        let StageIo::Cs(cs) = p.io else { panic!() };
+        assert_eq!(cs.threads, [32, 1, 1]);
+        assert_eq!(cs.user_sgprs(), 14);
+        assert_eq!(cs.system_sgprs(), ([Some(14), None, None], None));
+        assert_eq!(
+            p.used[0],
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 88,
+                lower_bound: 11,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 0,
+            }
+        );
+        assert_eq!(
+            (p.used[1].kind, p.used[1].root),
+            (ResourceType::Cbv, RootType::Descriptor)
+        );
+        assert_eq!(p.used[2].kind, ResourceType::Sampler);
+        let layout: Vec<_> = p
+            .layout
+            .iter()
+            .map(|l| (l.root, l.user_data, l.sgprs, l.slot))
+            .collect();
+        assert_eq!(
+            layout,
+            [
+                (RootType::ImmediateSampler, 0, 0, 0),
+                (RootType::Table, 4, 1, 0),
+                (RootType::Descriptor, 6, 2, 2),
+            ]
+        );
+        // The container's ACCC part reaches it through `native_programs`.
+        assert_eq!(crate::native_programs(&image()).unwrap(), [p]);
+    }
+
+    #[test]
+    fn rejects_corrupt_images() {
+        let good = image();
+        let mut bad = good.clone();
+        bad[4] = 2; // version
+        assert!(program(&bad).is_err());
+        let mut bad = good.clone();
+        bad[12] = 0xFF; // image size
+        assert!(program(&bad).is_err());
+        assert!(program(&good[..good.len() - 4]).is_err());
+        let mut bad = good.clone();
+        let tag = good.len() - 32 * 5; // the first root map entry's tag
+        bad[tag] = 0x44;
+        assert!(program(&bad).is_err());
+    }
+}
