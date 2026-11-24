@@ -2612,6 +2612,72 @@ pub(crate) mod tests {
         assert!(a.dynamic.is_some());
     }
 
+    /// Two paths add an index to one table in the code and meet before one
+    /// load (hair `CS_InterpolateStrands`): the join is the computed term,
+    /// counted from the `s_getpc_b64`. (Test from fxceless/victory-gta6
+    /// 578d459, whose `Tracer::code_join` our [`Tracer::code_value`]
+    /// already covers.)
+    #[test]
+    fn two_paths_into_one_code_table_load() {
+        let r = track_words(
+            &[
+                0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
+                0x8002_FF02,
+                0x0000_0040, // s_add_u32 s2, s2, 0x40
+                0x8203_8003, // s_addc_u32 s3, s3, 0
+                0xBF06_8001, // 0x10: s_cmp_eq_u32 s1, 0
+                0xBF85_0005, // 0x14: s_cbranch_scc1 -> 0x2c
+                0xD70F_0457,
+                0x0000_054A, // 0x18: v_add_co_u32 v87, s4, v74, s2
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0xBF82_0004, // 0x28: s_branch -> 0x3c
+                0xD70F_0457,
+                0x0000_054B, // 0x2c: v_add_co_u32 v87, s4, v75, s2
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0xDC34_8000,
+                0x577D_0057, // 0x3c: global_load_dwordx2 v[87:88], v[87:88], null
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        let [(_, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!((a.param, a.offset), (CODE, 0));
+        assert!(a.dynamic.is_some(), "the join is the computed term, the byte in the code");
+    }
+
+    /// An address into a table in the code computed per lane and taken from
+    /// the first lane (`avgLuminanceCompute` `ColorDownsample`): the lane's
+    /// index is the computed term. (Test from fxceless/victory-gta6 578d459.)
+    #[test]
+    fn a_code_table_address_taken_from_the_first_lane() {
+        let r = track_words(
+            &[
+                0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
+                0xD70F_0457,
+                0x0000_054A, // v_add_co_u32 v87, s4, v74, s2
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0x7E0C_0557, // v_readfirstlane_b32 s6, v87
+                0x7E0E_0558, // v_readfirstlane_b32 s7, v88
+                0xF400_0203,
+                0xFA00_0000, // s_load_dword s8, s[6:7], 0x0
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        let [(_, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!((a.param, a.offset), (CODE, 4));
+        assert!(a.dynamic.is_some(), "the lane's index is the computed term");
+    }
+
     const CODE_PHI: [u32; 14] = [
         0xBE80_1F00, // s_getpc_b64 s[0:1]
         0xBF06_8005, // s_cmp_eq_u32 s5, 0
