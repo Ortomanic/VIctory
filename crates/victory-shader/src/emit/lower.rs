@@ -6460,7 +6460,9 @@ impl<'a> Lower<'a> {
                 let h = 2 * attribute.channel;
                 let c = self.cur;
                 if f16 {
-                    // A half no signature element holds is the row's padding
+                    // Last fallback: a half no signature element holds even
+                    // with the row's partner (`half_inputs` pairs unlisted
+                    // rows, which hold most such halves) is the row's padding
                     // (a float3 packed into two dwords): unspecified on the
                     // hardware, so zero here rather than a failed program.
                     let lo = match half(self, h + u8::from(attribute.high))? {
