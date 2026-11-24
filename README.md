@@ -21,7 +21,8 @@ loads the world, where rendering fails.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Tested on one machine: Windows 11, AMD RX 6700 XT. It also runs on Linux
+under Wine with vkd3d-proton: see [docs/linux-wine.md](docs/linux-wine.md).
 
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
