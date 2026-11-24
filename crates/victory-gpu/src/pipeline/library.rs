@@ -49,7 +49,10 @@ struct Library {
 // mutex that holds the library.
 unsafe impl Send for Library {}
 
-const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// Not `host-pipelines.bin`, its name before the library was off under
+/// Wine: builds from before load any library found there, so an opted-in
+/// run's library would slow them down too.
+const LIBRARY_FILE: &str = "host-pipeline-library.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;

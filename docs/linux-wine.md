@@ -44,7 +44,7 @@ where there is no D3D12 device.
 ## Switches
 
 - `VICTORY_PIPELINE_LIBRARY`: 1 keeps host pipelines in
-  `host-pipelines.bin` under the cache folder (the default on Windows), 0
+  `host-pipeline-library.bin` under the cache folder (the default on Windows), 0
   does not (the default under Wine). Delete the file to reset it.
 - `VICTORY_PIPELINE_WAIT_MS`: how long a title frame may wait for pipelines
   being made (500 by default; 0 never waits, so pipelines appear a few
