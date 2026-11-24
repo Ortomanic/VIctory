@@ -9860,6 +9860,11 @@ mod tests {
     /// and a sampler (`s[16:19]`) from two tables, sets v4..v11 to small
     /// integers, runs `body` (its result in v0..v3) and branches on v0.
     fn lowers_image(body: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_image(body, crate::emit::HEAP_VIEWS).map(|_| ())
+    }
+
+    /// [`lowers_image`] for a host view heap of `heap_views` slots.
+    fn lower_image(body: &[u32], heap_views: u32) -> Result<Lowered, crate::ShaderError> {
         let mut words = vec![
             0xBE85_0380, // s_mov_b32 s5, 0
             0xBE87_0380, // s_mov_b32 s7, 0
@@ -9927,9 +9932,21 @@ mod tests {
             mesh_stride: 0,
             host_wave32: false,
             root_bounds: true,
-            heap_views: crate::emit::HEAP_VIEWS,
+            heap_views,
         })
-        .map(|_| ())
+    }
+
+    #[test]
+    fn heap_indices_clamp_to_the_host_heap_size() {
+        // image_sample v[0:3], v[4:5], s[8:15], s[16:19] dmask:0xf dim:2D
+        let body = [0xF080_0F08, 0x0082_0004];
+        let portable = lower_image(&body, crate::emit::HEAP_VIEWS).unwrap().dxil;
+        let again = lower_image(&body, crate::emit::HEAP_VIEWS).unwrap().dxil;
+        let larger = lower_image(&body, 1_041_451).unwrap().dxil;
+        assert_eq!(portable, again);
+        // The view index clamp is the only difference (the sampler's stays).
+        assert_ne!(portable, larger);
+        assert_eq!(super::super::Options::default().heap_views, crate::emit::HEAP_VIEWS);
     }
 
     #[test]
