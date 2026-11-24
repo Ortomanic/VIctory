@@ -177,6 +177,13 @@ fn forget<V>(map: &mut BTreeMap<usize, V>, from: usize, to: usize, end: impl Fn(
 /// memory is asked every time (it may be decommitted unreported).
 static COMMITTED: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
+/// Adjacent view regions found committed are kept as one run of up to this
+/// many bytes: physical-page memory is a view per 64 KiB block, and a
+/// texture's check then reads a few runs, not an entry per block. A
+/// remapping of any part forgets the whole run (asked again), so runs stay
+/// short where streaming remaps blocks one by one.
+const COMMITTED_RUN: usize = 2 << 20;
+
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive; copies into title memory must not
 /// meet a hole). Asked of the host once per view region: textures are
@@ -184,23 +191,40 @@ static COMMITTED: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 /// query takes the process's virtual-memory lock and walks the region
 /// (~80 us for a 4 GiB view of uniform protection).
 pub(crate) fn committed(at: usize, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    committed_asking(at, len).0
+}
+
+/// [`committed`], and whether the host was asked (some of the range was not
+/// known committed views).
+pub(crate) fn committed_asking(at: usize, len: usize) -> (bool, bool) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
     let end = at.saturating_add(len);
     let mut p = at;
+    let mut asked = false;
     while p < end {
-        let known = COMMITTED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .range(..=p)
-            .next_back()
-            .map(|(_, &e)| e)
-            .filter(|&e| p < e);
-        if let Some(e) = known {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::CommitHits, 1);
-            p = e;
-            continue;
+        {
+            // The known runs from `p` on, under one lock.
+            let known = COMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+            while p < end {
+                let Some(e) = known
+                    .range(..=p)
+                    .next_back()
+                    .map(|(_, &e)| e)
+                    .filter(|&e| p < e)
+                else {
+                    break;
+                };
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::CommitHits, 1);
+                p = e;
+            }
         }
+        if p >= end {
+            break;
+        }
+        asked = true;
         let remappings = REMAPPINGS.load(Ordering::Acquire);
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -209,20 +233,41 @@ pub(crate) fn committed(at: usize, len: usize) -> bool {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::CommitQueries, 1);
         if n == 0 || info.State != MEM_COMMIT || info.RegionSize == 0 {
-            return false;
+            return (false, true);
         }
-        let (from, to) = (info.BaseAddress as usize, (info.BaseAddress as usize).saturating_add(info.RegionSize));
+        let (from, to) = (
+            info.BaseAddress as usize,
+            (info.BaseAddress as usize).saturating_add(info.RegionSize),
+        );
         if info.Type == MEM_MAPPED {
             let mut known = COMMITTED.lock().unwrap_or_else(|e| e.into_inner());
             // A remapping since the query may have changed what it found.
             if REMAPPINGS.load(Ordering::Acquire) == remappings {
                 forget(&mut known, from, to, |&e| e);
-                known.insert(from, to);
+                keep_committed(&mut known, from, to);
             }
         }
         p = to;
     }
-    true
+    (true, asked)
+}
+
+/// Notes `[from, to)` (overlapping nothing in `known`) committed, joined
+/// with the runs it adjoins while the run stays within [`COMMITTED_RUN`].
+fn keep_committed(known: &mut BTreeMap<usize, usize>, mut from: usize, mut to: usize) {
+    if let Some((&start, _)) = known
+        .range(..from)
+        .next_back()
+        .filter(|&(&start, &e)| e == from && to - start <= COMMITTED_RUN)
+    {
+        known.remove(&start);
+        from = start;
+    }
+    if let Some(&e) = known.get(&to).filter(|&&e| e - from <= COMMITTED_RUN) {
+        known.remove(&to);
+        to = e;
+    }
+    known.insert(from, to);
 }
 
 /// A frame was presented: holes are looked at again (once a frame, not at
@@ -841,6 +886,131 @@ mod tests {
             assert!(!committed(p, 2 * BLOCK));
             VirtualFree(p as *mut _, 0, MEM_RELEASE);
         }
+    }
+
+    /// `blocks` contiguous 64 KiB views of a pagefile section in one
+    /// placeholder, as xmem maps physical pages: their base. They live
+    /// until the test process ends.
+    fn page_views(blocks: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a pagefile section and a placeholder, split and mapped
+        // block by block.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (blocks * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let base = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                blocks * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(base, 0);
+            for i in 0..blocks {
+                let at = base + i * BLOCK;
+                if i + 1 < blocks {
+                    VirtualFree(at as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                }
+                let view = MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    at as *const _,
+                    (i * BLOCK) as u64,
+                    BLOCK,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                assert_eq!(view.Value as usize, at);
+            }
+            base
+        }
+    }
+
+    /// Page views found committed are kept as runs of up to
+    /// [`COMMITTED_RUN`]; a remapping forgets only the run it touches.
+    #[test]
+    fn committed_page_views_are_kept_as_runs() {
+        let per_run = COMMITTED_RUN / BLOCK;
+        let blocks = per_run * 2 + per_run / 2;
+        let base = page_views(blocks);
+        let len = blocks * BLOCK;
+        let runs = || {
+            COMMITTED
+                .lock()
+                .unwrap()
+                .range(base..base + len)
+                .map(|(&s, &e)| (s - base, e - base))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(committed_asking(base, len), (true, true));
+        // A remapping elsewhere (another test) during a query keeps
+        // nothing; asked again, it is kept.
+        while committed_asking(base, len).1 {}
+        assert_eq!(
+            runs(),
+            [
+                (0, COMMITTED_RUN),
+                (COMMITTED_RUN, 2 * COMMITTED_RUN),
+                (2 * COMMITTED_RUN, len)
+            ]
+        );
+        assert_eq!(committed_asking(base + 100, BLOCK), (true, false));
+        title_memory_remapped(base + COMMITTED_RUN + 3 * BLOCK, BLOCK);
+        assert_eq!(runs(), [(0, COMMITTED_RUN), (2 * COMMITTED_RUN, len)]);
+        assert_eq!(committed_asking(base, COMMITTED_RUN), (true, false));
+        assert!(committed_asking(base, len).0);
+    }
+
+    /// What a texture's committed check costs in physical-page memory:
+    /// asking `VirtualQuery` view by view, and reading the kept runs.
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn committed_timing() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        const BLOCKS: usize = 512;
+        const ROUNDS: u32 = 200;
+        let base = page_views(BLOCKS);
+        let len = BLOCKS * BLOCK;
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let mut p = base;
+            while p < base + len {
+                // SAFETY: plain data filled in by the query.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: a valid out pointer of the right size.
+                assert_ne!(
+                    unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) },
+                    0
+                );
+                p = info.BaseAddress as usize + info.RegionSize;
+            }
+        }
+        let asked = started.elapsed() / ROUNDS;
+        while committed_asking(base, len).1 {}
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            assert_eq!(committed_asking(base, len), (true, false));
+        }
+        let known = started.elapsed() / ROUNDS;
+        println!(
+            "{} MiB in {BLOCKS} views: VirtualQuery {asked:?}, kept runs {known:?} a check",
+            len >> 20
+        );
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
