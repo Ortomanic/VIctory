@@ -110,13 +110,16 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
+/// Runs the lists' host lists and waits for them (decision 0007). The
+/// title thread is held meanwhile ([`crate::held`]): the console's call
+/// returns at once.
 extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
+        let _held = crate::held::hold();
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let host_lists: Vec<_> = lists

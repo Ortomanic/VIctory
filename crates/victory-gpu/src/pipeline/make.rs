@@ -168,6 +168,8 @@ fn wait(p: &Pending, frame: u64) {
 
 /// [`wait`], with the frame's waiting so far in `spent`.
 fn wait_in(p: &Pending, frame: u64, spent: &Mutex<Spent>) {
+    // The console's title thread never waits here ([`crate::held`]).
+    let _held = crate::held::hold();
     let spent = || spent.lock().unwrap_or_else(|e| e.into_inner());
     let started = Instant::now();
     {
