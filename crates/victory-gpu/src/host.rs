@@ -703,7 +703,17 @@ impl Host {
                 };
                 for &(from, to) in ranges {
                     let started = std::time::Instant::now();
-                    let copied = shadow.update(from as usize, (to - from) as usize);
+                    // Views of memory the title has unmapped (released
+                    // buffers, streamed pages) are left as last copied: a
+                    // copy meeting a hole falls back to slow reads
+                    // (~0.3-0.5 s per world frame of them).
+                    let (at, len) = (from as usize, (to - from) as usize);
+                    if !crate::watch::committed(at, len) {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::BindlessUnmapped, 1);
+                        continue;
+                    }
+                    let copied = shadow.update(at, len);
                     PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
                 }

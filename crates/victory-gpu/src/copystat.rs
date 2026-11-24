@@ -162,8 +162,10 @@ pub(crate) enum C {
     /// descriptors at slots from data.
     BindlessReadSubmissions,
     BindlessWriteSubmissions,
+    /// Bindless ranges not refreshed: not all committed.
+    BindlessUnmapped,
 }
-const COUNTERS: usize = C::BindlessWriteSubmissions as usize + 1;
+const COUNTERS: usize = C::BindlessUnmapped as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -427,12 +429,14 @@ pub(crate) fn log(frames: f64) {
         "heap buffer views: {table} named by tables, {bindless} made for bindless reads only, \
          {deferred} null until a table names them, {failed} null (not made); bindless ranges: {slots} \
          slots over {copies} copies, {:.1} MB read, {:.1} MB of it written by shaders; per frame \
-         {:.1} submissions reading bindlessly, {:.1} writing, {:.1} merges {:.2} ms, prepared {:.2} ms \
+         {:.1} submissions reading bindlessly, {:.1} writing, {:.1} ranges skipped (not all mapped), \
+         {:.1} merges {:.2} ms, prepared {:.2} ms \
          (copy-back of all ranges {:.2} ms, {:.1} MB compared)",
         span as f64 / 1e6,
         written as f64 / 1e6,
         c[C::BindlessReadSubmissions as usize],
         c[C::BindlessWriteSubmissions as usize],
+        c[C::BindlessUnmapped as usize],
         c[C::BindlessRebuilds as usize],
         ms(c[C::BindlessMergeUs as usize]),
         ms(c[C::BindlessPrepUs as usize]),
