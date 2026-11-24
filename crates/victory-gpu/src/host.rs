@@ -2303,6 +2303,14 @@ impl Host {
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         #[cfg(feature = "diagnostics")]
         let readying = std::time::Instant::now();
+        // Diagnostics: an intermediate target instead (VICTORY_SHOW_TARGET).
+        #[cfg(feature = "diagnostics")]
+        let shown = crate::capture::take_shown();
+        #[cfg(feature = "diagnostics")]
+        let (texture, state) = match &shown {
+            Some((copy, s)) => (&copy.texture, *s),
+            None => (texture, state),
+        };
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
