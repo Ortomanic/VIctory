@@ -167,6 +167,11 @@ impl Shadow {
             return;
         }
         // Parts newly covered from the copy, the rest as it was taken.
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::SnapshotBytes,
+            (end - start - before.as_ref().map_or(0, |(_, b)| b.len())) as u64,
+        );
         let mut grown = pooled(end - start);
         match before.take() {
             Some((at, bytes)) => {
@@ -243,7 +248,7 @@ impl Shadow {
             if first < last
                 && !synced.is_empty()
                 && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
+                && let Some((now, _)) = crate::watch::writes_fresh(first * PAGE, last * PAGE, true)
             {
                 let base = start / PAGE;
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());

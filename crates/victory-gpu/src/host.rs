@@ -613,11 +613,22 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        #[cfg(feature = "diagnostics")]
+        let _executing = crate::copystat::timed(crate::copystat::C::ExecUs);
+        #[cfg(feature = "diagnostics")]
+        let entered = std::time::Instant::now();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::Submissions, 1);
+        {
+            crate::copystat::add(crate::copystat::C::Submissions, 1);
+            let waited = (started - entered).as_micros() as u64;
+            crate::copystat::add(crate::copystat::C::LockUs, waited);
+        }
+        // The submission's askings start afresh: what the title wrote
+        // before it submitted is seen ([`crate::watch::new_epoch`]).
+        crate::watch::new_epoch();
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
@@ -680,6 +691,12 @@ impl Host {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::PrepUs, (prepared - started).as_micros() as u64);
+            add(C::GpuUs, gpu.as_micros() as u64);
+        }
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -725,6 +742,10 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::since(crate::copystat::C::BackUs, copying);
+        #[cfg(feature = "diagnostics")]
+        let _after = crate::copystat::timed(crate::copystat::C::AfterUs);
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
@@ -1304,16 +1325,22 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            let mut started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
+                        add(C::TitleCopySteps, 1);
                     }
                     batch.title_written();
+                    // The flush before it counts as refreshes (and
+                    // textures), not as this copy.
+                    started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::since(C::TitleCopyUs, started);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -1323,6 +1350,8 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::since(C::FillUs, started);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -1349,7 +1378,11 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
+                    #[cfg(feature = "diagnostics")]
+                    let snapshot = std::time::Instant::now();
                     shadow.writing(*address, *len);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::since(C::SnapshotUs, snapshot);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -1408,16 +1441,25 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        // What the step writes is seen by the askings after it.
+        crate::watch::new_epoch();
     }
 
     fn flush(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        let textures = std::time::Instant::now();
         crate::texture::refresh_all(std::mem::take(&mut self.due));
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::since(crate::copystat::C::TexBatchUs, textures);
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
+            {
+                crate::copystat::range(from, to - from, us, 0);
+                crate::copystat::add(crate::copystat::C::FlushUs, us);
+            }
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
@@ -1469,20 +1511,37 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         read_pieces(src, dst, len);
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::FallbackUs, fallback.elapsed().as_micros() as u64);
+    crate::copystat::fallback(src as usize, len, fallback.elapsed().as_micros() as u64);
 }
 
-/// After a failed bulk read into host memory, skip contiguous holes. Never
-/// cache the query across copies: the title may remap the same address.
+/// After a failed bulk read into host memory, skip contiguous holes. The
+/// title may remap the same address, so what queries find is kept only
+/// for views, whose maps and unmaps the runtime reports
+/// ([`crate::watch::known_committed`], forgotten when remapped): those are
+/// read without a query (physical-page memory is a view per 64 KiB, a
+/// query each). A read that fails anyway goes piece by piece.
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
     let mut offset = 0;
     while offset < len {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
+        if let Some(end) = crate::watch::known_committed(at as usize) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::FallbackKnown, 1);
+            let n = (end - at as usize).min(remaining);
+            if !read(at, to, n) {
+                read_pieces(at, to, n);
+            }
+            offset += n;
+            continue;
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::FallbackQueries, 1);
+        let remappings = crate::watch::REMAPPINGS.load(Ordering::Acquire);
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
@@ -1497,9 +1556,15 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
-            // A mapping may change between query and read.
-            read_pieces(at, to, n);
+        } else {
+            if info.Type == MEM_MAPPED {
+                let from = info.BaseAddress as usize;
+                crate::watch::found_committed_view(from, from + info.RegionSize, remappings);
+            }
+            if !read(at, to, n) {
+                // A mapping may change between query and read.
+                read_pieces(at, to, n);
+            }
         }
         offset += n;
     }
@@ -1959,7 +2024,11 @@ impl Host {
                 transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT),
             ]);
             p.copy.close();
+            #[cfg(feature = "diagnostics")]
+            let executing = std::time::Instant::now();
             self.execute(&[&p.copy]);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::since(crate::copystat::C::PresentExecUs, executing);
             #[cfg(feature = "diagnostics")]
             let completed = (capture.is_some() || new_depth.is_some()) && self.capture_completed();
             #[cfg(feature = "diagnostics")]
@@ -1968,7 +2037,11 @@ impl Host {
             {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            #[cfg(feature = "diagnostics")]
+            let swapping = std::time::Instant::now();
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::since(crate::copystat::C::SwapUs, swapping);
             #[cfg(not(feature = "diagnostics"))]
             let _ = status;
             #[cfg(feature = "diagnostics")]
@@ -2062,12 +2135,20 @@ impl Host {
                 )]);
             }
             p.copy.close();
+            #[cfg(feature = "diagnostics")]
+            let executing = std::time::Instant::now();
             self.execute(&[&p.copy]);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::since(crate::copystat::C::PresentExecUs, executing);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            #[cfg(feature = "diagnostics")]
+            let swapping = std::time::Instant::now();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::since(crate::copystat::C::SwapUs, swapping);
             p.meter.frame(p.hwnd, false);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

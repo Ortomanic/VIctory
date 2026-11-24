@@ -44,22 +44,227 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+/// Page ranges asked about since the submission began or since our last
+/// write into title memory in it ([`new_epoch`]): `first page → end page`,
+/// merged, of askings the kernel answered (write-watched memory) and of
+/// those the guards answered (views). A submission's flushes ask about the
+/// same big buffers again and again (~45 askings a world submission);
+/// what the title wrote before it submitted was found at the first, and
+/// what it writes while the submission is prepared (racing it) is found at
+/// the next submission's: the kernel's bits and the guards keep it.
+struct Epoch {
+    /// Changes at each new epoch and each forgetting, so that an asking
+    /// that raced one does not note its pages.
+    generation: u64,
+    watched: BTreeMap<usize, usize>,
+    guarded: BTreeMap<usize, usize>,
+}
+
+static EPOCH: Mutex<Epoch> = Mutex::new(Epoch {
+    generation: 0,
+    watched: BTreeMap::new(),
+    guarded: BTreeMap::new(),
+});
+
+fn epoch() -> std::sync::MutexGuard<'static, Epoch> {
+    EPOCH.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A submission begins, or a step of it writes title memory: askings go
+/// to the kernel and the guards again.
+pub(crate) fn new_epoch() {
+    let mut e = epoch();
+    e.generation += 1;
+    e.watched.clear();
+    e.guarded.clear();
+}
+
+/// Pages `[first, last)` are asked about afresh in this epoch (memory
+/// remapped or written by us).
+fn forget_asked(first: usize, last: usize) {
+    let mut e = epoch();
+    if e.watched.is_empty() && e.guarded.is_empty() {
+        return;
+    }
+    e.generation += 1;
+    cut(&mut e.watched, first, last);
+    cut(&mut e.guarded, first, last);
+}
+
+/// The parts of `[first, last)` that none of `maps`' extents cover.
+fn gaps(maps: &[&BTreeMap<usize, usize>], first: usize, last: usize) -> Vec<(usize, usize)> {
+    let mut covered: Vec<(usize, usize)> = maps
+        .iter()
+        .flat_map(|m| {
+            let before = m
+                .range(..=first)
+                .next_back()
+                .filter(|&(_, &e)| e > first)
+                .map(|(&s, &e)| (s, e));
+            before
+                .into_iter()
+                .chain(m.range(first + 1..last).map(|(&s, &e)| (s, e)))
+        })
+        .collect();
+    covered.sort_unstable();
+    let mut out = Vec::new();
+    let mut at = first;
+    for (s, e) in covered {
+        if at >= last {
+            break;
+        }
+        if s > at {
+            out.push((at, s.min(last)));
+        }
+        at = at.max(e);
+    }
+    if at < last {
+        out.push((at, last));
+    }
+    out
+}
+
+/// Notes `[from, to)` in `map`, merged with the extents it overlaps or
+/// adjoins.
+fn insert_merged(map: &mut BTreeMap<usize, usize>, mut from: usize, mut to: usize) {
+    if let Some((&s, &e)) = map.range(..=from).next_back()
+        && e >= from
+    {
+        map.remove(&s);
+        from = s;
+        to = to.max(e);
+    }
+    let inside: Vec<(usize, usize)> = map.range(from..=to).map(|(&s, &e)| (s, e)).collect();
+    for (s, e) in inside {
+        map.remove(&s);
+        to = to.max(e);
+    }
+    map.insert(from, to);
+}
+
+/// Takes `[from, to)` out of `map`'s extents.
+fn cut(map: &mut BTreeMap<usize, usize>, from: usize, to: usize) {
+    let hit: Vec<(usize, usize)> = map
+        .range(..to)
+        .rev()
+        .take_while(|&(_, &e)| e > from)
+        .map(|(&s, &e)| (s, e))
+        .collect();
+    for (s, e) in hit {
+        map.remove(&s);
+        if s < from {
+            map.insert(s, from);
+        }
+        if e > to {
+            map.insert(to, e);
+        }
+    }
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
+///
+/// Pages this epoch asked about already ([`Epoch`]) are answered from the
+/// journal, without the kernel or the guards.
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_in(start, end, guarded, true)
+}
+
+/// [`writes`] asking the kernel and the guards about all of the range:
+/// after our own write into title memory, to take its bits.
+pub(crate) fn writes_fresh(
+    start: usize,
+    end: usize,
+    guarded: bool,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_in(start, end, guarded, false)
+}
+
+fn writes_in(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    reuse: bool,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    #[cfg(feature = "diagnostics")]
+    let waiting = std::time::Instant::now();
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::since(crate::copystat::C::JournalWaitUs, waiting);
+    let j = &mut *j;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let (gaps, generation) = if reuse {
+        let e = epoch();
+        let gaps = if guarded {
+            gaps(&[&e.watched, &e.guarded], first, last)
+        } else {
+            gaps(&[&e.watched], first, last)
+        };
+        (gaps, e.generation)
+    } else {
+        (vec![(first, last)], 0)
+    };
+    #[cfg(feature = "diagnostics")]
+    match gaps.as_slice() {
+        [] => crate::copystat::add(crate::copystat::C::EpochSkips, 1),
+        [(a, b)] if (*a, *b) == (first, last) => {}
+        _ => crate::copystat::add(crate::copystat::C::EpochPartial, 1),
+    }
+    // Pages the kernel or the guards report go into the journal even if a
+    // later gap fails: their bits are taken.
+    j.asked += 1;
+    let now = j.asked;
+    let mut asked = Vec::with_capacity(gaps.len());
+    for (a, b) in gaps {
+        let pages = ask(j, a, b, guarded)?;
+        for page in pages.0 {
+            j.written.insert(page, now);
+        }
+        asked.push((a, b, pages.1));
+    }
+    if reuse && !asked.is_empty() {
+        let mut e = epoch();
+        if e.generation == generation {
+            for (a, b, by_guard) in asked {
+                let kind = if by_guard {
+                    &mut e.guarded
+                } else {
+                    &mut e.watched
+                };
+                insert_merged(kind, a, b);
+            }
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+    }
+    Some((
+        now,
+        j.written
+            .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+    ))
+}
+
+/// Asks the kernel (or the guards, view memory with `guarded`) for the
+/// written pages of pages `[first, last)`: the pages, and whether the
+/// guards answered. `None` if the memory is neither watched nor (with
+/// `guarded`) a view.
+fn ask(j: &mut Journal, first: usize, last: usize, guarded: bool) -> Option<(Vec<usize>, bool)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
     // View memory cannot be write-watched: where it is known to be a view,
     // the kernel is not asked. Under Wine every query takes the process's
     // virtual-memory lock, which the title's mapping threads hold across
@@ -70,6 +275,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if view {
         crate::copystat::add(crate::copystat::C::KernelSkips, 1);
     }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = view || unsafe {
         GetWriteWatch(
@@ -82,35 +289,27 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         )
     } != 0;
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::WatchKernelUs, started.elapsed().as_micros() as u64);
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
-        }
-        guard(first * PAGE, last * PAGE)?
-    } else {
-        Vec::new()
-    };
-    #[cfg(feature = "diagnostics")]
-    {
+    if !view {
         use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
+        let us = started.elapsed().as_micros() as u64;
+        add(C::KernelCalls, 1);
+        if guarded {
+            add(C::WatchKernelUs, us);
+        } else {
+            add(C::TexKernelCalls, 1);
+            add(C::TexKernelUs, us);
+        }
     }
-    j.asked += 1;
-    let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    if !failed {
+        let pages = j.found[..count].iter().map(|&at| at / PAGE).collect();
+        return Some((pages, false));
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    if !guarded {
+        return None;
+    }
+    #[cfg(feature = "diagnostics")]
+    let _guarding = crate::copystat::timed(crate::copystat::C::GuardUs);
+    Some((guard(first * PAGE, last * PAGE)?, true))
 }
 
 /// Guarded blocks of view memory.
@@ -250,6 +449,28 @@ pub(crate) fn committed_asking(at: usize, len: usize) -> (bool, bool) {
         p = to;
     }
     (true, asked)
+}
+
+/// The end of the run of view memory known committed ([`COMMITTED`])
+/// that holds `at`, if one does.
+pub(crate) fn known_committed(at: usize) -> Option<usize> {
+    COMMITTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=at)
+        .next_back()
+        .map(|(_, &e)| e)
+        .filter(|&e| at < e)
+}
+
+/// A region query made when [`REMAPPINGS`] was `remappings` found `[from,
+/// to)` committed view memory: kept as [`committed`] keeps what it finds.
+pub(crate) fn found_committed_view(from: usize, to: usize, remappings: u64) {
+    let mut known = COMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+    if REMAPPINGS.load(Ordering::Acquire) == remappings {
+        forget(&mut known, from, to, |&e| e);
+        keep_committed(&mut known, from, to);
+    }
 }
 
 /// Notes `[from, to)` (overlapping nothing in `known`) committed, joined
@@ -545,13 +766,18 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    let end = at.saturating_add(len);
+    open(&mut guards(), at, end);
+    forget_asked(at / PAGE, end.div_ceil(PAGE));
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
     REMAPPINGS.fetch_add(1, Ordering::AcqRel);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::Remaps, 1);
+    forget_asked(at / PAGE, at.saturating_add(len.max(1)).div_ceil(PAGE));
     let to = at.saturating_add(len.max(1));
     forget_kinds(&mut KINDS.lock().unwrap_or_else(|e| e.into_inner()), at, to);
     forget(&mut COMMITTED.lock().unwrap_or_else(|e| e.into_inner()), at, to, |&e| e);
@@ -682,6 +908,9 @@ mod tests {
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
+        // As at the next submission: the epoch's askings are answered from
+        // the journal ([`askings_of_an_epoch_are_answered_once`]).
+        new_epoch();
         let (now, after) = writes(start, end, false).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
@@ -699,6 +928,83 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn epoch_extents_merge_cut_and_leave_gaps() {
+        let mut m = BTreeMap::new();
+        insert_merged(&mut m, 10, 20);
+        insert_merged(&mut m, 30, 40);
+        insert_merged(&mut m, 20, 25);
+        let extents =
+            |m: &BTreeMap<usize, usize>| m.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>();
+        assert_eq!(extents(&m), [(10, 25), (30, 40)]);
+        assert_eq!(gaps(&[&m], 0, 50), [(0, 10), (25, 30), (40, 50)]);
+        assert_eq!(gaps(&[&m], 12, 24), []);
+        assert_eq!(gaps(&[&m], 12, 35), [(25, 30)]);
+        let mut other = BTreeMap::new();
+        insert_merged(&mut other, 24, 31);
+        assert_eq!(gaps(&[&m, &other], 12, 45), [(40, 45)]);
+        cut(&mut m, 15, 35);
+        assert_eq!(extents(&m), [(10, 15), (35, 40)]);
+        insert_merged(&mut m, 5, 50);
+        assert_eq!(extents(&m), [(5, 50)]);
+    }
+
+    /// Within an epoch a range asked again is answered from the journal; a
+    /// write in between is never lost: the next epoch's asking (or an
+    /// asking after our own write) reports it.
+    #[test]
+    fn askings_of_an_epoch_are_answered_once() {
+        // SAFETY: a fresh write-watched allocation, kept.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 4 * PAGE);
+        let page = p / PAGE + 2;
+        let mut deferred = 0;
+        for round in 0..20u8 {
+            new_epoch();
+            let (before, _) = writes(start, end, false).expect("watched");
+            // SAFETY: committed pages of ours.
+            unsafe { ((p + 2 * PAGE + 8) as *mut u8).write_volatile(round) };
+            let (now, again) = writes(p + PAGE, p + 3 * PAGE, false).expect("watched");
+            let seen = |list: &[(usize, u64)], after: u64| {
+                list.iter().any(|&(q, w)| q == page && w > after)
+            };
+            if !seen(&again, before) {
+                // Another test's remapping may start a new generation
+                // between the askings: then the kernel was asked.
+                deferred += 1;
+            }
+            new_epoch();
+            let (_, later) = writes(start, end, false).expect("watched");
+            assert!(
+                seen(&later, before),
+                "a write between askings is reported by the next epoch"
+            );
+            let _ = now;
+        }
+        assert!(
+            deferred > 0,
+            "the second asking of an epoch skipped the kernel"
+        );
+        // Our own write forgets the epoch's askings there.
+        new_epoch();
+        let (before, _) = writes(start, end, false).expect("watched");
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 8) as *mut u8).write_volatile(1) };
+        writing(p + 8, 1);
+        let (_, after) = writes(start, end, false).expect("watched");
+        assert!(after.iter().any(|&(q, w)| q == p / PAGE && w > before));
+        // Not freed: the journal keeps its pages, which a test allocating
+        // at the same address next would find written.
     }
 
     /// What the allocation queries found is kept for the allocation and
