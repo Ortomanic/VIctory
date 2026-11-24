@@ -200,6 +200,207 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+/// The buffer a texture the host writes is copied through into the texture
+/// of a view the title placed in its memory in another format ([`alias`]):
+/// per level and layer, the two textures' copy layouts (the same bytes:
+/// the texels are as wide), the written texture's first.
+struct Through {
+    buffer: ID3D12Resource,
+    parts: Vec<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>,
+}
+
+// SAFETY: a device-local buffer lists only record copies with.
+unsafe impl Send for Through {}
+// SAFETY: as above.
+unsafe impl Sync for Through {}
+
+/// The most levels times layers [`alias`] copies (a cube of nine levels).
+const ALIAS_PARTS: u32 = 54;
+
+/// The copy buffers of [`alias`], by the placed view's texture (`None`:
+/// the two cannot be copied that way, asked once).
+static THROUGH: Mutex<Option<HashMap<usize, Option<Arc<Through>>>>> = Mutex::new(None);
+
+/// Levels times layers of a texture (a volume's slices are one part).
+fn parts_of(d: &D3D12_RESOURCE_DESC) -> u32 {
+    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(d.DepthOrArraySize)
+    };
+    u32::from(d.MipLevels) * layers
+}
+
+/// Whether two textures' copy layouts lay out the same bytes, part for
+/// part (offsets, sizes, row pitches): a copy of one into a buffer can be
+/// copied out of it into the other.
+fn layouts_alike(a: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT], b: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            let (fa, fb) = (a.Footprint, b.Footprint);
+            a.Offset == b.Offset
+                && (fa.Width, fa.Height, fa.Depth, fa.RowPitch) == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
+        })
+}
+
+/// The copy buffer for `placed` (made once), `None` if its texture and
+/// `source`'s cannot be copied into each other through one.
+fn through(placed: This, from: &ID3D12Resource, to: &ID3D12Resource) -> Option<Arc<Through>> {
+    let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    if let Some(known) = map.get(&(placed as usize)) {
+        return known.clone();
+    }
+    let host = host()?;
+    // SAFETY: live textures.
+    let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
+    let parts = parts_of(&of_from);
+    let made = (|| {
+        if parts == 0 || parts > ALIAS_PARTS || parts != parts_of(&of_to) {
+            return None;
+        }
+        let mut rows = [(); 2].map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
+        let mut bytes = [0u64; 2];
+        // SAFETY: plain queries; the out pointers are ours and hold
+        // `parts` layouts each.
+        unsafe {
+            for (k, d) in [of_from, of_to].iter().enumerate() {
+                host.device.GetCopyableFootprints(
+                    d,
+                    0,
+                    parts,
+                    0,
+                    Some(rows[k].as_mut_ptr()),
+                    None,
+                    None,
+                    Some(&mut bytes[k]),
+                );
+            }
+        }
+        if bytes[0] == 0 || bytes[0] == u64::MAX || bytes[0] != bytes[1] || !layouts_alike(&rows[0], &rows[1]) {
+            return None;
+        }
+        let buffer = host.default_buffer(bytes[0])?;
+        crate::host::name(&buffer, || {
+            format!(
+                "alias copy {}x{} f{} to f{}",
+                of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
+            )
+        });
+        let [of_written, of_read] = rows;
+        Some(Arc::new(Through {
+            buffer,
+            parts: of_written.into_iter().zip(of_read).collect(),
+        }))
+    })();
+    tracing::info!(
+        view = ?placed,
+        width = of_from.Width,
+        height = of_from.Height,
+        parts,
+        written_as = of_from.Format.0,
+        read_as = of_to.Format.0,
+        copied = made.is_some(),
+        "a view placed in the memory of a texture the host writes, in another format: read from that texture by a copy on the host"
+    );
+    map.insert(placed as usize, made.clone());
+    made
+}
+
+/// Brings `placed`, the texture of a view the title placed in the memory
+/// of `source` (`crate::resource::alias_of`), up to date with what the
+/// host wrote to `source`: the texels of every level and layer copied as
+/// they are, through a buffer (the host copies between two formats of one
+/// texel width in no other way). Recorded the first time the list reads
+/// the view and again whenever the list used `source` in another way since
+/// (wrote it, or read it itself). Leaves `placed` in the copy destination
+/// state, as [`upload`] does. False if the copy cannot be made: the caller
+/// fills the texture from title memory, as before.
+///
+/// Ported from fxceless/victory-gta6 578d459 (`texture::alias`).
+pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+    const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    let (Some(to), Some(from)) = (
+        crate::resource::host_resource(placed),
+        crate::resource::host_resource(source),
+    ) else {
+        return false;
+    };
+    let Some(through) = through(placed, from, to) else {
+        return false;
+    };
+    let first = list.first_use(placed as usize);
+    // The source's first use in the list records nothing (its prelude
+    // brings it to the state); a use in another way since the last copy
+    // shows as a change of state.
+    let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
+        let state = crate::host::legal_state(texture, COPY_SOURCE);
+        let barrier = crate::host::transition(
+            texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(state as i32),
+        );
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        before
+    });
+    if !first && before.is_none() {
+        return true;
+    }
+    crate::list::ensure_state(list, placed, COPY_DEST);
+    let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: index as u32,
+        },
+    };
+    let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(&through.buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *row },
+    };
+    let (common, read, written) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+    // SAFETY: an open list and live resources; the buffer is as big as the
+    // layouts and rests in the common state between copies.
+    unsafe {
+        list.list
+            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+        for (index, (of_written, _)) in through.parts.iter().enumerate() {
+            list.list
+                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+        }
+        list.list
+            .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+        for (index, (_, of_read)) in through.parts.iter().enumerate() {
+            list.list
+                .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+        }
+        list.list
+            .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+    }
+    list.keep(&through.buffer);
+    // A draw that also writes the source (a view of it readied before this
+    // one) needs it in that state again; the next read of the alias then
+    // copies once more, as it must after a write.
+    if let Some(before) = before
+        && before & TARGET_OR_UNORDERED != 0
+    {
+        crate::list::ensure_state(list, source, before);
+    }
+    true
+}
+
 /// Textures due together of at least this many bytes are refreshed on
 /// several threads ([`refresh_all`]).
 const PARALLEL_BYTES: u64 = 1 << 20;
@@ -671,6 +872,40 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 mod tests {
     use super::*;
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    /// Copy layouts with the same offsets, sizes and pitches are alike
+    /// whatever their formats; parts count levels times layers, a volume's
+    /// slices as one.
+    #[test]
+    fn alias_layouts_and_parts() {
+        let fp = |offset: u64, width: u32, pitch: u32, format| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: format,
+                Width: width,
+                Height: 4,
+                Depth: 1,
+                RowPitch: pitch,
+            },
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R9G9B9E5_SHAREDEXP, DXGI_FORMAT_R32_UINT};
+        let (u, e) = (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R9G9B9E5_SHAREDEXP);
+        let a = [fp(0, 8, 256, u), fp(1024, 4, 256, u)];
+        let b = [fp(0, 8, 256, e), fp(1024, 4, 256, e)];
+        assert!(layouts_alike(&a, &b));
+        assert!(!layouts_alike(&a, &b[..1]), "part counts differ");
+        assert!(!layouts_alike(&a, &[b[0], fp(1536, 4, 256, e)]), "offsets differ");
+        assert!(!layouts_alike(&a, &[b[0], fp(1024, 4, 512, e)]), "pitches differ");
+        let desc = |dimension, layers, mips| D3D12_RESOURCE_DESC {
+            Dimension: dimension,
+            DepthOrArraySize: layers,
+            MipLevels: mips,
+            ..Default::default()
+        };
+        assert_eq!(parts_of(&desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6, 9)), 54);
+        assert_eq!(parts_of(&desc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 32, 1)), 1);
+        assert_eq!(parts_of(&desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, 4)), 4);
+    }
 
     /// Memory is detiled when it differs from what was last detiled, the
     /// first time, and when it changes back.

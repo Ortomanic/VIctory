@@ -1410,12 +1410,31 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
+    // A texture the host writes: what views placed in its memory show
+    // ([`alias_of`]).
+    #[cfg(windows)]
+    if host_writes(&desc) && resource.host.is_some() && !MAKING_PLACED.get() {
+        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        TARGETS_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(resource.data() as u64, at);
+    }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        // Out of the table of written textures first: `alias_of` looks at
+        // the ones in it, under its lock.
+        if host_writes(&self.desc) {
+            let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+            let at = self.data() as u64;
+            if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
+                targets.remove(&at);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if self
             .host
@@ -1626,6 +1645,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     let mut out = std::ptr::null();
+    MAKING_PLACED.set(true);
     let made = create_at_address(
         std::ptr::null(),
         address,
@@ -1635,11 +1655,107 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         &RESOURCE_IIDS[0],
         &mut out,
     );
+    MAKING_PLACED.set(false);
     if made != S_OK {
         return None;
     }
     map.insert((address, *desc), out as usize);
     resource(out).host.is_some().then_some(out)
+}
+
+/// The title textures the host renders to or writes (render target, depth
+/// or unordered access), by the address of their memory: what a view the
+/// title places in that memory in another format shows ([`alias_of`]). A
+/// texture leaves the table before it is freed. Textures made for placed
+/// views ([`texture_at`]) are never in it.
+#[cfg(windows)]
+static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(windows)]
+std::thread_local! {
+    /// Set while [`texture_at`] makes the texture of a placed view: that
+    /// texture does not go into [`TARGETS_AT`] whatever its flags say.
+    static MAKING_PLACED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the host writes textures described by `desc` (render target,
+/// depth or unordered access): their contents exist on the host alone.
+fn host_writes(desc: &ResourceDesc) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED != 0
+}
+
+/// Whether `source`, a texture the host writes, is what a view placed in
+/// its memory as `placed` shows, read by a copy of its texels
+/// ([`alias_of`]): the same dimension, size, levels and layers, single
+/// sampled, not depth, both of one texel per element of the same width,
+/// and the host keeps `source` in the title's format (no stand-in).
+/// `whole`: textures of several levels or layers count too.
+pub(crate) fn alias_matches(placed: &ResourceDesc, source: &ResourceDesc, whole: bool) -> bool {
+    const DEPTH: u32 = 0x2;
+    let one = |d: &ResourceDesc| {
+        d.dimension != BUFFER
+            && d.mip_levels >= 1
+            && d.depth_or_array_size >= 1
+            && (whole || (d.mip_levels == 1 && d.depth_or_array_size == 1))
+            && d.sample_count <= 1
+    };
+    let texel = |f: u32| element(pc_format(f)).filter(|e| e.1 == 1);
+    !host_writes(placed)
+        && host_writes(source)
+        && one(placed)
+        && one(source)
+        && source.dimension == placed.dimension
+        && source.width == placed.width
+        && source.height == placed.height
+        && source.mip_levels == placed.mip_levels
+        && source.depth_or_array_size == placed.depth_or_array_size
+        && source.flags & DEPTH == 0
+        && target_format(source.format) == pc_format(source.format)
+        && texel(source.format).is_some()
+        && texel(source.format) == texel(placed.format)
+}
+
+/// For `this`, the texture made for a view the title placed in memory
+/// ([`texture_at`]): the title texture the host writes that lies in the
+/// same memory, if [`alias_matches`] says the view shows it.
+///
+/// Ported from fxceless/victory-gta6 578d459 (`alias_of`). The console
+/// reads such a texture through the view as it is: Grand Theft Auto VI
+/// packs light as R9G9B9E5 into R32_UINT textures with compute shaders
+/// (which cannot write R9G9B9E5) and samples them through R9G9B9E5 views
+/// placed at the textures' addresses (the sky, the sky and light probes,
+/// the bounced light the lighting pass adds; textures of several levels or
+/// layers too: the probes' light atlas, the sky light cache, volumes). On
+/// the host they are two textures; the placed one was filled from title
+/// memory, which nothing writes, so all read through such a view was black.
+/// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
+/// of one level and one layer.
+#[cfg(windows)]
+pub(crate) fn alias_of(this: This) -> Option<This> {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_ALIAS_COPY").as_deref().map(str::trim) {
+        Ok("0") => None,
+        Ok("1") => Some(false),
+        _ => Some(true),
+    });
+    let whole = mode?;
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.host.is_none() || host_writes(&r.desc) {
+        return None;
+    }
+    // Under the table's lock: a texture leaves it before it is freed.
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let other = *targets.get(&(r.data() as u64))? as This;
+    if other == this {
+        return None;
+    }
+    let o = resource(other);
+    (o.host.is_some() && alias_matches(&r.desc, &o.desc, whole)).then_some(other)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1857,6 +1973,49 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    /// A view placed in the memory of a texture the host writes shows it
+    /// when the two lay out the same texels (R9G9B9E5 over R32_UINT, every
+    /// level and layer), not when sizes, levels, texel widths or kinds
+    /// differ, nor for depth, multisampled or title-filled sources.
+    #[test]
+    fn placed_views_alias_written_textures_of_the_same_texels() {
+        const R32_UINT: u32 = 42;
+        const UNORDERED: u32 = 4;
+        let written = |mips: u16, layers: u16| ResourceDesc {
+            flags: UNORDERED,
+            depth_or_array_size: layers,
+            ..texture(160, 90, R32_UINT, mips)
+        };
+        let view = |mips: u16, layers: u16| ResourceDesc {
+            depth_or_array_size: layers,
+            ..texture(160, 90, RGB9E5, mips)
+        };
+        assert!(alias_matches(&view(1, 1), &written(1, 1), true));
+        assert!(alias_matches(&view(4, 1), &written(4, 1), true), "a light atlas of four levels");
+        assert!(alias_matches(&view(1, 6), &written(1, 6), true), "six layers");
+        assert!(!alias_matches(&view(4, 1), &written(4, 1), false), "one level only");
+        assert!(alias_matches(&view(1, 1), &written(1, 1), false));
+        assert!(!alias_matches(&view(2, 1), &written(1, 1), true), "levels differ");
+        assert!(!alias_matches(&view(1, 1), &written(1, 2), true), "layers differ");
+        let wider = ResourceDesc { width: 161, ..view(1, 1) };
+        assert!(!alias_matches(&wider, &written(1, 1), true), "sizes differ");
+        let rgba16 = ResourceDesc { format: 10, ..view(1, 1) };
+        assert!(!alias_matches(&rgba16, &written(1, 1), true), "texel widths differ");
+        let bc1 = ResourceDesc { format: 71, ..view(1, 1) };
+        assert!(!alias_matches(&bc1, &written(1, 1), true), "block compressed");
+        let filled = ResourceDesc { flags: 0, ..written(1, 1) };
+        assert!(!alias_matches(&view(1, 1), &filled, true), "the title fills the source");
+        let depth = ResourceDesc { flags: 2, format: 40, ..written(1, 1) };
+        assert!(!alias_matches(&ResourceDesc { format: 41, ..view(1, 1) }, &depth, true), "depth");
+        let msaa = ResourceDesc { sample_count: 4, ..written(1, 1) };
+        assert!(!alias_matches(&view(1, 1), &msaa, true), "multisampled");
+        let target_view = ResourceDesc { flags: UNORDERED, ..view(1, 1) };
+        assert!(!alias_matches(&target_view, &written(1, 1), true), "the view's texture is written too");
+        let volume = |d: ResourceDesc| ResourceDesc { dimension: TEXTURE_3D, ..d };
+        assert!(alias_matches(&volume(view(1, 8)), &volume(written(1, 8)), true), "a volume");
+        assert!(!alias_matches(&volume(view(1, 8)), &written(1, 8), true), "dimensions differ");
     }
 
     fn heap(size: u64) -> This {
