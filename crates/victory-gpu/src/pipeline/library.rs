@@ -6,7 +6,8 @@
 //!    shaders' code, which changes when a translation does, our root
 //!    signature, the graphics state). The library is saved under the cache
 //!    folder; the host refuses a library of another adapter or driver, and
-//!    an entry whose description differs, so neither is ever used.
+//!    an entry whose description differs, so neither is ever used. Off
+//!    under Wine unless `VICTORY_PIPELINE_LIBRARY=1` ([`library_wanted`]).
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
@@ -53,10 +54,38 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
+/// Whether host pipelines go into a pipeline library: `VICTORY_PIPELINE_LIBRARY`
+/// (1 or 0), else not under Wine. vkd3d-proton (NVIDIA, 3.1) made pipelines
+/// three to four times slower with a library whose entries miss (every
+/// translator change renames them all): ~2,600 early pipelines took ~220 s
+/// with one against 30-70 s without, and the world was entered with many
+/// still unmade. Windows drivers keep it.
+fn library_wanted() -> bool {
+    match std::env::var("VICTORY_PIPELINE_LIBRARY").as_deref().map(str::trim) {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => !under_wine(),
+    }
+}
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`).
+fn under_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain lookups in ntdll, always loaded.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
+
 fn library() -> Option<&'static Mutex<Library>> {
     static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            if !library_wanted() {
+                tracing::info!("no host pipeline library (off under Wine; VICTORY_PIPELINE_LIBRARY=1 turns it on)");
+                return None;
+            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR
                 .get()

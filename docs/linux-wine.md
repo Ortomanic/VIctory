@@ -30,7 +30,9 @@ where there is no D3D12 device.
 ## Where vkd3d-proton differs from Windows drivers (handled)
 
 - An empty pipeline library must be asked for with a null blob; an empty
-  slice's dangling pointer is refused, and pipelines were then not kept.
+  slice's dangling pointer is refused. The library is still off under Wine
+  by default (`VICTORY_PIPELINE_LIBRARY=1` turns it on): with entries that
+  miss, vkd3d-proton made pipelines several times slower.
 - DXIL container hashes are not checked (a shader test skips that check
   under Wine).
 - `ws2_32` lacks `WSAConnectByList` and `GetAddrInfoExA`: their overrides
@@ -41,6 +43,9 @@ where there is no D3D12 device.
 
 ## Switches
 
+- `VICTORY_PIPELINE_LIBRARY`: 1 keeps host pipelines in
+  `host-pipelines.bin` under the cache folder (the default on Windows), 0
+  does not (the default under Wine). Delete the file to reset it.
 - `VICTORY_PIPELINE_WAIT_MS`: how long a title frame may wait for pipelines
   being made (500 by default; 0 never waits, so pipelines appear a few
   frames later and one-off passes may be lost).
