@@ -187,7 +187,12 @@ impl Shadow {
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    pub(crate) fn copy_back(
+        &self,
+        address: usize,
+        len: usize,
+        regions: &mut crate::host::Regions,
+    ) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -224,7 +229,7 @@ impl Shadow {
                     }
                     if changed {
                         crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n, regions);
                         written += n;
                     }
                     synced.push((start + at) / PAGE);

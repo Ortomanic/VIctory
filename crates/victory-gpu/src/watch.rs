@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -114,6 +115,11 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
 });
+
+/// Counts the runtime's mappings and unmappings of title memory
+/// ([`title_memory_remapped`]): what [`crate::host::Regions`] learnt of the
+/// memory before one is stale after it.
+pub(crate) static REMAPPINGS: AtomicU64 = AtomicU64::new(0);
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -217,6 +223,7 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    REMAPPINGS.fetch_add(1, Ordering::AcqRel);
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
@@ -377,5 +384,41 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// A direct write into a guarded block (what `host::write_mapped` does
+    /// when a block was guarded after it asked) faults into the handler,
+    /// which opens the block and notes it written.
+    #[test]
+    fn direct_writes_into_guarded_blocks_open_them() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        // SAFETY: a byte of our view; the handler gives write access back.
+        unsafe { ((view + BLOCK + 8) as *mut u8).write_volatile(5) };
+        // SAFETY: the byte just written.
+        assert_eq!(unsafe { ((view + BLOCK + 8) as *const u8).read_volatile() }, 5);
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE + 1..view / PAGE + 2).collect())
+        );
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        title_memory_remapped(view, 2 * BLOCK);
     }
 }

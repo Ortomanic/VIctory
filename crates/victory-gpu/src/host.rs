@@ -622,9 +622,13 @@ impl Host {
                 }
             }
         }
+        // What title memory is writable is asked once per region for the
+        // whole pass, not again for the next submission: the title may
+        // have freed or remapped memory by then.
+        let mut regions = Regions::default();
         for (shadow, address, len) in &back {
             let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+            let written = shadow.copy_back(address, len, &mut regions);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1387,9 +1391,24 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+///
+/// Directly when `regions` says the whole destination is committed
+/// writable memory (`VICTORY_DIRECT_WRITES=0` turns that off): Wine's
+/// `WriteProcessMemory` sends every byte through wineserver, even into our
+/// own process. Otherwise through the kernel, which skips unmapped pages
+/// instead of faulting. The caller opens guarded blocks first
+/// ([`crate::watch::writing`]); one guarded again since faults into the
+/// watch handler, which opens it.
+pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize, regions: &mut Regions) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if len != 0 && direct_writes() && regions.writable(dst as usize, len) {
+        // SAFETY: the destination is committed writable memory as of the
+        // check just made (shortcut: a title unmapping it right now would
+        // fault); the source is our own buffer, apart from title memory.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        return;
+    }
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
@@ -1407,6 +1426,74 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             });
         }
     });
+}
+
+/// Whether [`write_mapped`] may copy into title memory directly (unless
+/// `VICTORY_DIRECT_WRITES=0`).
+fn direct_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
+}
+
+/// Writable title memory regions as `VirtualQuery` described them,
+/// `(start, end)`, kept through one copy-back pass: asking costs up to
+/// milliseconds in the title's big pools. Forgotten when the runtime remaps
+/// title memory ([`crate::watch::REMAPPINGS`]). A block the watch guards
+/// after it was asked stays listed: a write to it faults into the watch
+/// handler, which opens it. Regions that are not writable are asked again
+/// each time (a guarded block may have been opened since).
+#[derive(Default)]
+pub(crate) struct Regions {
+    remappings: u64,
+    writable: Vec<(usize, usize)>,
+}
+
+impl Regions {
+    /// Whether `[at, at + len)` is all committed memory that may be written
+    /// without a fault: read-write or copy-on-write, not a guard page.
+    fn writable(&mut self, at: usize, len: usize) -> bool {
+        let remappings = crate::watch::REMAPPINGS.load(Ordering::Acquire);
+        if remappings != self.remappings {
+            self.writable.clear();
+            self.remappings = remappings;
+        }
+        let end = at + len;
+        let mut p = at;
+        while p < end {
+            let known = self.writable.iter().find(|&&(start, end)| start <= p && p < end);
+            p = match known {
+                Some(&(_, region_end)) => region_end,
+                None => match query_region(p) {
+                    Some((start, region_end, true)) => {
+                        self.writable.push((start, region_end));
+                        region_end
+                    }
+                    _ => return false,
+                },
+            };
+        }
+        true
+    }
+}
+
+/// The region holding `at`: `(start, end, writable)`.
+fn query_region(at: usize) -> Option<(usize, usize, bool)> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.RegionSize == 0 {
+        return None;
+    }
+    let start = info.BaseAddress as usize;
+    let write = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    let writable =
+        info.State == MEM_COMMIT && info.Protect & write != 0 && info.Protect & PAGE_GUARD == 0;
+    Some((start, start + info.RegionSize, writable))
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -2042,6 +2129,110 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    /// Committed read-write pages are written directly, a range reaching
+    /// into reserved or read-only pages through the kernel, which writes
+    /// the pages it can; remapping forgets what was learnt.
+    #[test]
+    fn write_mapped_writes_what_is_writable() {
+        use super::{Regions, write_mapped};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        const PAGE: usize = 64 << 10;
+        // SAFETY: a fresh reservation of four pages, the first two
+        // committed read-write, the third read-only; freed at the end.
+        let p = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!p.is_null());
+            assert!(!VirtualAlloc(p, 3 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            let mut old = 0;
+            assert_ne!(VirtualProtect(p.add(2 * PAGE), PAGE, PAGE_READONLY, &mut old), 0);
+            p as usize
+        };
+        let mut regions = Regions::default();
+        assert!(regions.writable(p, 2 * PAGE));
+        assert!(!regions.writable(p + PAGE, 2 * PAGE));
+        assert!(!regions.writable(p + 3 * PAGE, 1));
+        let ones = vec![1u8; 4 * PAGE];
+        write_mapped(p as *mut u8, ones.as_ptr(), 2 * PAGE, &mut regions);
+        write_mapped((p + PAGE) as *mut u8, ones.as_ptr(), 3 * PAGE, &mut regions);
+        // SAFETY: the committed pages.
+        let memory = unsafe { std::slice::from_raw_parts(p as *const u8, 3 * PAGE) };
+        assert!(memory[..2 * PAGE].iter().all(|&b| b == 1));
+        // The kernel, unlike a direct write, may lift the read-only page's
+        // protection for the write (Windows does); either way nothing faults.
+        // A region that becomes writable is asked again.
+        let mut old = 0;
+        // SAFETY: our page.
+        assert_ne!(
+            unsafe { VirtualProtect((p + 2 * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) },
+            0
+        );
+        assert!(regions.writable(p, 3 * PAGE));
+        crate::watch::title_memory_remapped(p, 4 * PAGE);
+        assert!(!regions.writable(p + 3 * PAGE, 1));
+        assert!(regions.writable.is_empty(), "forgotten after a remapping");
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Writing 64 MiB of committed title-like memory (plain and
+    /// write-watched) in 64 KiB pieces, as the copy-back does, directly and
+    /// through `WriteProcessMemory` (under Wine a wineserver round trip
+    /// with the bytes). Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture write_mapped_timing`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn write_mapped_timing() {
+        use super::{Regions, write_mapped};
+        use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch, VirtualAlloc,
+            VirtualFree,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const LEN: usize = 64 << 20;
+        const PIECE: usize = 64 << 10;
+        let source = vec![7u8; PIECE];
+        for (memory, watch) in [("plain", 0), ("write-watched", MEM_WRITE_WATCH)] {
+            // SAFETY: a fresh committed allocation, freed at the end.
+            let p = unsafe {
+                VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE)
+            } as usize;
+            assert_ne!(p, 0);
+            let time = |f: &dyn Fn(usize)| {
+                if watch != 0 {
+                    // SAFETY: our write-watched allocation.
+                    unsafe { ResetWriteWatch(p as *const _, LEN) };
+                }
+                let started = std::time::Instant::now();
+                for at in (p..p + LEN).step_by(PIECE) {
+                    f(at);
+                }
+                started.elapsed().as_secs_f64() * 1e3
+            };
+            let kernel = time(&|at| {
+                let mut done = 0;
+                // SAFETY: our committed memory.
+                let ok = unsafe {
+                    WriteProcessMemory(GetCurrentProcess(), at as _, source.as_ptr().cast(), PIECE, &mut done)
+                };
+                assert_ne!(ok, 0);
+            });
+            let regions = std::cell::RefCell::new(Regions::default());
+            let direct = time(&|at| {
+                write_mapped(at as *mut u8, source.as_ptr(), PIECE, &mut regions.borrow_mut());
+            });
+            println!(
+                "64 MiB {memory} in 64 KiB pieces: WriteProcessMemory {kernel:.1} ms, write_mapped {direct:.1} ms"
+            );
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        }
     }
 
     /// The hashing a submission does for textures in physical-page memory,
