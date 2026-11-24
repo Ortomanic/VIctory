@@ -8028,10 +8028,8 @@ impl<'a> Lower<'a> {
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
             // `_l`: DXIL's gather reads the most detailed level and has no
-            // level operand, so the LOD (the last address, after the
-            // coordinates) is not applied: exact for LOD 0, which is what a
-            // compute shader's `Gather*` compiles to (no derivatives to
-            // pick a level); another LOD would gather the wrong mip.
+            // level operand; a 2D gather at a named level becomes four
+            // texel reads at that level (below), others read level 0.
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
             | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
@@ -8078,6 +8076,8 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
+        // A gather at a named level, done as four texel reads (below).
+        let mut gathered: Option<[V; 4]> = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -8358,16 +8358,79 @@ impl<'a> Lower<'a> {
                             os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
                         }
                     }
-                    args.extend(&os[..2]);
-                    args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    if matches!(name, "image_gather4_l" | "image_gather4_l_o")
+                        && coords == 2
+                        && spatial == 2
+                    {
+                        // DXIL's gather has no level and reads level 0 where
+                        // the title names one (depth-pyramid occlusion tests,
+                        // resolves): the four texels are read at the level
+                        // instead, in the gather's order (u0,v1) (u1,v1)
+                        // (u1,v0) (u0,v0); an offset (`_o`) is in texels of
+                        // that level.
+                        // shortcut: the level is rounded to a whole one and
+                        // coordinates past the edge are clamped, whatever
+                        // the sampler says.
+                        let lod = addr_val(self, first + coords)?;
+                        let lod = to_float(self, lod);
+                        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+                        let zero = self.s.m.f32(0);
+                        let lod = self.binary(35, lod, zero); // maximum
+                        let lod = self.unary(26, lod); // round to nearest even
+                        let mip = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
+                        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                        let d = self
+                            .s
+                            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+                        let half = self.s.m.f32(0.5f32.to_bits());
+                        let one = self.s.m.f32(1.0f32.to_bits());
+                        let (mut lo, mut hi) = ([iu; 2], [iu; 2]);
+                        for k in 0..2 {
+                            let n = self.s.m.extract(c, d, k as u32);
+                            let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+                            let last = self.s.m.bin(c, Bin::Sub, n, one);
+                            let t = self.s.m.bin(c, Bin::Mul, cs[k], n);
+                            let t = self.s.m.bin(c, Bin::Sub, t, half);
+                            let at = self.unary(27, t); // round down
+                            let by = self.s.m.cast(c, Cast::SiToFp, os[k], f32t);
+                            let at = self.s.m.bin(c, Bin::Add, at, by);
+                            let next = self.s.m.bin(c, Bin::Add, at, one);
+                            for (slot, x) in [(&mut lo[k], at), (&mut hi[k], next)] {
+                                let x = self.binary(35, x, zero); // maximum
+                                let x = self.binary(36, x, last); // minimum
+                                *slot = self.s.m.cast(c, Cast::FpToSi, x, i32t);
+                            }
+                        }
+                        let ch = dmask.trailing_zeros();
+                        let mut g = [fu; 4];
+                        let mut read = None;
+                        let texels = [(lo[0], hi[1]), (hi[0], hi[1]), (hi[0], lo[1]), (lo[0], lo[1])];
+                        for (slot, (x, y)) in g.iter_mut().zip(texels) {
+                            let r = self.s.op(
+                                c,
+                                "textureLoad.f32",
+                                Attr::ReadOnly,
+                                self.s.t.res_ret,
+                                66,
+                                &[h, mip, x, y, iu, iu, iu, iu],
+                            );
+                            *slot = self.s.m.extract(c, r, ch);
+                            read = Some(r);
+                        }
+                        gathered = Some(g);
+                        read.expect("four reads")
+                    } else {
+                        args.extend(&os[..2]);
+                        args.push(self.s.m.i32(dmask.trailing_zeros()));
+                        self.s.op(
+                            c,
+                            "textureGather.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            73,
+                            &args,
+                        )
+                    }
                 }
             }
         } else {
@@ -8406,7 +8469,10 @@ impl<'a> Lower<'a> {
         };
         let mut xs = Vec::new();
         for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
+            let x = match gathered {
+                Some(g) => g[ch as usize],
+                None => self.s.m.extract(c, r, ch),
+            };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
@@ -10657,6 +10723,23 @@ mod tests {
     fn image_gather4_l_translates() {
         // image_gather4_l v[0:3], v[4:6], ... dmask:0x1 dim:2D (s, t, lod)
         lowers_image(&[0xF110_0108, 0x0082_0004]).unwrap();
+    }
+
+    /// A 2D gather at a named level (`_l`, `_l_o`) reads its four texels at
+    /// that level: DXIL's gather has no level and read level 0. A gather at
+    /// level zero (`_lz`) stays a gather.
+    #[test]
+    fn a_gather_at_a_named_level_reads_four_texels_of_that_level() {
+        // image_gather4_l v[0:3], v[4:6] (s, t, lod); image_gather4_l_o
+        // v[0:3], v[4:7] (offsets, s, t, lod); image_gather4_lz v[0:3],
+        // v[4:5]; all dmask:0x1 dim:2D
+        for (word, level) in [(0xF110_0108, true), (0xF150_0108, true), (0xF11C_0108, false)] {
+            let l = lower_image(&[word, 0x0082_0004], crate::emit::HEAP_VIEWS).unwrap();
+            if let Some(gathers) = calls(&l.dxil, "textureGather") {
+                assert_eq!(gathers, !level, "{word:#x}");
+                assert_eq!(calls(&l.dxil, "textureLoad"), Some(level), "{word:#x}");
+            }
+        }
     }
 
     #[test]
