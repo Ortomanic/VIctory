@@ -410,6 +410,8 @@ impl Shadow {
                 old.copy_from_slice(host);
             }
             drop(kept);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::compared(self.start, self.len, (to - from) as u64, written as u64);
             if missed > 0 {
                 // Every declared range's pages were kept when submitted
                 // (`snapshot`): a page found in none would lose what the

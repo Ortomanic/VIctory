@@ -155,6 +155,9 @@ pub(crate) enum C {
     RecNoteUs,
     RecFindUs,
     RecFinds,
+    /// Root unordered-access views declared for copy-back, and their bytes.
+    RootUavs,
+    RootUavBytes,
     /// Copy-back: bytes compared with their snapshot, and 64 KiB pieces
     /// the GPU wrote (title memory read and merged).
     BackCompared,
@@ -310,6 +313,21 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
     e.0 += 1;
     e.1 += len as u64;
     e.2 += us;
+}
+
+/// Per buffer copy (start, length): copy-backs, bytes compared, bytes the
+/// GPU wrote, and bytes of them declared through root views.
+type Backs = HashMap<(u64, u64), (u64, u64, u64)>;
+static BACKS: Mutex<Option<Backs>> = Mutex::new(None);
+
+/// A copy-back compared `bytes` of the copy of the buffer at `start` and
+/// found `written` of them written by the GPU.
+pub(crate) fn compared(start: u64, len: u64, bytes: u64, written: u64) {
+    let mut map = BACKS.lock().unwrap_or_else(|e| e.into_inner());
+    let e = map.get_or_insert_with(HashMap::new).entry((start, len)).or_insert((0, 0, 0));
+    e.0 += 1;
+    e.1 += bytes;
+    e.2 += written;
 }
 
 fn page_faults() -> u64 {
@@ -556,6 +574,25 @@ pub(crate) fn log(frames: f64) {
         c[C::BindlessHoleRuns as usize],
         ms(c[C::BindlessFallbackUs as usize]),
     );
+    // Which copies the copy-back compares most (their unordered-access
+    // ranges, each once per submission).
+    let backs = BACKS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut backs: Vec<_> = backs.into_iter().flatten().collect();
+    backs.sort_by_key(|&(_, (_, bytes, _))| std::cmp::Reverse(bytes));
+    tracing::info!(
+        "copy-back per frame: {} copies compared; root unordered-access views declared {:.1} with {:.1} MB (before a submission's ranges are merged)",
+        backs.len(),
+        c[C::RootUavs as usize],
+        mb(c[C::RootUavBytes as usize]),
+    );
+    for ((start, len), (n, bytes, written)) in backs.into_iter().take(12) {
+        tracing::info!(
+            "  compared in the copy of {start:#x}+{len:#x}: {:.1}x/frame, {:.2} MB/frame, {:.3} MB/frame written by the GPU",
+            n as f64 / frames,
+            bytes as f64 / 1e6 / frames,
+            written as f64 / 1e6 / frames
+        );
+    }
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

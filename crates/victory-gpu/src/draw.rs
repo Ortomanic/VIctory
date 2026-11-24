@@ -274,6 +274,11 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<(u64
         }
         shadow.refresh(list, address, len);
         shadow.gpu_writes(list, address, len);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::RootUavs, 1);
+            crate::copystat::add(crate::copystat::C::RootUavBytes, len);
+        }
         return Some((shadow.gpu(address), u32::try_from(len).unwrap_or(u32::MAX)));
     }
     let len = left.min(if srv { 1 << 20 } else { 1 << 16 });
