@@ -152,8 +152,18 @@ pub(crate) enum C {
     BackFreshUs,
     /// Copy-back ranges found in no snapshot (should stay 0).
     BackMissed,
+    /// Bindless buffer views (`descriptor::bindless`): the registry's
+    /// ranges merged again and the time, and preparing them at submission
+    /// (refresh and snapshot; their copy-back is in `BackUs`).
+    BindlessRebuilds,
+    BindlessMergeUs,
+    BindlessPrepUs,
+    /// Submissions with shaders that read (only) or write through heap
+    /// descriptors at slots from data.
+    BindlessReadSubmissions,
+    BindlessWriteSubmissions,
 }
-const COUNTERS: usize = C::BackMissed as usize + 1;
+const COUNTERS: usize = C::BindlessWriteSubmissions as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -408,6 +418,26 @@ pub(crate) fn log(frames: f64) {
         waits as f64 / frames,
         wait_us as f64 / 1e3 / frames,
         unmade as f64 / frames,
+    );
+    // Buffer views in the heaps by what the host made of them, and what
+    // their bindless reads cost per frame.
+    let [_, _, table, bindless, deferred, failed] = crate::descriptor::slot_states();
+    let (slots, copies, span, written) = crate::descriptor::bindless::sizes();
+    tracing::info!(
+        "heap buffer views: {table} named by tables, {bindless} made for bindless reads only, \
+         {deferred} null until a table names them, {failed} null (not made); bindless ranges: {slots} \
+         slots over {copies} copies, {:.1} MB read, {:.1} MB of it written by shaders; per frame \
+         {:.1} submissions reading bindlessly, {:.1} writing, {:.1} merges {:.2} ms, prepared {:.2} ms \
+         (copy-back of all ranges {:.2} ms, {:.1} MB compared)",
+        span as f64 / 1e6,
+        written as f64 / 1e6,
+        c[C::BindlessReadSubmissions as usize],
+        c[C::BindlessWriteSubmissions as usize],
+        c[C::BindlessRebuilds as usize],
+        ms(c[C::BindlessMergeUs as usize]),
+        ms(c[C::BindlessPrepUs as usize]),
+        ms(c[C::BackUs as usize]),
+        mb(c[C::BackCompared as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

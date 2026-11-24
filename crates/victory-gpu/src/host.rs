@@ -383,6 +383,9 @@ pub(crate) struct HostList {
     /// descriptor slots it lent back): a run does its CPU work but not
     /// its GPU commands.
     lost: AtomicBool,
+    /// What its shaders do through heap descriptors at slots from data
+    /// (`victory_shader::emit::BINDLESS_READS`, `BINDLESS_WRITES`).
+    bindless: std::sync::atomic::AtomicU8,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -600,6 +603,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 lost: AtomicBool::new(false),
+                bindless: std::sync::atomic::AtomicU8::new(0),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -654,6 +658,61 @@ impl Host {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+        }
+        // Buffer views shaders may read bindlessly (`descriptor::bindless`):
+        // their ranges after every title copy of the submission, then the
+        // bytes of those shaders may write kept to tell what they wrote.
+        // Only for submissions whose shaders index the heap from data
+        // (`victory_shader::emit::bindless`); the snapshot and copy-back of
+        // the ranges shaders may write only if they write so.
+        let uses = runs
+            .iter()
+            .filter(|l| !l.lost.load(Ordering::Relaxed))
+            .fold(0, |b, l| b | l.bindless.load(Ordering::Relaxed));
+        let writes_bindless = uses & victory_shader::emit::BINDLESS_WRITES != 0;
+        let bindless = (uses != 0 && crate::descriptor::bindless::enabled())
+            .then(crate::descriptor::bindless::merged)
+            .filter(|m| !m.shadows.is_empty());
+        if let Some(m) = &bindless {
+            #[cfg(feature = "diagnostics")]
+            let _preparing = crate::copystat::timed(crate::copystat::C::BindlessPrepUs);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                if writes_bindless {
+                    crate::copystat::C::BindlessWriteSubmissions
+                } else {
+                    crate::copystat::C::BindlessReadSubmissions
+                },
+                1,
+            );
+            // What the lists refresh first, then the ranges one by one (not
+            // merged per copy as the batch merges: the gaps may be unmapped).
+            batch.flush();
+            // The ranges read once per frame (`bindless`, shortcut), the
+            // unordered ones whenever shaders may write them.
+            use std::sync::atomic::AtomicU64;
+            static REFRESHED: AtomicU64 = AtomicU64::new(u64::MAX);
+            let frame = crate::frame::current();
+            let all = crate::descriptor::bindless::every_submission()
+                || REFRESHED.swap(frame, Ordering::Relaxed) != frame;
+            for (shadow, reads, writes) in &m.shadows {
+                let ranges = match (all, writes_bindless) {
+                    (true, _) => reads,
+                    (false, true) => writes,
+                    (false, false) => continue,
+                };
+                for &(from, to) in ranges {
+                    let started = std::time::Instant::now();
+                    let copied = shadow.update(from as usize, (to - from) as usize);
+                    PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                }
+            }
+            for (shadow, _, writes) in m.shadows.iter().filter(|_| writes_bindless) {
+                for &(from, to) in writes {
+                    shadow.writing(from as usize, (to - from) as usize);
+                }
+            }
         }
         batch.flush();
         let prepared = std::time::Instant::now();
@@ -760,6 +819,16 @@ impl Host {
                         None => back.push((shadow.clone(), vec![range])),
                     }
                 }
+            }
+        }
+        for (shadow, _, writes) in bindless.iter().flat_map(|m| &m.shadows) {
+            if writes.is_empty() || !writes_bindless {
+                continue;
+            }
+            let ranges = writes.iter().map(|&(from, to)| (from as usize, to as usize));
+            match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                Some((_, r)) => r.extend(ranges),
+                None => back.push((shadow.clone(), ranges.collect())),
             }
         }
         // What title memory is writable is asked once per region for the
@@ -1078,6 +1147,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         self.lost.store(false, Ordering::Relaxed);
+        self.bindless.store(0, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1226,6 +1296,12 @@ impl HostList {
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
         }
+    }
+
+    /// The list runs shaders that read or write through heap descriptors
+    /// at slots from data (`bits`: `victory_shader::emit::BINDLESS_*`).
+    pub(crate) fn note_bindless(&self, bits: u8) {
+        self.bindless.fetch_or(bits, Ordering::Relaxed);
     }
 
     /// Notes a pipeline the list binds.

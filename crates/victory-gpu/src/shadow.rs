@@ -10,10 +10,11 @@
 //! in its copy. Ranges shaders write go back to title memory after the
 //! submission ([`Shadow::gpu_writes`]).
 //!
-//! shortcut: only the ranges draws are known to read are brought up to
-//! date (vertex and index buffer views, constant buffers in tables, root
-//! descriptors, buffer views in tables); buffers read through directly
-//! indexed heaps keep what their first use copied.
+//! The ranges draws are known to read are brought up to date (vertex and
+//! index buffer views, constant buffers in tables, root descriptors,
+//! buffer views in tables), and every buffer view in a shader-visible heap
+//! at each submission (`descriptor::bindless`: shaders may index the heap
+//! from data).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};

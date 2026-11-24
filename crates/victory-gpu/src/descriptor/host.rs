@@ -34,6 +34,28 @@ pub(crate) struct HostHeap {
     dynamic: u32,
     /// Which dynamic slots are taken (by lists not yet run, or running).
     next: Mutex<Slots>,
+    /// What each mirrored slot holds (`SLOT_*`), and how many hold each.
+    state: Mutex<Vec<u8>>,
+    states: [std::sync::atomic::AtomicU32; 6],
+}
+
+/// Mirrored slots: no view; a view of a texture or a sampler; a buffer
+/// view a table named; a buffer view made for bindless reads that no table
+/// named yet; a buffer view left null until a table names it (placed
+/// textures, or all with `VICTORY_BINDLESS=0`: what shaders reading the
+/// slot bindlessly see as null); a buffer view the host could not make
+/// (null).
+pub(crate) const SLOT_NONE: u8 = 0;
+pub(crate) const SLOT_OTHER: u8 = 1;
+pub(crate) const SLOT_TABLE: u8 = 2;
+pub(crate) const SLOT_BINDLESS: u8 = 3;
+pub(crate) const SLOT_DEFERRED: u8 = 4;
+pub(crate) const SLOT_FAILED: u8 = 5;
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        super::bindless::forget_heap(self.id());
+    }
 }
 
 /// Dynamic slots: which are taken (a bit each), how many are free, and
@@ -517,6 +539,15 @@ impl HostHeap {
             seen: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new(Slots::new(extra as usize)),
+            state: Mutex::new(vec![SLOT_NONE; count as usize]),
+            states: [
+                std::sync::atomic::AtomicU32::new(count),
+                std::sync::atomic::AtomicU32::new(0),
+                std::sync::atomic::AtomicU32::new(0),
+                std::sync::atomic::AtomicU32::new(0),
+                std::sync::atomic::AtomicU32::new(0),
+                std::sync::atomic::AtomicU32::new(0),
+            ],
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -746,9 +777,13 @@ impl HostHeap {
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
-    /// if it changed since, and returns the view recorded there. Buffer
-    /// views are made only for draws (`for_draw`), which also copy their
-    /// data: a host copy of a buffer is made on first use.
+    /// if it changed since, and returns the view recorded there (`for_draw`:
+    /// a table of a draw names it). Buffer views are made either way, a
+    /// host copy of their memory made on first use, their ranges brought
+    /// up to date at every submission for bindless reads ([`bindless`]);
+    /// views of textures the title placed itself only for draws.
+    ///
+    /// [`bindless`]: super::bindless
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -779,10 +814,18 @@ impl HostHeap {
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
+                super::bindless::clear(self.id(), index);
             }
+            self.set_state(index, SLOT_NONE);
             return None;
         };
-        if made[index as usize] != key {
+        if made[index as usize] == key {
+            // A buffer view made for bindless reads is now named by a
+            // table too (diagnostics count).
+            if for_draw {
+                self.named(index);
+            }
+        } else {
             // Diagnostic: a slot made from another record that the title
             // changed without writing a view or copying descriptors there
             // (a copy of its own): bindless reads of such slots see the old
@@ -794,7 +837,12 @@ impl HostHeap {
                     tracing::warn!(index, n, "title heap slot changed unseen (copied by the title itself)");
                 }
             }
-            let later = !for_draw && view.is_buffer();
+            // Buffer views are made outside tables too (shaders may read
+            // them bindlessly, `bindless`), placed textures only for draws.
+            let range = buffer_range(&view);
+            let later = !for_draw
+                && view.is_buffer()
+                && !(range.is_some() && super::bindless::enabled());
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
@@ -804,9 +852,72 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
+            let state = match (range, later, kept.is_some()) {
+                (_, true, _) => SLOT_DEFERRED,
+                (Some(_), _, false) => SLOT_FAILED,
+                (Some(_), _, true) if for_draw => SLOT_TABLE,
+                (Some(_), _, true) => SLOT_BINDLESS,
+                (None, _, _) => SLOT_OTHER,
+            };
+            self.set_state(index, state);
+            // The range the slot views, brought up to date at every
+            // submission (bindless reads).
+            match range {
+                Some((address, len)) if kept.is_some() && len > 0 && super::bindless::enabled() => {
+                    match crate::shadow::find(address, len) {
+                        Some(shadow) => {
+                            let unordered =
+                                matches!(view, View::Unordered(..) | View::Placed(true, ..));
+                            let end = address + len.min(shadow.left(address));
+                            let id = self.id();
+                            super::bindless::set(id, index, &shadow, address, end, unordered);
+                        }
+                        None => super::bindless::clear(self.id(), index),
+                    }
+                }
+                _ => super::bindless::clear(self.id(), index),
+            }
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// This heap, for the bindless registry.
+    fn id(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// Notes what slot `index` holds now (counts for diagnostics).
+    fn set_state(&self, index: u32, state: u8) {
+        let mut states = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = states.get_mut(index as usize)
+            && *s != state
+        {
+            self.states[usize::from(*s)].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.states[usize::from(state)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *s = state;
+        }
+    }
+
+    /// A table names slot `index`, made before.
+    fn named(&self, index: u32) {
+        let bindless = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(|&s| s == SLOT_BINDLESS);
+        if bindless {
+            self.set_state(index, SLOT_TABLE);
+        }
+    }
+
+    /// Mirrored slots by what they hold: [`SLOT_NONE`], [`SLOT_OTHER`],
+    /// [`SLOT_TABLE`], [`SLOT_BINDLESS`], [`SLOT_DEFERRED`],
+    /// [`SLOT_FAILED`] (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn slot_states(&self) -> [u32; 6] {
+        std::array::from_fn(|i| self.states[i].load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Mirrors the slots whose record the title changed without our seeing
@@ -1927,5 +2038,169 @@ void main(uint3 id : SV_DispatchThreadID) {
             (&title[..68], &title[100..]),
             (&before[..68], &before[100..])
         );
+    }
+    /// Buffer views no table names, as the title's skinning job records
+    /// name them (a raw placed view, format 39, and an R32_UINT placed
+    /// unordered view, format 42): made when the title writes them, read
+    /// bindlessly by a shader, what they read brought up to date at the
+    /// submission and what they write copied back, with no draw naming
+    /// them.
+    #[test]
+    fn heap_buffer_views_are_made_for_bindless_reads() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        if !super::super::bindless::enabled() {
+            return;
+        }
+        // The root signature made by the host, not compiled in (Wine's
+        // compiler leaves out what `CreateRootSignature` takes).
+        const SOURCE: &str = r#"
+ByteAddressBuffer view : register(t0);
+RWBuffer<uint> written : register(u0);
+[numthreads(32, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    written[id.x] = view.Load(id.x * 4) + 1;
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; out pointer ours.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("bindless"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_0"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        let device = &host.device;
+        let ranges = [
+            D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                ..Default::default()
+            },
+            D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                NumDescriptors: 1,
+                OffsetInDescriptorsFromTableStart: 1,
+                ..Default::default()
+            },
+        ];
+        let parameter = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 2,
+                    pDescriptorRanges: ranges.as_ptr(),
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let mut blob: Option<ID3DBlob> = None;
+        // SAFETY: the description and its ranges live through the calls;
+        // the blobs' own bytes.
+        let (root, pso) = unsafe {
+            D3D12SerializeRootSignature(
+                &D3D12_ROOT_SIGNATURE_DESC {
+                    NumParameters: 1,
+                    pParameters: &parameter,
+                    ..Default::default()
+                },
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut blob,
+                None,
+            )
+            .unwrap();
+            let blob = blob.unwrap();
+            let signature = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast::<u8>(),
+                blob.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, signature).unwrap();
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.GetBufferPointer(),
+                        BytecodeLength: code.GetBufferSize(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        let heap = HostHeap::new(false, 4).unwrap();
+
+        // Title memory of 4 KiB outside any buffer object (placed views):
+        // 32 dwords read at 256, 32 written at 2048.
+        let mut title: Vec<u32> = (0..1024).map(|i| 0x5150_0000 | i).collect();
+        let start = title.as_mut_ptr() as u64;
+        let placed = |unordered: bool, format: u32, flags: u32, at: u64| {
+            let mut resource = [0u32; 14];
+            resource[0] = 1; // a buffer
+            resource[4] = 128;
+            let mut desc = [0u32; 16];
+            desc[0] = format;
+            desc[1] = 1; // buffer dimension
+            if unordered {
+                desc[4] = 32; // NumElements
+                desc[8] = flags;
+            } else {
+                desc[2] = 0x1688; // the default component mapping
+                desc[6] = 32; // NumElements
+                desc[8] = flags;
+            }
+            desc[10] = at as u32;
+            desc[11] = (at >> 32) as u32;
+            View::Placed(unordered, resource, desc)
+        };
+        let mut slots = [[0u32; 8]; 2];
+        let srv = placed(false, 39, D3D12_BUFFER_SRV_FLAG_RAW.0 as u32, start + 256);
+        let uav = placed(true, 42, 0, start + 2048);
+        super::super::record(slots[0].as_mut_ptr() as u64, srv);
+        super::super::record(slots[1].as_mut_ptr() as u64, uav);
+        for (i, slot) in slots.iter().enumerate() {
+            // As a view written into a shader-visible heap is mirrored.
+            assert!(heap.mirror(i as u32, slot.as_ptr() as u64, false).is_some());
+        }
+        assert_eq!(heap.state.lock().unwrap()[..2], [SLOT_BINDLESS; 2]);
+
+        // The title writes what is read after the views were made.
+        for (i, v) in title[64..96].iter_mut().enumerate() {
+            *v = 1000 + i as u32;
+        }
+        let list = host.new_list().unwrap();
+        // As a translated shader that indexes the heap from data says.
+        use victory_shader::emit::{BINDLESS_READS, BINDLESS_WRITES};
+        list.note_bindless(BINDLESS_READS | BINDLESS_WRITES);
+        // SAFETY: an open list; our heap, root signature and pipeline.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRootDescriptorTable(0, heap.heap.GetGPUDescriptorHandleForHeapStart());
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let want: Vec<u32> = (0..32).map(|i| 1001 + i).collect();
+        assert_eq!(&title[512..544], &want[..], "what the unordered view wrote");
+        assert_eq!(title[511], 0x5150_0000 | 511);
+        assert_eq!(title[544], 0x5150_0000 | 544);
+        drop(heap);
     }
 }

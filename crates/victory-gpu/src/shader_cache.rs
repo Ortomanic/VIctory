@@ -253,6 +253,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.bindless));
     out
 }
 
@@ -309,6 +310,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let bindless = u8::try_from(r.word()?).ok()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -317,6 +319,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        bindless,
     })
 }
 
@@ -343,6 +346,7 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            bindless: victory_shader::emit::BINDLESS_WRITES,
         }
     }
 

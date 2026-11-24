@@ -138,20 +138,17 @@ impl Shader {
 /// cable, tree and hair vertices and indices that `XboxBvhBuilder.dll`
 /// builds the BVH from), by shader hash.
 ///
-/// The host does not run them. Nothing on the host reads what they write:
-/// VIctory does no ray tracing (the BVH builder's own shaders do not
-/// translate either). They cannot run right on the host today: every
-/// vertex buffer a job record names is a buffer view in the heap read
-/// bindlessly, and the host makes buffer views only for tables, so all of
-/// them read zeros through null slots (probe, bisect-fault, 2026-11-24:
-/// 6,144 records, every slot named unmade). And run, they fault or hang
-/// the GPU (Xid 13 at CSComputeSkinningDefaultVelocity after
-/// CSComputeSkinningRigidVelocity, Xid 109 at CSGenerateHairIB) in every
-/// world run since their tables are made (dynamic descriptor slots); run
-/// without them, the world runs clean.
+/// Nothing on the host reads what they write: VIctory does no ray tracing
+/// (the BVH builder's own shaders do not translate either). Every vertex
+/// buffer a job record names is a buffer view in the heap read bindlessly;
+/// until those were made outside tables (`descriptor::bindless`) they all
+/// read zeros through null slots (probe, bisect-fault, 2026-11-24: 6,144
+/// records, every slot named unmade), and run that way they faulted or
+/// hung the GPU (Xid 13 at CSComputeSkinningDefaultVelocity after
+/// CSComputeSkinningRigidVelocity, Xid 109 at CSGenerateHairIB).
 ///
-/// `VICTORY_BVH_SKINNING=1` runs them (for whoever makes bindless buffer
-/// views).
+/// They run again; `VICTORY_BVH_SKINNING=0` drops them (diagnostics A/B,
+/// or if they fault the GPU again).
 #[cfg(windows)]
 const BVH_SKINNING_SHADERS: [&str; 43] = [
     "81dc252c4d183e30", // CSComputeCable
@@ -201,14 +198,14 @@ const BVH_SKINNING_SHADERS: [&str; 43] = [
 
 #[cfg(windows)]
 const BVH_SKINNING: &str =
-    "BVH skinning: nothing on the host reads it (no ray tracing) and it faults the GPU; VICTORY_BVH_SKINNING=1 runs it";
+    "BVH skinning: VICTORY_BVH_SKINNING=0 drops it (nothing on the host reads it: no ray tracing)";
 
 /// Whether the shader with `hash` is one of [`BVH_SKINNING_SHADERS`] and
-/// they are not to run.
+/// they are not to run (`VICTORY_BVH_SKINNING=0`).
 #[cfg(windows)]
 fn bvh_skinning(hash: &str) -> bool {
     static RUN: OnceLock<bool> = OnceLock::new();
-    let run = *RUN.get_or_init(|| std::env::var("VICTORY_BVH_SKINNING").is_ok_and(|v| v == "1"));
+    let run = *RUN.get_or_init(|| !std::env::var("VICTORY_BVH_SKINNING").is_ok_and(|v| v == "0"));
     !run && BVH_SKINNING_SHADERS.contains(&hash)
 }
 

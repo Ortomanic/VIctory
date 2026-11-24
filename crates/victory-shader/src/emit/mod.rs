@@ -297,6 +297,51 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Whether the program reads ([`BINDLESS_READS`]) or writes
+    /// ([`BINDLESS_WRITES`]) memory through heap descriptors at slots it
+    /// computes from data ([`bindless`]): which slots the host cannot know.
+    pub bindless: u8,
+}
+
+/// [`HostShader::bindless`]: reads through descriptors from data.
+pub const BINDLESS_READS: u8 = 1;
+/// [`HostShader::bindless`]: writes (stores, atomics) through them.
+pub const BINDLESS_WRITES: u8 = 2;
+
+/// [`HostShader::bindless`] of a program: its image and buffer accesses
+/// whose descriptor is loaded from a heap (a table or the heap itself) at
+/// an address with a term from data (bindless indices, waterfall loops).
+/// Descriptors at fixed table offsets are the title's used resources,
+/// which the host makes and brings up to date per draw.
+fn bindless(p: &ir::Program, res: &resource::Resources, layout: &[crate::native::RootParam]) -> u8 {
+    use crate::native::RootType;
+    let scalar: std::collections::HashMap<_, _> = res.scalar.iter().copied().collect();
+    let mut bits = 0;
+    for d in res.descriptors.iter().filter(|d| d.role == resource::Role::Resource) {
+        let from_data = d.source.leaves().into_iter().any(|leaf| {
+            let resource::Source::Loaded { load, .. } = leaf else {
+                return false;
+            };
+            scalar.get(load).is_some_and(|a| {
+                let heap = layout.get(a.param).map(|p| p.root);
+                matches!(heap, Some(RootType::ResourceHeap))
+                    || a.dynamic.is_some() && matches!(heap, Some(RootType::Table))
+            })
+        });
+        if !from_data {
+            continue;
+        }
+        let Some(inst) = p.blocks.get(d.site.0).and_then(|b| b.insts.get(d.site.1)) else {
+            continue;
+        };
+        let name = inst.name();
+        bits |= if name.contains("store") || name.contains("atomic") {
+            BINDLESS_WRITES
+        } else {
+            BINDLESS_READS
+        };
+    }
+    bits
 }
 
 impl HostShader {
@@ -498,6 +543,7 @@ fn emit_program(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        bindless: bindless(p, res, &native.layout),
     })
 }
 
@@ -696,6 +742,48 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    /// Heap descriptors at slots from data make a program bindless (a read
+    /// or a write by the instruction using them); one at a fixed table
+    /// offset does not.
+    #[test]
+    fn descriptors_at_slots_from_data_are_bindless() {
+        use crate::native::{RootParam, RootType};
+        let param = |root, user_data| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: 0,
+        };
+        let bits = |access: u32, soffset: u32, heap: RootType| {
+            // As `resource::tests::heap_indices_from_root_constants_in_a_merged_stage`:
+            // user data from s8, the constant s14, the heap (or table) s18.
+            let words = [
+                0x8F08_850E, // s_lshl_b32 s8, s14, 5
+                0xBE93_0380, // s_mov_b32 s19, 0
+                0xF408_0209,
+                soffset, // s_load_dwordx4 s[8:11], s[18:19], <soffset>
+                access, 0x8002_0400, // buffer_{load,store}_format_x v4, v0, s[8:11], 0 idxen
+                0xBF81_0000, // s_endpgm
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, false, 256).unwrap();
+            let st = structure::structure(&p).ok();
+            let layout = [param(RootType::Constants, 6), param(heap, 10)];
+            let res = resource::track_lanes(&p, &layout, HwStage::Ms, st.as_ref()).unwrap();
+            bindless(&p, &res, &layout)
+        };
+        const LOAD: u32 = 0xE000_2000;
+        const STORE: u32 = 0xE010_2000;
+        const BY_S8: u32 = 0x1000_0000;
+        const FIXED: u32 = 0xFA00_0000;
+        assert_eq!(bits(LOAD, BY_S8, RootType::ResourceHeap), BINDLESS_READS);
+        assert_eq!(bits(STORE, BY_S8, RootType::ResourceHeap), BINDLESS_WRITES);
+        assert_eq!(bits(LOAD, BY_S8, RootType::Table), BINDLESS_READS);
+        assert_eq!(bits(STORE, FIXED, RootType::Table), 0);
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
@@ -1016,6 +1104,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            bindless: 0,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1026,6 +1115,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                bindless: 0,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

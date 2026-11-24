@@ -713,6 +713,12 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        // Shaders that index the heap from data: the submission brings every
+        // buffer view's range up to date (`descriptor::bindless`).
+        let bindless = p.stages.iter().fold(0, |b, s| b | s.translated().host.bindless);
+        if bindless != 0 {
+            list.note_bindless(bindless);
+        }
         for stage in &p.stages {
             let t = stage.translated();
             let made = {

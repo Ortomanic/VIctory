@@ -11,6 +11,8 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+pub(crate) mod bindless;
+#[cfg(windows)]
 pub(crate) mod host;
 
 const HEAP_IIDS: [Iid; 4] = [
@@ -206,6 +208,27 @@ pub(crate) fn dynamic_use() -> (u64, u64, u64, u64) {
             sum.1 += u64::from(now);
             sum.2 += u64::from(high);
             sum.3 += stolen;
+        }
+    }
+    sum
+}
+
+/// The host view heaps' mirrored slots by what they hold (`host::SLOT_*`),
+/// summed (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn slot_states() -> [u64; 6] {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sum = [0u64; 6];
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.samplers() {
+            continue;
+        }
+        if let Some(Some(host)) = heap.host.get() {
+            for (s, n) in sum.iter_mut().zip(host.slot_states()) {
+                *s += u64::from(n);
+            }
         }
     }
     sum
