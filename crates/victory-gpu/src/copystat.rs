@@ -50,8 +50,23 @@ pub(crate) enum C {
     RegionQueries,
     RegionQueryUs,
     HoleSkips,
+    /// Of the watch time, in the kernel's write-watch query; askings of
+    /// known view memory, which skip that query.
+    WatchKernelUs,
+    KernelSkips,
+    /// Guarding: `VirtualProtect` calls and their time.
+    Protects,
+    ProtectUs,
+    /// Hole runs checked again (once a frame) and found still uncommitted.
+    HoleChecks,
+    /// Time in copies that met an unmapped page, after the failed read.
+    FallbackUs,
+    /// `committed` answers: regions asked of the host, and ranges answered
+    /// from what was asked before (view memory, until remapped).
+    CommitQueries,
+    CommitHits,
 }
-const COUNTERS: usize = 29;
+const COUNTERS: usize = 37;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -98,8 +113,8 @@ fn page_faults() -> u64 {
     u64::from(c.PageFaultCount)
 }
 
-/// Logs the counters per frame over `frames` frames, and the ranges that
-/// took most bytes.
+/// Logs the counters per frame over `frames` frames (all since the last
+/// line), and the ranges that took most bytes.
 pub(crate) fn log(frames: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
@@ -117,7 +132,9 @@ pub(crate) fn log(frames: f64) {
          unchanged; {:.1} fallbacks; {:.0} guard faults; {:.1} region queries {:.2} ms, {:.0} hole \
          blocks skipped; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed; texture read {:.2} ms, committed \
-         {:.2} ms, hash {:.2} ms, detile {:.2} ms",
+         {:.2} ms, hash {:.2} ms, detile {:.2} ms; over {frames:.0} frames: watch kernel {:.2} ms, \
+         {:.0} kernel askings skipped (views); {:.0} protects {:.2} ms; {:.0} hole runs rechecked; \
+         fallbacks {:.2} ms; committed {:.0} queried, {:.0} known",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -148,6 +165,14 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::TexQueryUs as usize]),
         ms(c[C::TexHashUs as usize]),
         ms(c[C::TexDetileUs as usize]),
+        ms(c[C::WatchKernelUs as usize]),
+        c[C::KernelSkips as usize],
+        c[C::Protects as usize],
+        ms(c[C::ProtectUs as usize]),
+        c[C::HoleChecks as usize],
+        ms(c[C::FallbackUs as usize]),
+        c[C::CommitQueries as usize],
+        c[C::CommitHits as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
