@@ -347,6 +347,12 @@ pub struct Structured {
     pub masks: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
+    /// Values read as lane masks that derive from neither EXEC nor a VALU
+    /// result (constants, selects on SCC, values loaded or built from
+    /// scalars), by low dword: their lanes' bits, for the instructions that
+    /// read a mask per lane (`v_cndmask`, carry-ins, mask joins). Their
+    /// values are ordinary data.
+    pub other: HashMap<Value, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -413,6 +419,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// The incoming masks of each join left as an [`Atom::Phi`].
+    phi_args: Vec<Vec<Key>>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -476,6 +484,7 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            phi_args: Vec::new(),
         })
     }
 
@@ -488,6 +497,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.phi_args.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -541,6 +551,28 @@ impl<'a> Lanes<'a> {
             {
                 self.when[b] = Some(self.branch(last));
             }
+        }
+        // A join left per lane takes each incoming mask's bit on its edge:
+        // back edges' masks are known only now (and may join others). They
+        // are kept apart: one taken as derived only here would turn the
+        // scalar code writing it from data into a mask.
+        let before: HashSet<Key> = self.masks.keys().copied().collect();
+        let mut j = 0;
+        while j < self.phi_args.len() {
+            for a in self.phi_args[j].clone() {
+                self.mask(a);
+            }
+            j += 1;
+        }
+        let late: Vec<Key> = self
+            .masks
+            .keys()
+            .filter(|k| !before.contains(k))
+            .copied()
+            .collect();
+        for k in late {
+            let m = self.masks.remove(&k).expect("listed");
+            self.other.insert(k, m);
         }
         execs
     }
@@ -626,6 +658,7 @@ impl<'a> Lanes<'a> {
         }
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
                 .keys()
@@ -768,6 +801,7 @@ impl<'a> Lanes<'a> {
             }
         }
         let born = self.index[block];
+        self.phi_args.push(args);
         Some((self.b.atom(Atom::Phi(id), born), derived))
     }
 

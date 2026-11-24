@@ -312,6 +312,33 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// The lane's bit of the mask whose low dword is `v`: one derived from EXEC
+/// or VALU results, or another value read as a mask (see
+/// [`Structured::other`]).
+fn lane_mask(st: &Structured, v: Value) -> Option<Bool> {
+    st.masks.get(&v).or_else(|| st.other.get(&v)).copied()
+}
+
+/// The masks instructions read per lane (`v_cndmask`, carry-ins): each the
+/// lane's bit of a register pair.
+fn per_lane_masks<'s>(st: &'s Structured, p: &'s Program) -> impl Iterator<Item = Bool> + 's {
+    p.blocks.iter().flat_map(|b| &b.insts).filter_map(|i| {
+        let Fields::Valu(v) = &i.fields else {
+            return None;
+        };
+        let n = i.name();
+        if n != "v_cndmask_b32" && !n.contains("_co_ci_") {
+            return None;
+        }
+        match v.src.get(2) {
+            Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                lane_mask(st, i.read(Reg::S(code))?)
+            }
+            _ => None,
+        }
+    })
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -484,6 +511,7 @@ impl<'a> Lower<'a> {
                         .flatten()
                         .copied()
                         .chain(whens)
+                        .chain(per_lane_masks(x.st, p))
                         .collect();
                 all.sort_unstable();
                 all.dedup();
@@ -869,12 +897,7 @@ impl<'a> Lower<'a> {
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
-                let &m = self
-                    .x
-                    .st
-                    .masks
-                    .get(&mask)
-                    .ok_or("a wave reduction's untracked mask")?;
+                let m = lane_mask(self.x.st, mask).ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
@@ -892,12 +915,7 @@ impl<'a> Lower<'a> {
             return Err(self.whole_wave(SPLIT));
         }
         let c = self.cur;
-        let &m = self
-            .x
-            .st
-            .masks
-            .get(&mask)
-            .ok_or("a wave reduction's untracked mask")?;
+        let m = lane_mask(self.x.st, mask).ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
@@ -1453,11 +1471,18 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
-        }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
+            None if !self.x.st.active.contains(&lo) => {
+                if !self.balloting.insert(lo) {
+                    return Err("a lane mask whose lanes depend on its own value");
+                }
+                let xy = self.mask_by_def(lo);
+                self.balloting.remove(&lo);
+                let xy = xy?;
+                self.ballots.insert(lo, xy);
+                xy
+            }
             None => {
                 let (at, ir) = match self.def_block.get(&lo) {
                     // Program inputs (EXEC on entry).
@@ -1501,6 +1526,142 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// A lane mask that may hold lanes not reaching the block writing it
+    /// (lanes outside EXEC there: an inverse, a union with a mask of
+    /// earlier lanes) as a number: the scalar operation writing it, applied
+    /// to its operands as numbers (masks by their ballots), where it is
+    /// written. Console lanes only: the bits are console lanes'.
+    fn mask_by_def(&mut self, lo: Value) -> Result<(V, V), Why> {
+        const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+        if self.mask_data != MaskData::Console {
+            return Err(ELSEWHERE);
+        }
+        let p = self.x.p;
+        let &b = self.def_block.get(&lo).ok_or(ELSEWHERE)?;
+        let inst: &Inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == lo))
+            .ok_or(ELSEWHERE)?;
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return Err(ELSEWHERE);
+        };
+        let wide = self.wave() == 64;
+        let width = if wide { "_b64" } else { "_b32" };
+        let op = inst
+            .name()
+            .strip_prefix("s_")
+            .and_then(|n| n.strip_suffix(width))
+            .ok_or(ELSEWHERE)?;
+        let at = if b == self.cur_ir {
+            self.cur
+        } else {
+            self.tail[b].ok_or("a lane mask written after its use")?
+        };
+        let saved = self.mask_ok;
+        self.mask_ok = true;
+        let r = self.mask_op(inst, src, op, lo, at, wide);
+        self.mask_ok = saved;
+        r.map_err(|w| if w == LANE_MASK { ELSEWHERE } else { w })
+    }
+
+    /// Dwords (low, high) of the lane-mask result `lo` of `inst`, a
+    /// lane-width scalar operation `op`, built at the end of block `at`.
+    fn mask_op(
+        &mut self,
+        inst: &Inst,
+        src: &[Operand],
+        op: &str,
+        lo: Value,
+        at: usize,
+        wide: bool,
+    ) -> Result<(V, V), Why> {
+        let dword = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
+            match *src.get(k).ok_or("a missing operand")? {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    let v = inst.read(Reg::S(code + h)).ok_or("an unread operand")?;
+                    l.i32_of(v)
+                }
+                Operand::Scalar { .. } => Ok(l.s.m.i32(0)),
+                // Inline constants sign-extend to 64 bits; literals do not.
+                Operand::Const(c) => {
+                    let x = crate::resource::inline(c).ok_or("a special operand")?;
+                    Ok(l.s.m.i32(match h {
+                        0 => x,
+                        _ if (x as i32) < 0 => u32::MAX,
+                        _ => 0,
+                    }))
+                }
+                Operand::Literal(x) => Ok(l.s.m.i32(if h == 0 { x } else { 0 })),
+                _ => Err("a special operand"),
+            }
+        };
+        let (save, f) = match (op.strip_suffix("_saveexec"), op.strip_suffix("_wrexec")) {
+            (Some(f), _) => (Some(true), f),
+            (_, Some(f)) => (Some(false), f),
+            _ => (None, op),
+        };
+        let ones = self.s.m.i32(u32::MAX);
+        // `_saveexec` leaves EXEC as it was in its destination; the other
+        // forms (and its EXEC) take the result.
+        let old_exec = save == Some(true) && inst.write(Reg::S(EXEC)) != Some(lo);
+        let mut out = [None, None];
+        for h in 0..1 + u8::from(wide) {
+            let exec = |l: &mut Self| -> Result<V, Why> {
+                let e = inst.read(Reg::S(EXEC + h)).ok_or("an unread EXEC")?;
+                l.i32_of(e)
+            };
+            if old_exec {
+                out[usize::from(h)] = Some(exec(self)?);
+                continue;
+            }
+            let a = dword(self, 0, h)?;
+            let c = match (save, f) {
+                (_, "mov" | "not") => a,
+                (Some(_), _) => exec(self)?,
+                _ => dword(self, 1, h)?,
+            };
+            let not = |l: &mut Self, x: V| l.s.m.bin(at, Bin::Xor, x, ones);
+            let r = match f {
+                "mov" => a,
+                "not" => not(self, a),
+                "cselect" if save.is_none() => {
+                    let scc = inst.read(Reg::Scc).ok_or("an unread SCC")?;
+                    let Val::Bit(cond) = self.get(scc)? else {
+                        return Err("SCC without a value");
+                    };
+                    self.s.m.select(at, cond, a, c)
+                }
+                "and" => self.s.m.bin(at, Bin::And, a, c),
+                "or" => self.s.m.bin(at, Bin::Or, a, c),
+                "xor" => self.s.m.bin(at, Bin::Xor, a, c),
+                "nand" | "nor" | "xnor" => {
+                    let bin = match f {
+                        "nand" => Bin::And,
+                        "nor" => Bin::Or,
+                        _ => Bin::Xor,
+                    };
+                    let r = self.s.m.bin(at, bin, a, c);
+                    not(self, r)
+                }
+                "andn2" | "orn2" => {
+                    let nc = not(self, c);
+                    let bin = if f == "andn2" { Bin::And } else { Bin::Or };
+                    self.s.m.bin(at, bin, a, nc)
+                }
+                "andn1" | "orn1" => {
+                    let na = not(self, a);
+                    let bin = if f == "andn1" { Bin::And } else { Bin::Or };
+                    self.s.m.bin(at, bin, na, c)
+                }
+                _ => return Err("a lane-mask operation read as data"),
+            };
+            out[usize::from(h)] = Some(r);
+        }
+        let x = out[0].expect("the low dword");
+        Ok((x, out[1].unwrap_or(x)))
     }
 
     // ---- operands ----
@@ -1932,6 +2093,7 @@ impl<'a> Lower<'a> {
         let lane = if self.split.is_some() {
             self.console_lane()
         } else {
+            self.s.flags |= flags::WAVE_OPS;
             self.s.op(
                 at,
                 "waveGetLaneIndex",
@@ -4669,7 +4831,7 @@ impl<'a> Lower<'a> {
                     _ => None,
                 };
                 let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
+                    .and_then(|m| lane_mask(self.x.st, m))
                     .ok_or("a select on an untracked mask")?;
                 let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
@@ -4694,7 +4856,7 @@ impl<'a> Lower<'a> {
                         _ => None,
                     };
                     let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
+                        .and_then(|m| lane_mask(self.x.st, m))
                         .ok_or("a carry-in from an untracked mask")?;
                     Some(self.boolean(m, c)?)
                 } else {
@@ -7469,6 +7631,21 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// An incoming lane mask of a data phi as a number, where lanes are
+    /// the console's (none: not a mask, or no mask data here).
+    fn phi_mask_arg(&mut self, arg: Value) -> Option<Result<V, Why>> {
+        let st = self.x.st;
+        let is_mask = st.masks.contains_key(&arg) || st.highs.contains_key(&arg);
+        if !is_mask || self.mask_data != MaskData::Console {
+            return None;
+        }
+        let saved = self.mask_ok;
+        self.mask_ok = true;
+        let r = self.mask_dword(arg);
+        self.mask_ok = saved;
+        Some(r)
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
@@ -7485,6 +7662,8 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        // Every block is done: values built now go where they are written.
+        self.cur_ir = usize::MAX;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -7497,6 +7676,15 @@ impl<'a> Lower<'a> {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                    }
+                    (Some(Val::Missing(why)), false) if self.read_phis.contains(&phi.value) => {
+                        // A lane mask joined as a number (an accumulated
+                        // mask read as data): each incoming mask's data.
+                        match self.phi_mask_arg(arg) {
+                            Some(Ok(x)) => x,
+                            Some(Err(w)) => return Err(Stop::Retry(phi.value, w)),
+                            None => return Err(Stop::Retry(phi.value, why)),
+                        }
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
@@ -7521,10 +7709,8 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
+                let m = lane_mask(self.x.st, phi.args[n])
+                    .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
@@ -7547,10 +7733,41 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowered_rsrc2(words, false, false, rsrc2).map(|_| ())
+    }
+
+    /// The container a one-lane compute program of constants lowers to,
+    /// in wave64 or wave32; checked by `dxv` when `VICTORY_DXV` names it.
+    /// Wave64 is also lowered for a 32-lane host, which must translate too.
+    fn lowered(words: &[u32], wave64: bool) -> Result<Vec<u8>, crate::ShaderError> {
+        let l = lowered_on(words, wave64, false)?;
+        if wave64 {
+            lowered_on(words, wave64, true).unwrap();
+        }
+        Ok(l.dxil)
+    }
+
+    /// [`lowered`] for a host with (`host_wave32` false) or without 64-lane
+    /// waves.
+    fn lowered_on(
+        words: &[u32],
+        wave64: bool,
+        host_wave32: bool,
+    ) -> Result<super::Lowered, crate::ShaderError> {
+        lowered_rsrc2(words, wave64, host_wave32, 0)
+    }
+
+    /// [`lowered_on`] with the compute registers `rsrc2`.
+    fn lowered_rsrc2(
+        words: &[u32],
+        wave64: bool,
+        host_wave32: bool,
+        rsrc2: u32,
+    ) -> Result<super::Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
-            wave64: false,
+            wave64,
             vgprs: 256,
             layout: vec![],
             used: vec![],
@@ -7560,7 +7777,7 @@ mod tests {
             }),
             code,
         };
-        let p = ir::build(&native.code, false, 256).unwrap();
+        let p = ir::build(&native.code, wave64, 256).unwrap();
         let st = structure::structure(&p).unwrap();
         let res = resource::track_lanes(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
@@ -7574,10 +7791,185 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-            host_wave32: false,
+            host_wave32,
             root_bounds: true,
         })
-        .map(|_| ())
+        .inspect(|l| validate(&l.dxil))
+    }
+
+    /// Runs a tool named by an environment variable on a container: its
+    /// output, if it is set (and it succeeded).
+    fn run_tool(var: &str, args: &[&str], container: &[u8]) -> Option<String> {
+        let tool = std::env::var_os(var)?;
+        let dir = std::env::temp_dir().join(format!("victory-lanemask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{:016x}.dxil", {
+            use std::hash::{BuildHasher, RandomState};
+            RandomState::new().hash_one(container)
+        }));
+        std::fs::write(&file, container).unwrap();
+        let out = std::process::Command::new(tool)
+            .args(args)
+            .arg(&file)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        let _ = std::fs::remove_file(&file);
+        assert!(out.status.success(), "{var}: {text}");
+        Some(text)
+    }
+
+    /// Checks a container with the validator `VICTORY_DXV` names (any
+    /// host's `dxv`).
+    fn validate(container: &[u8]) {
+        if let Some(text) = run_tool("VICTORY_DXV", &[], container) {
+            assert!(!text.contains("error"), "{text}");
+        }
+    }
+
+    /// Whether a container calls DXIL operation `op`, by the disassembly of
+    /// the `dxc` that `VICTORY_DXC` names (none: no dxc).
+    fn calls(container: &[u8], op: &str) -> Option<bool> {
+        let text = run_tool("VICTORY_DXC", &["-dumpbin"], container)?;
+        Some(text.contains(&format!("@dx.op.{op}")))
+    }
+
+    const V_CNDMASK_V1_0_1_S2: [u32; 2] = [0xD501_0001, 0x0009_0280]; // v_cndmask_b32 v1, 0, 1, s2 (s[2:3])
+    /// A branch on v1 (so the select must be built).
+    const BRANCH_ON_V1: [u32; 3] = [
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0xBF87_0001, // s_cbranch_vccnz +1
+        0x7E04_0280, // v_mov_b32 v2, 0
+    ];
+
+    #[test]
+    fn a_select_on_a_uniform_mask_is_the_uniform_condition() {
+        // The console compiler's form of a uniform condition in a select:
+        // SCC made a mask of all lanes or none.
+        let mut w = vec![
+            0xBE80_0385, // s_mov_b32 s0, 5
+            0xBF06_8300, // s_cmp_eq_u32 s0, 3
+            0x8502_80C1, // s_cselect_b32 s2, -1, 0
+        ];
+        w.extend(V_CNDMASK_V1_0_1_S2);
+        w.extend(BRANCH_ON_V1);
+        w.push(S_ENDPGM);
+        let dxil = lowered(&w, false).unwrap();
+        assert_ne!(
+            calls(&dxil, "waveGetLaneIndex"),
+            Some(true),
+            "a uniform needs no lane"
+        );
+        // wave64: s_cselect_b64 s[2:3], -1, 0.
+        w[2] = 0x8582_80C1;
+        lowered(&w, true).unwrap();
+    }
+
+    #[test]
+    fn a_select_on_a_constant_mask_tests_the_lanes_bit() {
+        let mut w = vec![
+            0xBE82_03FF, // s_mov_b32 s2, 0x55
+            0x0000_0055,
+        ];
+        w.extend(V_CNDMASK_V1_0_1_S2);
+        w.extend(BRANCH_ON_V1);
+        w.push(S_ENDPGM);
+        let dxil = lowered(&w, false).unwrap();
+        assert_ne!(calls(&dxil, "waveGetLaneIndex"), Some(false));
+    }
+
+    #[test]
+    fn a_join_of_a_constant_and_a_compare_mask_selects_per_lane() {
+        // if (uniform) s[2:3] = -1; else s[2:3] = v0 == 0; v1 = s[2:3] ? 1 : 0
+        let mut w = vec![
+            0xBE80_0385, // 0: s_mov_b32 s0, 5
+            0xBF06_8300, // 4: s_cmp_eq_u32 s0, 3
+            0xBF85_0003, // 8: s_cbranch_scc1 -> 0x18
+            0x7D84_0080, // c: v_cmp_eq_u32 vcc, 0, v0
+            0xBE82_046A, // 10: s_mov_b64 s[2:3], vcc
+            0xBF82_0001, // 14: s_branch -> 0x1c
+            0xBE82_04C1, // 18: s_mov_b64 s[2:3], -1
+        ];
+        w.extend(V_CNDMASK_V1_0_1_S2); // 1c
+        w.extend(BRANCH_ON_V1);
+        w.push(S_ENDPGM);
+        lowered(&w, true).unwrap();
+    }
+
+    #[test]
+    fn the_lanes_outside_exec_read_as_data() {
+        // ~EXEC once EXEC is narrowed holds lanes that do not run here:
+        // the complement of EXEC's ballot.
+        let w = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+            0xBE82_087E, // s_not_b64 s[2:3], exec
+            0xBE84_1002, // s_bcnt1_i32_b64 s4, s[2:3]
+            0xBF06_8304, // s_cmp_eq_u32 s4, 3
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0x7E02_0280, // v_mov_b32 v1, 0
+            S_ENDPGM,
+        ];
+        let dxil = lowered(&w, true).unwrap();
+        assert_ne!(calls(&dxil, "waveActiveBallot"), Some(false));
+    }
+
+    #[test]
+    fn a_join_of_compare_masks_reads_as_data() {
+        // if (uniform) s[2:3] = v0 == 1; else s[2:3] = v0 == 0; count it.
+        let w = [
+            0xBE80_0385, // 0: s_mov_b32 s0, 5
+            0xBF06_8300, // 4: s_cmp_eq_u32 s0, 3
+            0xBF85_0003, // 8: s_cbranch_scc1 -> 0x18
+            0x7D84_0080, // c: v_cmp_eq_u32 vcc, 0, v0
+            0xBE82_046A, // 10: s_mov_b64 s[2:3], vcc
+            0xBF82_0002, // 14: s_branch -> 0x20
+            0x7D84_0081, // 18: v_cmp_eq_u32 vcc, 1, v0
+            0xBE82_046A, // 1c: s_mov_b64 s[2:3], vcc
+            0xBE84_1002, // 20: s_bcnt1_i32_b64 s4, s[2:3]
+            0xBF06_8304, // s_cmp_eq_u32 s4, 3
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0x7E02_0280, // v_mov_b32 v1, 0
+            S_ENDPGM,
+        ];
+        lowered(&w, true).unwrap();
+    }
+
+    /// On a 32-lane host, a wave64 select on a constant mask runs split (the
+    /// lane's bit by its console lane); a mask read as data needs the whole
+    /// console wave, so that program keeps WaveSize(64).
+    #[test]
+    fn lane_masks_on_a_32_lane_host() {
+        let mut w = vec![
+            0xBE82_04FF, // s_mov_b64 s[2:3], 0x55
+            0x0000_0055,
+        ];
+        w.extend(V_CNDMASK_V1_0_1_S2);
+        w.extend(BRANCH_ON_V1);
+        w.push(S_ENDPGM);
+        let l = lowered_on(&w, true, true).unwrap();
+        // Split, or (a group of at most 32 threads) one 32-lane wave: either
+        // way no WaveSize(64).
+        assert!(matches!((l.wave_size, l.split), (None, true) | (Some(32), false)));
+        assert!(l.split_refused.is_none());
+        let native = lowered_on(&w, true, false).unwrap();
+        assert_eq!((native.wave_size, native.split), (Some(64), false));
+
+        let w = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+            0xBE82_087E, // s_not_b64 s[2:3], exec
+            0xBE84_1002, // s_bcnt1_i32_b64 s4, s[2:3]
+            0xBF06_8304, // s_cmp_eq_u32 s4, 3
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0x7E02_0280, // v_mov_b32 v1, 0
+            S_ENDPGM,
+        ];
+        let l = lowered_on(&w, true, true).unwrap();
+        // A group of at most 32 threads runs as one 32-lane wave (400fa50);
+        // larger groups keep WaveSize(64).
+        assert!(matches!((l.wave_size, l.split), (Some(64) | Some(32), false)));
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
