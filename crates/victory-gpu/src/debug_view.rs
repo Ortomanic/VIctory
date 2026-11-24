@@ -1,12 +1,13 @@
-//! `VICTORY_DEBUG_VIEW=albedo|normals|depth|rt<N>`: the window shows the
-//! title's G-buffer instead of the lit, tone-mapped scene (plane 0), with
-//! its UI plane still blended over it.
+//! `VICTORY_DEBUG_VIEW=albedo|normals|depth|cycle|rt<N>`: the window shows
+//! the title's G-buffer instead of the lit, tone-mapped scene (plane 0),
+//! with its UI plane still blended over it.
 //!
 //! The G-buffer is found by its pass: the render-target set bound with a
 //! depth target that has the most colour targets of the depth's size (GTA
-//! VI's main pass binds six at 1280x720 with its depth: R8G8B8A8 typeless,
-//! four R8G8B8A8, one R16G16). The chosen view is one of that set's colour
-//! slots, or its depth. Present samples it as it stands after the frame's
+//! VI's main pass binds six at 1280x720 with its R32G8X24 depth: slot 0
+//! R8G8B8A8 typeless, flat albedo; slot 1 R8G8B8A8, packed normals (shown
+//! as stored, in bands); slots 2, 3, 5 R8G8B8A8; slot 4 R16G16 float). The
+//! chosen view is one of that set's colour slots, or its depth. Present samples it as it stands after the frame's
 //! submissions, so the view costs one fullscreen draw and no copies; the
 //! tracking costs one compare per multi-target binding.
 //!
@@ -24,9 +25,11 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use crate::object::This;
 use crate::resource::HostTexture;
 
-/// GTA VI's main G-buffer pass slots (see `reports/unlit-view.md`).
-const ALBEDO_SLOT: usize = 1;
-const NORMALS_SLOT: usize = 3;
+/// GTA VI's main G-buffer pass slots, told apart with `cycle` (see
+/// `reports/unlit-view.md`): peds come out in skin and cloth colours in
+/// slot 0, in bands of a packed encoding in slot 1.
+const ALBEDO_SLOT: usize = 0;
+const NORMALS_SLOT: usize = 1;
 /// Fewest colour targets a G-buffer pass binds.
 const MIN_TARGETS: usize = 3;
 /// Presented frames the last G-buffer is shown for without a new pass.
