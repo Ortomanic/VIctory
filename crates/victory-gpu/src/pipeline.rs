@@ -254,6 +254,28 @@ pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
 
+/// A pipeline's shaders and, if it has no host pipeline, why
+/// (diagnostics: the pass log of listed frames).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn describe(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline".into();
+    }
+    let p = pipeline(this);
+    let hashes: Vec<String> = p
+        .shaders
+        .iter()
+        .map(|s| format!("{}:{}", &s.stage[..2], s.hash))
+        .collect();
+    let why = skipped_shader(p)
+        .map(|hash| format!("skipped shader {hash}"))
+        .or_else(|| make::missing(&p.host));
+    match why {
+        Some(why) => format!("{} DROPPED({why})", hashes.join(",")),
+        None => hashes.join(","),
+    }
+}
+
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

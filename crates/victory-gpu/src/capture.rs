@@ -23,13 +23,35 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
+    let fixed = LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
         list.split(',')
             .filter_map(|f| f.trim().parse().ok())
             .collect()
     })
-    .contains(&n)
+    .contains(&n);
+    fixed || after_scene(n)
+}
+
+/// The frame of the first usable scene depth preview (0 before one).
+static FIRST_SCENE: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_CAPTURE_AFTER_SCENE=<k>,...`: frames `k` after the first one
+/// whose scene depth preview was usable count as listed too (the world's
+/// first frame varies from run to run).
+fn after_scene(n: u64) -> bool {
+    static AFTER: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let first = FIRST_SCENE.load(Relaxed);
+    first != 0
+        && n > first
+        && AFTER
+            .get_or_init(|| {
+                let list = std::env::var("VICTORY_CAPTURE_AFTER_SCENE").unwrap_or_default();
+                list.split(',')
+                    .filter_map(|f| f.trim().parse().ok())
+                    .collect()
+            })
+            .contains(&(n - first))
 }
 
 /// Whether frame `n` is saved.
@@ -406,6 +428,7 @@ pub(crate) fn sample_scene_depth(frame: u64) {
         return;
     };
     if usable_depth(&rgba) {
+        let _ = FIRST_SCENE.compare_exchange(0, frame, Relaxed, Relaxed);
         let mut capture = SCENE_DEPTH.lock().unwrap_or_else(|e| e.into_inner());
         if capture.latest.as_ref().is_none_or(|last| last.frame < frame) {
             capture.latest = Some(Arc::new(SceneDepthPreview { frame, width, height, rgba }));

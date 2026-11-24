@@ -534,6 +534,8 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
+        self.pass_log("dispatch", x * y * z, true);
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
@@ -794,6 +796,7 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn trace(&self, kind: &str, count: u32, first: u32) {
         static TRACED: AtomicU64 = AtomicU64::new(0);
+        self.pass_log(kind, count, false);
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
@@ -826,6 +829,45 @@ impl State {
         if frame.len() < 256 {
             frame.push(line);
         }
+    }
+
+    /// Frames in `VICTORY_CAPTURE_FRAMES` with `VICTORY_PASS_LOG=1`: every
+    /// draw and dispatch at info level, with its shaders (and why it is
+    /// dropped), its targets and what it reads, to follow a frame's passes
+    /// (diagnostics builds).
+    #[cfg(feature = "diagnostics")]
+    fn pass_log(&self, kind: &str, count: u32, compute: bool) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_PASS_LOG").is_some())
+            || !crate::capture::listed(crate::queue::presented() + 1)
+        {
+            return;
+        }
+        let texture = |r: usize| {
+            crate::resource::host_resource(r as This).map_or_else(
+                || format!("{r:#x} no host"),
+                |t| {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    format!("{r:#x} {}x{} f{}", d.Width, d.Height, d.Format.0)
+                },
+            )
+        };
+        let targets: Vec<String> = if compute {
+            Vec::new()
+        } else {
+            self.targets.iter().map(|&t| texture(t)).collect()
+        };
+        let depth = (!compute && self.depth != 0).then(|| texture(self.depth));
+        let reads = if crate::pipeline::host_pipeline(self.pipeline as This).is_some() {
+            self.reads(compute)
+        } else {
+            Vec::new()
+        };
+        tracing::info!(
+            "pass {kind} {count} [{}] targets {targets:?} depth {depth:?} reads {reads:?}",
+            crate::pipeline::describe(self.pipeline as This)
+        );
     }
 
     /// What a draw's shaders read, one line per used resource (diagnostics
@@ -992,6 +1034,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        self.pass_log(&format!("indirect{kind}"), max, kind == 2);
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1176,7 +1220,7 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!("{r:?} {}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
     match view {
