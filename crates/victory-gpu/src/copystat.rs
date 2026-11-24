@@ -145,8 +145,13 @@ pub(crate) enum C {
     RecTableMisses,
     RecEntriesMade,
     RecMakeUs,
+    /// Of the copy-back: comparing with the snapshots, writing title
+    /// memory (opening guards included), asking about the pages after.
+    BackCompareUs,
+    BackWriteUs,
+    BackFreshUs,
 }
-const COUNTERS: usize = C::RecMakeUs as usize + 1;
+const COUNTERS: usize = C::BackFreshUs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -308,7 +313,8 @@ pub(crate) fn log(frames: f64) {
          [watch {:.1}: kernel {:.1} in {:.0} calls ({:.0} for textures {:.1} ms), guard {:.1}, \
          journal wait {:.1}; {:.0} askings from the submission's earlier ones, {:.0} in part], \
          texture batches {:.1}, snapshots {:.1} ms {:.1} MB; on the GPU {:.1}; copying back \
-         {:.1} ({:.1} MB compared, {:.0} pieces written by the GPU); after {:.1}); presenting {:.1} (swap chain {:.1}); recording {:.1} ms in {:.0} \
+         {:.1} ({:.1} MB compared in {:.1} ms, {:.0} pieces written by the GPU, written in {:.1} ms, \
+         asked after {:.1} ms); after {:.1}); presenting {:.1} (swap chain {:.1}); recording {:.1} ms in {:.0} \
          draws and dispatches (title threads); {:.0} remaps; fallback queries {:.0}, {:.0} \
          known views; slowest fallback {:.2} ms at {slow_src:#x}+{slow_len:#x}; outside executing \
          and presenting {:.1} ms",
@@ -334,7 +340,10 @@ pub(crate) fn log(frames: f64) {
         us(C::GpuUs),
         us(C::BackUs),
         mb(at(C::BackCompared)),
+        us(C::BackCompareUs),
         at(C::BackPieces),
+        us(C::BackWriteUs),
+        us(C::BackFreshUs),
         us(C::AfterUs),
         us(C::PresentUs),
         us(C::SwapUs),

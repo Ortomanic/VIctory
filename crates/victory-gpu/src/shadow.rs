@@ -289,12 +289,19 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                #[cfg(feature = "diagnostics")]
+                let compared = std::time::Instant::now();
+                let differs = host != old;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::since(crate::copystat::C::BackCompareUs, compared);
+                if differs && crate::host::read_into((start + at) as *const u8, title) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::BackPieces, 1);
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     if merge_written(title, host, old) {
+                        #[cfg(feature = "diagnostics")]
+                        let _writing = crate::copystat::timed(crate::copystat::C::BackWriteUs);
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n, regions);
                         written += n;
@@ -303,6 +310,8 @@ impl Shadow {
                 }
                 at += n;
             }
+            #[cfg(feature = "diagnostics")]
+            let _fresh = crate::copystat::timed(crate::copystat::C::BackFreshUs);
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).

@@ -136,25 +136,74 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
+/// The frame's waiting so far: which frame, the time spent while some
+/// thread waited, since when threads are waiting now and how many.
+struct Spent {
+    frame: u64,
+    spent: Duration,
+    since: Option<Instant>,
+    waiters: u32,
+}
+
+static SPENT: Mutex<Spent> = Mutex::new(Spent {
+    frame: u64::MAX,
+    spent: Duration::ZERO,
+    since: None,
+    waiters: 0,
+});
+
+impl Spent {
+    /// The budget's wall time used up: threads waiting at once spend it
+    /// together (summed per thread, five recording threads waited 2.5 s
+    /// of a world frame's 1.1).
+    fn used(&self, now: Instant) -> Duration {
+        self.spent + self.since.map_or(Duration::ZERO, |at| now - at)
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-    static WAITED_US: AtomicU64 = AtomicU64::new(0);
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        WAITED_US.store(0, Ordering::Relaxed);
-    }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    wait_in(p, frame, &SPENT);
+}
+
+/// [`wait`], with the frame's waiting so far in `spent`.
+fn wait_in(p: &Pending, frame: u64, spent: &Mutex<Spent>) {
+    let spent = || spent.lock().unwrap_or_else(|e| e.into_inner());
     let started = Instant::now();
+    {
+        let mut s = spent();
+        if s.frame != frame {
+            // Waits still running into the new frame count for it.
+            *s = Spent {
+                frame,
+                spent: Duration::ZERO,
+                since: (s.waiters > 0).then_some(started),
+                waiters: s.waiters,
+            };
+        }
+        if s.waiters == 0 {
+            s.since = Some(started);
+        }
+        s.waiters += 1;
+    }
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
+        let rest = BUDGET.saturating_sub(spent().used(Instant::now()));
         if rest.is_zero() {
             break;
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    drop(held);
+    let mut s = spent();
+    s.waiters -= 1;
+    if s.waiters == 0
+        && let Some(at) = s.since.take()
+    {
+        s.spent += at.elapsed();
+    }
+    drop(s);
     #[cfg(feature = "diagnostics")]
     crate::copystat::since(crate::copystat::C::RecWaitUs, started);
 }
@@ -236,5 +285,36 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// Threads waiting at once share the frame's budget: two waits for
+    /// pipelines never made end together after it, and a later one in
+    /// the same frame does not wait.
+    #[test]
+    fn waits_at_once_share_the_budget() {
+        static OWN: Mutex<Spent> = Mutex::new(Spent {
+            frame: u64::MAX,
+            spent: Duration::ZERO,
+            since: None,
+            waiters: 0,
+        });
+        let frame = 7;
+        let started = Instant::now();
+        let waits: Vec<_> = (0..2)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let p = Pending::new(Vec::new(), None);
+                    wait_in(&p, frame, &OWN);
+                })
+            })
+            .collect();
+        for w in waits {
+            w.join().unwrap();
+        }
+        let both = started.elapsed();
+        assert!(both >= BUDGET && both < BUDGET + BUDGET / 2, "{both:?}");
+        let later = Instant::now();
+        wait_in(&Pending::new(Vec::new(), None), frame, &OWN);
+        assert!(later.elapsed() < BUDGET / 10);
     }
 }
