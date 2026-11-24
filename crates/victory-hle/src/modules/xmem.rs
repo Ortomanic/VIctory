@@ -381,7 +381,59 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
 });
 
 fn physical() -> MutexGuard<'static, Physical> {
+    #[cfg(feature = "diagnostics")]
+    {
+        match PHYSICAL.try_lock() {
+            Ok(g) => {
+                contention::note(0);
+                g
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let waiting = std::time::Instant::now();
+                let g = PHYSICAL.lock().unwrap_or_else(|e| e.into_inner());
+                contention::note(waiting.elapsed().as_micros() as u64 + 1);
+                g
+            }
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Diagnostics (frame-perf2): how often title threads wait for the
+/// physical-page lock (streaming maps and unmaps hold it across host VM
+/// calls) and for how long, logged every ~5 s.
+#[cfg(feature = "diagnostics")]
+mod contention {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static WAITS: AtomicU64 = AtomicU64::new(0);
+    static WAITED_US: AtomicU64 = AtomicU64::new(0);
+    static MAX_US: AtomicU64 = AtomicU64::new(0);
+    static NEXT_LOG: AtomicU64 = AtomicU64::new(0);
+
+    /// A lock taken; `us` > 0: after waiting `us - 1` µs.
+    pub(super) fn note(us: u64) {
+        CALLS.fetch_add(1, Relaxed);
+        if us > 0 {
+            WAITS.fetch_add(1, Relaxed);
+            WAITED_US.fetch_add(us - 1, Relaxed);
+            MAX_US.fetch_max(us - 1, Relaxed);
+        }
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let now = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+        let next = NEXT_LOG.load(Relaxed);
+        if now >= next && NEXT_LOG.compare_exchange(next, now + 5, Relaxed, Relaxed).is_ok() && next > 0 {
+            tracing::info!(
+                calls = CALLS.swap(0, Relaxed),
+                waits = WAITS.swap(0, Relaxed),
+                waited_ms = WAITED_US.swap(0, Relaxed) as f64 / 1e3,
+                longest_ms = MAX_US.swap(0, Relaxed) as f64 / 1e3,
+                "xmem physical-page lock over ~5 s (title threads, summed)"
+            );
+        }
+    }
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
