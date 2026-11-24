@@ -1428,11 +1428,19 @@ impl State {
                     (0..n).map(|k| unsafe { (at as *const u32).add(k).read_unaligned() }).collect()
                 })
             };
+            let span = |at: u64, len: u64| {
+                crate::shadow::find(at, len).map(|s| {
+                    let (start, len) = s.span();
+                    format!("{start:#x}+{len:#x}")
+                })
+            };
             tracing::info!(
-                "pass indirect args at {arguments:#x} stride {stride} max {max}: {:?} count at {:?}: {:?}",
+                "pass indirect args at {arguments:#x} stride {stride} max {max}: {:?} count at {:?}: {:?} copies {:?} {:?}",
                 words(arguments, (stride as usize / 4).clamp(1, 5)),
                 count.map(|c| format!("{c:#x}")),
-                count.and_then(|c| words(c, 1))
+                count.and_then(|c| words(c, 1)),
+                span(arguments, u64::from(stride) * u64::from(max.max(1))),
+                count.and_then(|c| span(c, 4)),
             );
         }
         // Skip before the argument clamp can mutate the indirect buffer.
@@ -1548,6 +1556,15 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        #[cfg(feature = "diagnostics")]
+        let probe_slot = args_probe::before(
+            list,
+            &args.buffer,
+            args.offset(arguments),
+            kind,
+            &self.targets,
+            self.pipeline,
+        );
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -1591,7 +1608,7 @@ impl State {
             )
         };
         #[cfg(feature = "diagnostics")]
-        args_probe::take(list, &args.buffer, args.offset(arguments), kind, &self.targets, self.pipeline);
+        args_probe::take(list, &args.buffer, args.offset(arguments), probe_slot);
         crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1605,19 +1622,31 @@ impl State {
 }
 
 /// With `VICTORY_PASS_LOG` (diagnostics): the first record of each indirect
-/// execution of listed frames as the GPU read it (after the clamp), copied
-/// from the host copy into readback memory in the title's list, and
-/// summarized a few frames later per kind, G-buffer or not, zero or not.
+/// execution of listed frames as the GPU read it before the argument clamp
+/// and after it (with the list's budget word then), copied from the host
+/// copy into readback memory in the title's list, and summarized a few
+/// frames later per kind, G-buffer or not, zero or not: what the title's
+/// passes wrote apart from what the clamp cut.
 #[cfg(feature = "diagnostics")]
 mod args_probe {
     use super::*;
 
     const SLOTS: u64 = 16384;
+    /// Bytes per slot: the record after the clamp (12), the budget (4), the
+    /// record before it (12).
+    const SLOT: u64 = 32;
+
+    struct Note {
+        kind: u32,
+        gbuffer: bool,
+        name: String,
+        ran: bool,
+    }
 
     struct Probe {
         buffer: ID3D12Resource,
         frame: u64,
-        notes: Vec<(u32, bool, String)>,
+        notes: Vec<Note>,
         done: bool,
     }
     // SAFETY: D3D12 objects are free-threaded.
@@ -1630,16 +1659,18 @@ mod args_probe {
         *ON.get_or_init(|| std::env::var_os("VICTORY_PASS_LOG").is_some())
     }
 
-    pub(super) fn take(
+    /// Before the clamp (the arguments in unordered access): takes a slot
+    /// and copies the record into it.
+    pub(super) fn before(
         list: &HostList,
         buffer: &ID3D12Resource,
         offset: u64,
         kind: u32,
         targets: &[usize],
         pipeline: usize,
-    ) {
+    ) -> Option<usize> {
         if !on() {
-            return;
+            return None;
         }
         let frame = crate::queue::presented() + 1;
         let mut probe = PROBE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1651,17 +1682,17 @@ mod args_probe {
             p.done = true;
         }
         if !crate::capture::listed(frame) {
-            return;
+            return None;
         }
         if probe.is_none() {
-            let Some(host) = crate::host::host() else { return };
+            let host = crate::host::host()?;
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_READBACK,
                 ..Default::default()
             };
             let desc = D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: SLOTS * 16,
+                Width: SLOTS * SLOT,
                 Height: 1,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
@@ -1684,20 +1715,54 @@ mod args_probe {
                     &mut made,
                 )
             };
-            let (Ok(()), Some(buffer)) = (ok, made) else { return };
+            let (Ok(()), Some(buffer)) = (ok, made) else { return None };
             *probe = Some(Probe { buffer, frame, notes: Vec::new(), done: false });
         }
-        let Some(p) = probe.as_mut() else { return };
+        let p = probe.as_mut()?;
         if p.done || p.frame != frame || p.notes.len() as u64 >= SLOTS {
+            return None;
+        }
+        let slot = p.notes.len();
+        p.notes.push(Note {
+            kind,
+            gbuffer: targets.len() >= 5,
+            name: crate::pipeline::describe(pipeline as This),
+            ran: false,
+        });
+        list.keep(&p.buffer);
+        // SAFETY: an open list; the arguments buffer is in unordered access
+        // here (before the clamp), our readback buffer in copy-dest; both
+        // live.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                buffer,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&p.buffer, slot as u64 * SLOT + 16, buffer, offset, 12);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                buffer,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        Some(slot)
+    }
+
+    /// After the clamp and the execution (the arguments in the indirect
+    /// argument state): the record and the list's budget into `slot`.
+    pub(super) fn take(list: &HostList, buffer: &ID3D12Resource, offset: u64, slot: Option<usize>) {
+        let Some(slot) = slot else { return };
+        let mut probe = PROBE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(p) = probe.as_mut() else { return };
+        if p.done || slot >= p.notes.len() {
             return;
         }
-        let at = p.notes.len() as u64 * 16;
-        let gbuffer = targets.len() >= 5;
-        p.notes.push((kind, gbuffer, crate::pipeline::describe(pipeline as This)));
-        list.keep(&p.buffer);
+        p.notes[slot].ran = true;
+        let at = slot as u64 * SLOT;
         // SAFETY: an open list; the arguments buffer is in the indirect
-        // argument state here (after the clamp), our readback buffer in
-        // copy-dest; both live.
+        // argument state here (after the clamp), the budget (common) and our
+        // readback buffer in copy-dest; all live.
         unsafe {
             list.list.ResourceBarrier(&[crate::host::transition(
                 buffer,
@@ -1705,6 +1770,9 @@ mod args_probe {
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             list.list.CopyBufferRegion(&p.buffer, at, buffer, offset, 12);
+            if let Some(budget) = list.budget_buffer() {
+                list.list.CopyBufferRegion(&p.buffer, at + 12, budget, 0, 4);
+            }
             list.list.ResourceBarrier(&[crate::host::transition(
                 buffer,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -1721,26 +1789,63 @@ mod args_probe {
                 return;
             }
         }
-        let mut counts: std::collections::BTreeMap<(u32, bool, bool), u32> = Default::default();
-        let mut groups: std::collections::BTreeMap<String, (u32, u32, u64)> = Default::default();
-        for (k, (kind, gbuffer, name)) in p.notes.iter().enumerate() {
+        let work = |kind: u32, w: &[u32; 3]| match kind {
+            0 | 1 => u64::from(w[0]) * u64::from(w[1]),
+            _ => u64::from(w[0]) * u64::from(w[1]) * u64::from(w[2]),
+        };
+        // (kind, G-buffer, ran) -> (executions, nonzero before, nonzero after)
+        let mut counts: std::collections::BTreeMap<(u32, bool, bool), (u32, u32, u32)> =
+            Default::default();
+        let mut groups: std::collections::BTreeMap<String, (u32, u32, u32, u64, u64)> =
+            Default::default();
+        let mut cut = 0u32;
+        let mut max_budget = 0u32;
+        for (k, n) in p.notes.iter().enumerate() {
             // SAFETY: inside the mapped buffer.
-            let w: [u32; 3] = unsafe { (data.cast::<u8>().add(k * 16) as *const [u32; 3]).read_unaligned() };
-            let work = match kind {
-                0 | 1 => u64::from(w[0]) * u64::from(w[1]),
-                _ => u64::from(w[0]) * u64::from(w[1]) * u64::from(w[2]),
+            let slot: [u32; 8] = unsafe {
+                (data.cast::<u8>().add(k * SLOT as usize) as *const [u32; 8]).read_unaligned()
             };
-            *counts.entry((*kind, *gbuffer, work != 0)).or_default() += 1;
-            if *gbuffer {
-                let g = groups.entry(name.clone()).or_default();
+            let after = [slot[0], slot[1], slot[2]];
+            let before = [slot[4], slot[5], slot[6]];
+            let (wb, wa) = (work(n.kind, &before), if n.ran { work(n.kind, &after) } else { 0 });
+            if n.ran {
+                max_budget = max_budget.max(slot[3]);
+                if wb != 0 && wa == 0 {
+                    cut += 1;
+                    if cut <= 8 {
+                        tracing::info!(
+                            "args probe: the clamp zeroed {} ({:?} -> {:?}, budget then {:#x})",
+                            n.name, before, after, slot[3]
+                        );
+                    }
+                }
+            }
+            let c = counts.entry((n.kind, n.gbuffer, n.ran)).or_default();
+            c.0 += 1;
+            c.1 += u32::from(wb != 0);
+            c.2 += u32::from(wa != 0);
+            if n.gbuffer {
+                let g = groups.entry(n.name.clone()).or_default();
                 g.0 += 1;
-                g.1 += u32::from(work != 0);
-                g.2 += work;
+                g.1 += u32::from(wb != 0);
+                g.2 += u32::from(wa != 0);
+                g.3 += wb;
+                g.4 += wa;
             }
         }
-        tracing::info!(frame = p.frame, records = p.notes.len(), ?counts, "args probe: (kind, G-buffer, nonzero) -> executions");
-        for (name, (n, nonzero, work)) in groups {
-            tracing::info!(frame = p.frame, "args probe G-buffer {name}: {n} executions, {nonzero} nonzero, {work} groups/vertices");
+        tracing::info!(
+            frame = p.frame,
+            records = p.notes.len(),
+            cut,
+            max_budget,
+            ?counts,
+            "args probe: (kind, G-buffer, ran) -> (executions, nonzero before the clamp, nonzero after)"
+        );
+        for (name, (n, before, after, wb, wa)) in groups {
+            tracing::info!(
+                frame = p.frame,
+                "args probe G-buffer {name}: {n} executions, nonzero {before} before the clamp / {after} after, {wb} / {wa} groups/vertices"
+            );
         }
     }
 }
@@ -1842,23 +1947,35 @@ fn describe(view: Option<&View>) -> String {
             format!("{r:?} {}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
+    // Which host copy of title memory a buffer view resolves to (two views
+    // of the same memory in different copies do not see each other's
+    // writes within a submission).
+    let copy = |v: &View| {
+        crate::descriptor::host::buffer_range(v)
+            .filter(|&(_, len)| len > 0)
+            .and_then(|(a, len)| crate::shadow::find(a, len))
+            .map(|s| format!(" copy {:#x}+{:#x}", s.span().0, s.span().1))
+            .unwrap_or_default()
+    };
     match view {
         None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
+        Some(v @ View::Shader(r, _)) => texture(*r as This).unwrap_or_else(|| {
+            format!("buffer {:?}{}", crate::descriptor::host::buffer_range(v), copy(v))
+        }),
         // A buffer has no host texture: its title range, as for a shader view.
         Some(v @ View::Unordered(r, ..)) => texture(*r as This).map_or_else(
-            || format!("uav buffer {:?}", crate::descriptor::host::buffer_range(v)),
+            || format!("uav buffer {:?}{}", crate::descriptor::host::buffer_range(v), copy(v)),
             |t| format!("uav {t}"),
         ),
-        Some(View::Placed(u, r, d)) => format!(
-            "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
+        Some(v @ View::Placed(u, r, d)) => format!(
+            "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}{}",
             r[0],
             u64::from(r[4]) | u64::from(r[5]) << 32,
             r[6],
             r[8],
             r[11],
-            u64::from(d[10]) | u64::from(d[11]) << 32
+            u64::from(d[10]) | u64::from(d[11]) << 32,
+            if r[0] == 1 { copy(v) } else { String::new() }
         ),
         // The first four values, as a colour rectangle's constants are.
         Some(View::Constant(address, size))

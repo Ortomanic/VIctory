@@ -187,6 +187,12 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
+    /// The title range the copy covers: start and length (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn span(&self) -> (u64, u64) {
+        (self.start, self.len)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start

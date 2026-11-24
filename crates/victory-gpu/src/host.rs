@@ -1641,6 +1641,12 @@ impl HostList {
         Some(gpu + u64::from(slot) * 4)
     }
 
+    /// The budget's buffer once [`HostList::budget`] made it (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn budget_buffer(&self) -> Option<&ID3D12Resource> {
+        self.budget.get().and_then(|b| b.as_ref()).map(|(b, _)| b)
+    }
+
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
