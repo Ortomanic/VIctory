@@ -1165,8 +1165,18 @@ extern "system" fn execute_indirect(
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
+    // Diagnostics: `VICTORY_INDIRECT=0` drops indirect execution again (to
+    // tell whether a GPU fault comes from GPU-driven work).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let off = {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OFF.get_or_init(|| std::env::var_os("VICTORY_INDIRECT").is_some_and(|v| v == "0"))
+    };
+    #[cfg(not(all(windows, feature = "diagnostics")))]
+    let off = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if !off
+        && let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;
