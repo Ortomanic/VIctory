@@ -348,12 +348,20 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
         ((b(at + 3), b(at + 4)), at + 5)
     } else {
         // extrq reads its fields from src's low half, insertq from its high.
-        let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
+        let f = if prefix == 0x66 {
+            xmm[src].Low
+        } else {
+            xmm[src].High as u64
+        };
         ((f as u8, (f >> 8) as u8), at + 3)
     };
     let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
     let bits = if n == 0 { 64 } else { n };
-    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     if prefix == 0x66 {
         // extrq: register form takes its fields from src, works on dst.
         if immediate && (modrm >> 3) & 7 != 0 {
@@ -508,6 +516,27 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
+    #[cfg(feature = "diagnostics")]
+    if code == EXCEPTION_ACCESS_VIOLATION {
+        // What the faulting address is: committed? protected? whose allocation?
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: zeroed plain data, filled by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p[1] as *const _, &mut info, size_of_val(&info)) };
+        if n != 0 {
+            line(format!(
+                "  fault page: base {:#x} region {:#x} state {:#x} protect {:#x} type {:#x} allocation {:#x} (protect {:#x})",
+                info.BaseAddress as usize,
+                info.RegionSize,
+                info.State,
+                info.Protect,
+                info.Type,
+                info.AllocationBase as usize,
+                info.AllocationProtect
+            ));
+        }
+    }
     #[cfg(feature = "diagnostics")]
     if !to_file && code == EXCEPTION_BREAKPOINT && locate(at).ends_with("+0x4dcbc9d") {
         // Read the append-buffer header and classify a bounded payload prefix locally.
