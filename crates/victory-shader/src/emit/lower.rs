@@ -5808,9 +5808,6 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        if *a16 && name.starts_with("image_sample_b") {
-            return Err("a biased image sample with 16-bit coordinates");
-        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -5839,18 +5836,34 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
-        // With a16, two 16-bit components per VGPR, low half first.
+        // With a16, two 16-bit components per VGPR, low half first. The
+        // words before the coordinates (texel offsets, bias, comparison
+        // reference, gradients) keep a whole VGPR each; a bias is an f16 in the low
+        // half of its own (LLVM: "Bias is of type half but occupies full
+        // 32-bit"), so its high half is masked off here.
+        // Explicit gradients stay f32 too (16-bit ones are the `_g16` ops).
+        let gradients = if name.split('_').skip(2).any(|n| n == "d") {
+            2 * (coords - usize::from(kind == 6 || kind == 7))
+        } else {
+            0
+        };
+        let extras = gradients
+            + ["o", "b", "c"]
+                .iter()
+                .filter(|t| name.split('_').skip(2).any(|n| n == **t))
+                .count();
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
-            let r = *regs
-                .get(if *a16 { k / 2 } else { k })
-                .ok_or("an image address")?;
+            let packed = *a16 && k >= extras;
+            let slot = if packed { extras + (k - extras) / 2 } else { k };
+            let r = *regs.get(slot).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
-            if !*a16 {
+            if !packed {
                 return Ok(x);
             }
             let c = l.cur;
-            let (sh, mask) = (l.s.m.i32(16 * (k as u32 % 2)), l.s.m.i32(0xFFFF));
+            let half = if packed { (k - extras) as u32 % 2 } else { 0 };
+            let (sh, mask) = (l.s.m.i32(16 * half), l.s.m.i32(0xFFFF));
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
@@ -5998,7 +6011,7 @@ impl<'a> Lower<'a> {
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -6164,8 +6177,12 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
-                    let bias = self.as_float(bias);
+                    let mut bias = addr_val(self, 0)?;
+                    if *a16 {
+                        let m = self.s.m.i32(0xFFFF);
+                        bias = self.s.m.bin(c, Bin::And, bias, m);
+                    }
+                    let bias = to_float(self, bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
                     self.s.op(
@@ -6181,13 +6198,21 @@ impl<'a> Lower<'a> {
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
                         let x = addr_val(self, first + k)?;
-                        g[k] = to_float(self, x);
+                        g[k] = self.as_float(x);
                         let y = addr_val(self, first + spatial + k)?;
-                        g[3 + k] = to_float(self, y);
+                        g[3 + k] = self.as_float(y);
                     }
+                    // `_cl`: the minimum level of detail follows the
+                    // coordinates (an f32 or, with a16, an f16).
+                    let clamp = if name == "image_sample_d_cl" {
+                        let x = addr_val(self, first + grads + coords)?;
+                        to_float(self, x)
+                    } else {
+                        fu
+                    };
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -7724,6 +7749,101 @@ mod tests {
             S_ENDPGM,
         ]);
         lowers(&words, 0)
+    }
+
+    /// Lowers a compute program that loads an image descriptor (`s[8:15]`)
+    /// and a sampler (`s[16:19]`) from two tables, sets v4..v11 to small
+    /// integers, runs `body` (its result in v0..v3) and branches on v0.
+    fn lowers_image(body: &[u32]) -> Result<(), crate::ShaderError> {
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0202, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0xFA00_0000,
+            0xF408_0403, // s_load_dwordx4 s[16:19], s[6:7], 0
+            0xFA00_0000,
+        ];
+        words.extend((4..12).map(|r| v_mov(r, 128 + r)));
+        words.extend_from_slice(body);
+        words.extend([
+            v_readfirstlane_s0(0),
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let table = |user_data, slot| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let used = |kind, dwords, user_data, slot| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![table(4, 0), table(6, 1)],
+            used: vec![
+                used(ResourceType::Srv, 8, 4, 0),
+                used(ResourceType::Sampler, 4, 6, 1),
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 7 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 16).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|_| ())
+    }
+
+    #[test]
+    fn image_sample_d_translates_with_and_without_a_clamp() {
+        // image_sample_d v[0:3], v[4:9], ... dmask:0xf dim:2D (dx, dy, s, t)
+        lowers_image(&[0xF088_0F08, 0x0082_0004]).unwrap();
+        // image_sample_d_cl ..., v[4:10] (and the clamp after t)
+        lowers_image(&[0xF08C_0F08, 0x0082_0004]).unwrap();
+    }
+
+    #[test]
+    fn image_sample_d_cl_with_16_bit_coordinates_translates() {
+        // image_sample_d_cl ..., v[4:9] a16: dx, dy (f32), (s, t), clamp
+        lowers_image(&[0xF08C_0F08, 0x4082_0004]).unwrap();
+    }
+
+    #[test]
+    fn a_biased_image_sample_with_16_bit_coordinates_translates() {
+        // image_sample_b ..., v[4:5] a16: the bias (an f16) and (s, t)
+        lowers_image(&[0xF094_0F08, 0x4082_0004]).unwrap();
+        // The same with 32-bit coordinates: v[4:6]
+        lowers_image(&[0xF094_0F08, 0x0082_0004]).unwrap();
     }
 
     #[test]

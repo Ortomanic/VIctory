@@ -768,7 +768,8 @@ fn data_dwords(name: &str) -> u8 {
 }
 
 /// Address dwords of an image opcode: offset, bias, compare, derivatives,
-/// coordinates, then LOD/clamp/mip, packed in pairs with `a16`.
+/// coordinates, then LOD/clamp/mip, packed in pairs with `a16` (derivatives:
+/// only in `_g16` opcodes).
 fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     // (coordinates, derivatives per direction) for 1D 2D 3D CUBE 1D_ARRAY
     // 2D_ARRAY 2D_MSAA 2D_MSAA_ARRAY.
@@ -789,7 +790,7 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         "image_get_resinfo" => return 1,
         _ => {}
     }
-    let (mut whole, mut derivs, mut packed): (u8, u8, u8) = (0, 0, coords);
+    let (mut whole, mut derivs, mut packed, mut g16): (u8, u8, u8, bool) = (0, 0, coords, false);
     if let Some(rest) = name
         .strip_prefix("image_sample")
         .or_else(|| name.strip_prefix("image_gather4"))
@@ -799,15 +800,42 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
                 "o" | "b" | "c" => whole += 1,
                 "d" | "cd" => derivs = grads,
                 "l" | "cl" => packed += 1,
+                "g16" => g16 = true,
                 _ => {}
             }
         }
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+    // Derivatives are f16 (two to a dword per direction) only in the `_g16`
+    // opcodes; `a16` packs the coordinates, LOD and clamp, not them.
+    let derivs = if g16 {
+        2 * derivs.div_ceil(2)
     } else {
-        whole + 2 * derivs + packed
+        2 * derivs
+    };
+    if a16 {
+        whole + derivs + packed.div_ceil(2)
+    } else {
+        whole + derivs + packed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_addr_dwords;
+
+    /// Sizes as `llvm-mc -mcpu=gfx1030` accepts them (dim 1 = 2D).
+    #[test]
+    fn image_address_sizes_match_the_assembler() {
+        assert_eq!(image_addr_dwords("image_sample_d_cl", 1, false), 7);
+        // a16 packs the coordinates and clamp, not the derivatives.
+        assert_eq!(image_addr_dwords("image_sample_d_cl", 1, true), 6);
+        assert_eq!(image_addr_dwords("image_sample_d", 1, true), 5);
+        assert_eq!(image_addr_dwords("image_sample_d_g16", 1, false), 4);
+        // The bias keeps a dword of its own.
+        assert_eq!(image_addr_dwords("image_sample_b", 1, true), 2);
+        assert_eq!(image_addr_dwords("image_sample_b", 1, false), 3);
+        assert_eq!(image_addr_dwords("image_gather4_l", 1, false), 3);
     }
 }
