@@ -3360,6 +3360,41 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if name == "ds_bpermute_b32" {
+            // Backward permute, no LDS touched: each lane takes the data
+            // register of the lane its address names, ((address + offset)
+            // / 4) modulo the wave size; a source lane outside EXEC gives 0.
+            // (The title's checkerboard shadow-mask generators and the
+            // sticky-lips pass read their neighbours with it.)
+            // shortcut: a source lane that left through a branch (not a
+            // guard) is not at this instruction on the host and reads as the
+            // host gives it; the console reads 0.
+            self.cross_lane(false)?;
+            if self.split.is_some() {
+                // A console wave of 64 as two host waves: the lane named may
+                // be in the other half.
+                return Err(self.whole_wave("ds_bpermute in a split wave64 program"));
+            }
+            let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+            let o = self.s.m.i32(offset);
+            let at = self.s.m.bin(c, Bin::Add, at, o);
+            let two = self.s.m.i32(2);
+            let src = self.s.m.bin(c, Bin::LShr, at, two);
+            let last = self.s.m.i32(self.wave() - 1);
+            let src = self.s.m.bin(c, Bin::And, src, last);
+            let x = match guard {
+                Some(g) => {
+                    let z = self.s.m.i32(0);
+                    self.s.m.select(c, g, x, z)
+                }
+                None => x,
+            };
+            let r = self.read_lane(x, src);
+            let reg = dst_reg.ok_or("a permute result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -9755,6 +9790,19 @@ mod tests {
         lds_bytes: u32,
         host_wave32: bool,
     ) -> super::Lowered {
+        lower_cs(words, names, true, threads, lds_bytes, host_wave32).unwrap()
+    }
+
+    /// [`lower_wave64`] for a wave32 (`wave64` false) or wave64 program;
+    /// the error if it does not lower.
+    fn lower_cs(
+        words: &[u32],
+        names: &[&str],
+        wave64: bool,
+        threads: [u32; 3],
+        lds_bytes: u32,
+        host_wave32: bool,
+    ) -> Result<super::Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let decoded: Vec<_> = crate::gfx10::decode(&code)
             .unwrap()
@@ -9764,7 +9812,7 @@ mod tests {
         assert_eq!(decoded, names);
         let native = NativeProgram {
             stage: HwStage::Cs,
-            wave64: true,
+            wave64,
             vgprs: 8,
             layout: vec![],
             used: vec![],
@@ -9774,7 +9822,7 @@ mod tests {
             }),
             code,
         };
-        let p = ir::build(&native.code, true, 8).unwrap();
+        let p = ir::build(&native.code, wave64, 8).unwrap();
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
@@ -9792,7 +9840,7 @@ mod tests {
             root_bounds: true,
             heap_views: crate::emit::HEAP_VIEWS,
         })
-        .unwrap()
+        .inspect(|l| validate(&l.dxil))
     }
 
     // v_mbcnt_lo_u32_b32 v1, -1, 0; v_mbcnt_hi_u32_b32 v1, -1, v1: the
@@ -9820,6 +9868,33 @@ mod tests {
         let mut n = names.to_vec();
         n.push("s_endpgm");
         n
+    }
+
+    /// `ds_bpermute_b32` touches no LDS: each lane reads the lane its
+    /// address names. It stopped as "LDS the program does not allocate"
+    /// (sticky lips) or "an LDS operation" (the checkerboard shadow masks).
+    /// Wave32 runs in the console's lanes; a split wave64 program cannot
+    /// name a lane of the other half, so it keeps `WaveSize(64)`.
+    #[test]
+    fn a_backward_permute_reads_the_lane_its_address_names() {
+        let words = with_end(&[
+            0x7E04_028B, // v_mov_b32 v2, 11
+            0xDACC_0004,
+            0x0100_0200, // ds_bpermute_b32 v1, v0, v2 offset:4
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+        ]);
+        let n = names(&["v_mov_b32", "ds_bpermute_b32", "ds_write_b32"]);
+        for host_wave32 in [false, true] {
+            let l = lower_cs(&words, &n, false, [160, 1, 1], 1024, host_wave32).unwrap();
+            assert_eq!((l.wave_size, l.split), (Some(32), false));
+            if let Some(called) = calls(&l.dxil, "waveReadLaneAt") {
+                assert!(called);
+            }
+            let l = lower_cs(&words, &n, true, [128, 1, 1], 1024, host_wave32).unwrap();
+            assert_eq!((l.wave_size, l.split), (Some(64), false), "{host_wave32}");
+            dump("wave64_bpermute.dxil", &l.dxil);
+        }
     }
 
     /// The console lane id from `v_mbcnt` alone, 128 threads: on a host
