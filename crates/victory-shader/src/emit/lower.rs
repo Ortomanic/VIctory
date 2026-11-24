@@ -469,8 +469,8 @@ fn run_once(st: &Structured, entry: usize) -> Vec<bool> {
 }
 
 /// Pixel inputs of 16-bit values (see [`Lower::half_inputs`]): a packed row's
-/// partner is `row2` when distinct from `row`, else the next 16-bit row of the
-/// signature that no input entry names or claims as `row2`, taken in row order.
+/// partner is `row2` when distinct from `row`, else the next unlisted 16-bit
+/// row of the signature before the next `fp16` input row, taken in row order.
 fn half_inputs(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, (bool, Option<u8>)> {
     let StageIo::Ps {
         inputs: entries, ..
@@ -478,35 +478,48 @@ fn half_inputs(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, (bool, Option
     else {
         return HashMap::new();
     };
+    // Keep the first fp16 entry per row (matching the previous `.find()`
+    // behaviour) so duplicate rows neither overwrite earlier ones nor consume
+    // an extra free partner row.
+    let mut seen = HashSet::new();
+    let mut halves: Vec<_> = entries
+        .iter()
+        .filter(|i| i.fp16 && seen.insert(i.row))
+        .collect();
+    halves.sort_by_key(|i| i.row);
+    // In the console's PsInput table, `row2` repeats `row` when no distinct
+    // partner row is named; exclude both listed rows and explicitly claimed
+    // partners (`row2 != row`) from the fallback pool.
     let mut free: Vec<u8> = inputs
         .iter()
         .filter(|e| e.half && e.kind == 0)
         .filter_map(|e| u8::try_from(e.row?).ok())
         .filter(|&r| {
-            !entries
-                .iter()
-                .any(|i| i.row == r || (i.fp16 && i.pack2 && i.row2 != i.row && i.row2 == r))
+            !entries.iter().any(|i| i.row == r)
+                && !halves
+                    .iter()
+                    .any(|i| i.pack2 && i.row2 != i.row && i.row2 == r)
         })
         .collect();
     free.sort_unstable();
     free.dedup();
-    let mut halves: Vec<_> = entries.iter().filter(|i| i.fp16).collect();
-    halves.sort_by_key(|i| i.row);
-    halves
-        .into_iter()
-        .map(|i| {
-            let b = if !i.pack2 {
-                None
-            } else if i.row2 != i.row {
-                Some(i.row2)
-            } else {
-                free.iter()
-                    .position(|&r| r > i.row)
-                    .map(|idx| free.remove(idx))
-            };
-            (i.row, (i.pack2, b))
-        })
-        .collect()
+    let mut out = HashMap::with_capacity(halves.len());
+    for (idx, i) in halves.iter().enumerate() {
+        let next_fp16 = halves.get(idx + 1).map_or(u8::MAX, |n| n.row);
+        // Only take a fallback partner before the next fp16 input row so an
+        // earlier unpaired input cannot steal a later fp16 input's partner.
+        let b = if !i.pack2 {
+            None
+        } else if i.row2 != i.row {
+            Some(i.row2)
+        } else {
+            free.iter()
+                .position(|&r| r > i.row && r < next_fp16)
+                .map(|p| free.remove(p))
+        };
+        out.insert(i.row, (i.pack2, b));
+    }
+    out
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
@@ -9340,5 +9353,23 @@ mod tests {
         assert_eq!(map.get(&0), Some(&(true, Some(1))));
         assert_eq!(map.get(&2), Some(&(true, Some(4))));
         assert_eq!(map.get(&5), Some(&(true, None)));
+
+        // Duplicate entries for the same row keep the first entry and do not
+        // consume an extra free row; an earlier unpaired row (0) must not steal
+        // a free row (3) that comes after a later fp16 row (2).
+        let inputs2 = vec![sig(0, true), sig(2, true), sig(3, true)];
+        let io2 = StageIo::Ps {
+            inputs: vec![
+                ps_in(0, 0, true, 0),
+                ps_in(0, 9, false, 0),
+                ps_in(2, 1, true, 2),
+            ],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        };
+        let map2 = half_inputs(&io2, &inputs2);
+        assert_eq!(map2.get(&0), Some(&(true, None)));
+        assert_eq!(map2.get(&2), Some(&(true, Some(3))));
     }
 }
