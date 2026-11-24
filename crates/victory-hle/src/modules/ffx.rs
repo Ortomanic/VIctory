@@ -28,10 +28,9 @@
 //! title's own loader (and the console upscaler, whose passes are dropped)
 //! is used. With the stand-in the world's presented frames carry the scene
 //! (the opening night flight: city lights, bloom); without it they are
-//! black. Runs with it on NVIDIA often end in a GPU hang (Xid 109, context
-//! switch timeout) a few seconds to minutes into the world, at different
-//! dispatches each time (`VICTORY_GPU_BREADCRUMBS`); runs without it had
-//! not shown one.
+//! black. World runs on NVIDIA often end in a GPU hang (Xid 109, context
+//! switch timeout) with or without it, the host queue stopped at GPU
+//! particle or hair dispatches (`VICTORY_GPU_BREADCRUMBS`).
 #![allow(non_snake_case)]
 // Title code passes pointers the real library would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
