@@ -56,47 +56,41 @@ impl Slots {
         }
     }
 
+    #[cfg(test)]
     fn is_taken(&self, at: usize) -> bool {
         self.taken[at / 64] >> (at % 64) & 1 == 1
     }
 
-    /// The first run of `n` free slots inside `[lo, hi)`: its start.
+    /// The first run of `n` free slots inside `[lo, hi)`: its start. Runs
+    /// of taken and free slots are stepped over whole (bit counts), so a
+    /// search costs about a step per run, not per slot: when the slots
+    /// ran short and were fragmented, a slot-by-slot search of all of them
+    /// at every table cost the world's recording ~0.7 s per frame.
     fn find(&self, lo: usize, hi: usize, n: usize) -> Option<usize> {
         let (mut run, mut start, mut at) = (0, lo, lo);
         while at < hi {
-            if at % 64 == 0 && at + 64 <= hi {
-                match self.taken[at / 64] {
-                    u64::MAX => {
-                        run = 0;
-                        at += 64;
-                        continue;
-                    }
-                    0 => {
-                        if run == 0 {
-                            start = at;
-                        }
-                        run += 64;
-                        if run >= n {
-                            return Some(start);
-                        }
-                        at += 64;
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-            if self.is_taken(at) {
+            let bit = at % 64;
+            let word = self.taken[at / 64] >> bit;
+            let avail = (64 - bit).min(hi - at);
+            if word & 1 == 1 {
+                // Taken slots from `at` on.
                 run = 0;
+                at += (word.trailing_ones() as usize).min(avail);
             } else {
+                let free = if word == 0 {
+                    avail
+                } else {
+                    (word.trailing_zeros() as usize).min(avail)
+                };
                 if run == 0 {
                     start = at;
                 }
-                run += 1;
+                run += free;
                 if run >= n {
                     return Some(start);
                 }
+                at += free;
             }
-            at += 1;
         }
         None
     }
@@ -1165,6 +1159,48 @@ mod tests {
         assert_eq!(slots.take(6), Some(250));
         assert_eq!(slots.take(4), Some(0));
         assert_eq!(slots.free, 0);
+    }
+
+    /// Against a slot-by-slot first fit, over random takes and gives.
+    #[test]
+    fn slot_search_matches_a_slot_by_slot_search() {
+        let len = 3000;
+        let mut slots = Slots::new(len);
+        let mut naive = vec![false; len];
+        let mut next = 0;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        let mut held: Vec<(usize, usize)> = Vec::new();
+        for _ in 0..4000 {
+            if random(3) > 0 || held.is_empty() {
+                let n = 1 + random(90);
+                let find = |lo: usize, hi: usize, naive: &[bool]| {
+                    let mut run = 0;
+                    (lo..hi).find(|&at| {
+                        run = if naive[at] { 0 } else { run + 1 };
+                        run == n
+                    })
+                    .map(|at| at + 1 - n)
+                };
+                let want = find(next, len, &naive).or_else(|| find(0, next, &naive));
+                assert_eq!(slots.take(n), want);
+                if let Some(first) = want {
+                    naive[first..first + n].fill(true);
+                    next = (first + n) % len;
+                    held.push((first, n));
+                }
+            } else {
+                let (first, n) = held.swap_remove(random(held.len()));
+                slots.mark(first, first + n, false);
+                naive[first..first + n].fill(false);
+            }
+            assert_eq!(slots.free, naive.iter().filter(|t| !**t).count());
+        }
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
