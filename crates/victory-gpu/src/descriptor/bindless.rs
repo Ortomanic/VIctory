@@ -209,6 +209,108 @@ pub(crate) fn merged() -> Arc<Merged> {
     merged
 }
 
+/// At a bindless submission: brings the ranges read (`all`, once a frame)
+/// or those shaders write (`writes`) up to date.
+///
+/// What costs is not the bytes (almost none changed) but the host's
+/// virtual-memory calls, each a wait for Wine's lock while the title's
+/// streaming maps and unmaps views (~0.3 ms each at ~3,000 remaps a
+/// frame): a region query per range to tell it was all committed, and a
+/// write-watch query per range of private memory, ~4,000 + ~500 a world
+/// frame (1.2-1.8 s). So write-watched memory is asked about once per
+/// allocation ([`crate::watch::ask_ahead`]; the ranges' askings are then
+/// answered from the journal), and only runs of pages with something to
+/// copy are asked whether they are committed (views of memory the title
+/// has unmapped, released buffers and streamed pages, are left as last
+/// copied: a copy meeting a hole falls back to slow reads).
+pub(crate) fn refresh(m: &Merged, all: bool, writes: bool) {
+    use std::sync::atomic::Ordering;
+    #[cfg(feature = "diagnostics")]
+    let (started, before) = {
+        use crate::copystat::{C, get};
+        (
+            std::time::Instant::now(),
+            [C::WatchUs, C::CommitQueries, C::KernelCalls, C::FallbackUs].map(get),
+        )
+    };
+    if all {
+        // Write-watched copies' ranges by allocation: one asking each.
+        let mut hulls: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+        for (shadow, reads, _) in &m.shadows {
+            let (Some(&(from, _)), Some(&(_, to))) = (reads.first(), reads.last()) else {
+                continue;
+            };
+            let (from, to) = (from as usize, to as usize);
+            if !shadow.write_watched() {
+                continue;
+            }
+            if let Some((start, end, false)) = crate::watch::allocation(from)
+                && to <= end
+            {
+                let hull = hulls.entry(start).or_insert((from, to));
+                *hull = (hull.0.min(from), hull.1.max(to));
+            }
+        }
+        for (start, (from, to)) in hulls {
+            if !crate::watch::ask_ahead(from, to) {
+                // Not one write-watched allocation (any more): asked again
+                // next time, its ranges one by one meanwhile.
+                crate::watch::forget_allocation(start);
+            }
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    let mut commit_us = 0u64;
+    #[cfg(feature = "diagnostics")]
+    let mut ranges_asked = 0u64;
+    let mut copied_all = 0usize;
+    for (shadow, reads, unordered) in &m.shadows {
+        let ranges = match (all, writes) {
+            (true, _) => reads,
+            (false, true) => unordered,
+            (false, false) => continue,
+        };
+        for &(from, to) in ranges {
+            let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            {
+                ranges_asked += 1;
+            }
+            let (copied, _left) = shadow.update_if(from as usize, (to - from) as usize, &mut |a, b| {
+                #[cfg(feature = "diagnostics")]
+                let checking = std::time::Instant::now();
+                let ok = crate::watch::committed(a, b - a);
+                #[cfg(feature = "diagnostics")]
+                {
+                    commit_us += checking.elapsed().as_micros() as u64;
+                }
+                ok
+            });
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BindlessUnmapped, _left as u64);
+            copied_all += copied;
+            crate::host::PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::host::PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+    }
+    let _ = copied_all;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add, get};
+        let after = [C::WatchUs, C::CommitQueries, C::KernelCalls, C::FallbackUs].map(get);
+        let d = |i: usize| after[i].saturating_sub(before[i]);
+        add(C::BindlessSweepUs, started.elapsed().as_micros() as u64);
+        add(C::BindlessSweeps, 1);
+        add(C::BindlessRanges, ranges_asked);
+        add(C::BindlessCopied, copied_all as u64);
+        add(C::BindlessWatchUs, d(0));
+        add(C::BindlessCommitQueries, d(1));
+        add(C::BindlessKernelCalls, d(2));
+        add(C::BindlessFallbackUs, d(3));
+        add(C::BindlessCommitUs, commit_us);
+    }
+}
+
 /// Ranges in start order merged where they overlap or lie within `gap`
 /// bytes of each other.
 fn merge<'a>(ranges: impl Iterator<Item = &'a (u64, u64)>, gap: u64) -> Vec<(u64, u64)> {

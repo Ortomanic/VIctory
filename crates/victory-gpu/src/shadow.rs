@@ -364,10 +364,23 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.update_if(address, len, &mut |_, _| true).0
+    }
+
+    /// [`Shadow::update`] copying a run of stale pages (title `[from,
+    /// to)`) only where `copy_ok` allows it (bindless ranges: only memory
+    /// all committed, asked only of what is to be copied). Pages left out
+    /// stay stale. Returns the bytes copied and the runs left out.
+    pub(crate) fn update_if(
+        &self,
+        address: usize,
+        len: usize,
+        copy_ok: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
-            return 0;
+            return (0, 0);
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending
@@ -382,50 +395,78 @@ impl Shadow {
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
             busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
+            let (mut at, mut bytes, mut left) = (from, 0, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    let (b, l) = self.update_free(at, a, copy_ok);
+                    (bytes, left) = (bytes + b, left + l);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                let (b, l) = self.update_free(at, to, copy_ok);
+                (bytes, left) = (bytes + b, left + l);
             }
-            return bytes;
+            return (bytes, left);
         }
-        self.update_free(from, to)
+        self.update_free(from, to, copy_ok)
     }
 
-    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
+    /// Whether the title memory is known to be write-watched (asked of the
+    /// kernel, not guarded).
+    pub(crate) fn write_watched(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == 1
+    }
+
+    /// [`Shadow::update_if`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(
+        &self,
+        from: usize,
+        to: usize,
+        copy_ok: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> (usize, usize) {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let (copied, left) = self.copy_stale(from, to, now, &written, copy_ok);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
                 }
-                return copied;
+                return (copied, left);
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
+        if !copy_ok(from, to) {
+            return (0, 1);
+        }
         self.copy(from, to);
-        to - from
+        (to - from, 0)
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    /// asking), whole pages within the buffer, each run of them only if
+    /// `copy_ok` allows (the others stay stale). Returns the bytes copied
+    /// and the runs left out.
+    fn copy_stale(
+        &self,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        copy_ok: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> (usize, usize) {
         let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        // Runs of stale pages: [first, past).
+        let mut runs = Vec::new();
+        let mut run = None;
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -435,24 +476,34 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
-                }
+            let at = copied[page - base];
+            if at == 0 || write > at {
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                runs.push((first, page));
             }
         }
-        // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            runs.push((first, last + 1));
         }
-        bytes
+        let (mut bytes, mut left) = (0, 0);
+        for (first, past) in runs {
+            // Cut to the range: next to it shaders may be writing the copy.
+            let (a, b) = ((first * PAGE).max(from), (past * PAGE).min(to));
+            if !copy_ok(a, b) {
+                left += 1;
+                continue;
+            }
+            for page in first..past {
+                // A page only partly in the range is copied in part: it
+                // stays stale for the rest.
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    copied[page - base] = now;
+                }
+            }
+            bytes += self.copy(a, b);
+        }
+        (bytes, left)
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.

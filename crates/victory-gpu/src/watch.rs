@@ -221,7 +221,7 @@ fn writes_in(
     let now = j.asked;
     let mut asked = Vec::with_capacity(gaps.len());
     for (a, b) in gaps {
-        let pages = ask(j, a, b, guarded)?;
+        let pages = ask(j, a, b, guarded, false)?;
         for page in pages.0 {
             j.written.insert(page, now);
         }
@@ -255,11 +255,64 @@ fn writes_in(
     ))
 }
 
+/// Asks the kernel once about the pages of `[start, end)` of write-watched
+/// memory (one allocation: a bindless sweep's ranges in it, between them
+/// pages no copy reads) and keeps the answer in the journal, so that the
+/// epoch's askings inside it ([`writes`]) are answered without the kernel:
+/// one query per allocation instead of one per range (each a wait for
+/// Wine's virtual-memory lock, ~0.3 ms with the title streaming). Whether
+/// it was asked: not for view memory (guarded per block, no query) or
+/// memory not write-watched.
+pub(crate) fn ask_ahead(start: usize, end: usize) -> bool {
+    if start >= end || known_view(start) {
+        return false;
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    #[cfg(feature = "diagnostics")]
+    let waiting = std::time::Instant::now();
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::since(crate::copystat::C::JournalWaitUs, waiting);
+    let j = &mut *j;
+    let (gaps, generation) = {
+        let e = epoch();
+        (gaps(&[&e.watched], first, last), e.generation)
+    };
+    j.asked += 1;
+    let now = j.asked;
+    let mut asked = Vec::with_capacity(gaps.len());
+    let mut whole = true;
+    for (a, b) in gaps {
+        let Some((pages, _)) = ask(j, a, b, false, true) else {
+            whole = false;
+            break;
+        };
+        for page in pages {
+            j.written.insert(page, now);
+        }
+        asked.push((a, b));
+    }
+    let mut e = epoch();
+    if e.generation == generation {
+        for (a, b) in asked {
+            insert_merged(&mut e.watched, a, b);
+        }
+    }
+    whole
+}
+
 /// Asks the kernel (or the guards, view memory with `guarded`) for the
 /// written pages of pages `[first, last)`: the pages, and whether the
 /// guards answered. `None` if the memory is neither watched nor (with
-/// `guarded`) a view.
-fn ask(j: &mut Journal, first: usize, last: usize, guarded: bool) -> Option<(Vec<usize>, bool)> {
+/// `guarded`) a view. `ahead`: a bindless sweep's asking for a whole
+/// allocation ([`ask_ahead`], counted apart).
+fn ask(
+    j: &mut Journal,
+    first: usize,
+    last: usize,
+    guarded: bool,
+    ahead: bool,
+) -> Option<(Vec<usize>, bool)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -293,7 +346,11 @@ fn ask(j: &mut Journal, first: usize, last: usize, guarded: bool) -> Option<(Vec
         use crate::copystat::{C, add};
         let us = started.elapsed().as_micros() as u64;
         add(C::KernelCalls, 1);
-        if guarded {
+        if ahead {
+            add(C::WatchKernelUs, us);
+            add(C::BindlessAheadCalls, 1);
+            add(C::BindlessAheadUs, us);
+        } else if guarded {
             add(C::WatchKernelUs, us);
         } else {
             add(C::TexKernelCalls, 1);
@@ -573,6 +630,29 @@ fn known_view(at: usize) -> bool {
         .range(..=at)
         .next_back()
         .is_some_and(|(_, &(end, view))| view && at < end)
+}
+
+/// The allocation (or region) holding `at` as [`mapped`] finds it: its
+/// start and end and whether it is a view. `None` for free memory.
+pub(crate) fn allocation(at: usize) -> Option<(usize, usize, bool)> {
+    let known = |kinds: &BTreeMap<usize, (usize, bool)>| {
+        kinds
+            .range(..=at)
+            .next_back()
+            .filter(|(_, (end, _))| at < *end)
+            .map(|(&start, &(end, view))| (start, end, view))
+    };
+    if let Some(a) = known(&KINDS.lock().unwrap_or_else(|e| e.into_inner())) {
+        return Some(a);
+    }
+    mapped(at);
+    known(&KINDS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// The allocation at `at` is not what [`allocation`] found (an asking
+/// over it failed): asked again next time.
+pub(crate) fn forget_allocation(at: usize) {
+    forget_kinds(&mut KINDS.lock().unwrap_or_else(|e| e.into_inner()), at, at + 1);
 }
 
 /// Whether the current allocation at `at` is a mapped view, as last found

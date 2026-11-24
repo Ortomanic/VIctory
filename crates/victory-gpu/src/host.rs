@@ -695,28 +695,8 @@ impl Host {
             let frame = crate::frame::current();
             let all = crate::descriptor::bindless::every_submission()
                 || REFRESHED.swap(frame, Ordering::Relaxed) != frame;
-            for (shadow, reads, writes) in &m.shadows {
-                let ranges = match (all, writes_bindless) {
-                    (true, _) => reads,
-                    (false, true) => writes,
-                    (false, false) => continue,
-                };
-                for &(from, to) in ranges {
-                    let started = std::time::Instant::now();
-                    // Views of memory the title has unmapped (released
-                    // buffers, streamed pages) are left as last copied: a
-                    // copy meeting a hole falls back to slow reads
-                    // (~0.3-0.5 s per world frame of them).
-                    let (at, len) = (from as usize, (to - from) as usize);
-                    if !crate::watch::committed(at, len) {
-                        #[cfg(feature = "diagnostics")]
-                        crate::copystat::add(crate::copystat::C::BindlessUnmapped, 1);
-                        continue;
-                    }
-                    let copied = shadow.update(at, len);
-                    PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-                }
+            if all || writes_bindless {
+                crate::descriptor::bindless::refresh(m, all, writes_bindless);
             }
             for (shadow, _, writes) in m.shadows.iter().filter(|_| writes_bindless) {
                 for &(from, to) in writes {

@@ -164,12 +164,34 @@ pub(crate) enum C {
     BindlessWriteSubmissions,
     /// Bindless ranges not refreshed: not all committed.
     BindlessUnmapped,
+    /// The once-a-frame sweep of the bindless ranges read (all of them;
+    /// `prepared` also has the submission's own flush): its time and
+    /// count, the ranges asked about, the bytes copied, and of its time
+    /// what the watch, the committed checks (and their region queries),
+    /// the kernel askings ahead per allocation (and their count) and the
+    /// fallback copies took.
+    BindlessSweepUs,
+    BindlessSweeps,
+    BindlessRanges,
+    BindlessCopied,
+    BindlessWatchUs,
+    BindlessCommitUs,
+    BindlessCommitQueries,
+    BindlessAheadCalls,
+    BindlessAheadUs,
+    BindlessKernelCalls,
+    BindlessFallbackUs,
 }
-const COUNTERS: usize = C::BindlessUnmapped as usize + 1;
+const COUNTERS: usize = C::BindlessFallbackUs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// A counter's value since the last line (for differences around a step).
+pub(crate) fn get(c: C) -> u64 {
+    COUNT[c as usize].load(Relaxed)
 }
 
 /// Adds the time until it is dropped to a counter.
@@ -431,7 +453,9 @@ pub(crate) fn log(frames: f64) {
          slots over {copies} copies, {:.1} MB read, {:.1} MB of it written by shaders; per frame \
          {:.1} submissions reading bindlessly, {:.1} writing, {:.1} ranges skipped (not all mapped), \
          {:.1} merges {:.2} ms, prepared {:.2} ms \
-         (copy-back of all ranges {:.2} ms, {:.1} MB compared)",
+         (copy-back of all ranges {:.2} ms, {:.1} MB compared); sweep {:.2} ms in {:.1} \
+         ({:.0} ranges, {:.1} MB copied; watch {:.2} ms, {:.0} kernel calls, {:.0} ahead \
+         {:.2} ms; committed {:.2} ms, {:.0} queries; fallbacks {:.2} ms)",
         span as f64 / 1e6,
         written as f64 / 1e6,
         c[C::BindlessReadSubmissions as usize],
@@ -442,6 +466,17 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BindlessPrepUs as usize]),
         ms(c[C::BackUs as usize]),
         mb(c[C::BackCompared as usize]),
+        ms(c[C::BindlessSweepUs as usize]),
+        c[C::BindlessSweeps as usize],
+        c[C::BindlessRanges as usize],
+        mb(c[C::BindlessCopied as usize]),
+        ms(c[C::BindlessWatchUs as usize]),
+        c[C::BindlessKernelCalls as usize],
+        c[C::BindlessAheadCalls as usize],
+        ms(c[C::BindlessAheadUs as usize]),
+        ms(c[C::BindlessCommitUs as usize]),
+        c[C::BindlessCommitQueries as usize],
+        ms(c[C::BindlessFallbackUs as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
