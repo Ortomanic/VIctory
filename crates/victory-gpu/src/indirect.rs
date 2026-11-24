@@ -69,6 +69,43 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// Compiles a compute shader with DXC (`dxcompiler.dll` from the DLL search path).
+fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::Dxc::*;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::core::{Interface, w};
+    type Create = unsafe extern "system" fn(
+        *const windows::core::GUID,
+        *const windows::core::GUID,
+        *mut *mut std::ffi::c_void,
+    ) -> windows::core::HRESULT;
+    // SAFETY: loading the compiler and calling its documented entry point with
+    // out pointers of ours; the buffer and arguments outlive the calls.
+    unsafe {
+        let library = LoadLibraryW(w!("dxcompiler.dll"))?;
+        let create: Create = std::mem::transmute(
+            GetProcAddress(library, s!("DxcCreateInstance"))
+                .ok_or_else(windows::core::Error::from_thread)?,
+        );
+        let mut raw = std::ptr::null_mut();
+        create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut raw).ok()?;
+        let compiler = IDxcCompiler3::from_raw(raw);
+        let buffer = DxcBuffer {
+            Ptr: source.as_ptr().cast(),
+            Size: source.len(),
+            Encoding: DXC_CP_UTF8.0,
+        };
+        let arguments = [w!("-T"), w!("cs_6_0"), w!("-E"), w!("main"), w!("-O3")];
+        let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
+        result.GetStatus()?.ok()?;
+        let blob = result.GetResult()?;
+        Ok(
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+                .to_vec(),
+        )
+    }
+}
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -112,20 +149,35 @@ fn make() -> windows::core::Result<Clamp> {
             Some(&mut errors),
         )
     };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
+    // Wine's d3dcompiler_47 (vkd3d-shader) rejects RWByteAddressBuffer loads:
+    // then DXC (dxcompiler.dll, as shader translation already needs) compiles
+    // the same source as cs_6_0, root signature inside.
+    let fallback;
+    if let Err(e) = &compiled {
+        if let Some(errors) = &errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
             };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+            tracing::info!(error = %e, "argument clamp: the system compiler refused it ({}); trying DXC", String::from_utf8_lossy(text).trim());
         }
-        return Err(e);
+        fallback = dxc_compile(SOURCE)
+            .inspect_err(|e| tracing::warn!(error = %e, "argument clamp: DXC failed too"))?;
+    } else {
+        fallback = Vec::new();
     }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
     // SAFETY: the blob's own bytes; the root signature is inside the shader.
     unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let bytes = match (&compiled, &code) {
+            (Ok(()), Some(code)) => std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            ),
+            _ => &fallback[..],
+        };
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -199,7 +251,9 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
         },
     }
 }
