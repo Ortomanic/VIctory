@@ -101,6 +101,9 @@ pub(crate) enum C {
     PresentMeterUs,
     /// Of the preparing: the lists' preludes (texture state transitions).
     PreludeUs,
+    /// Before `Host::execute`: the shader-visible heaps' slots checked for
+    /// records the title copied itself (`sync_shader_heaps`).
+    HeapSyncUs,
     /// Of the host slots: waiting for the heap's made-slot lock.
     RecMirrorLockUs,
     /// Recording draws and dispatches (title threads, summed) and their count;
@@ -400,7 +403,7 @@ pub(crate) fn log(frames: f64) {
          asked after {:.1} ms, {:.0} ranges without a snapshot); after {:.1}); presenting {:.1} (ready {:.1}, execute {:.1} of it GPU {:.1}, compose {:.1}, meter {:.1}, swap chain {:.1}); recording {:.1} ms in {:.0} \
          draws and dispatches (title threads; {:.1} on submitting threads); {:.0} remaps; fallback queries {:.0}, {:.0} \
          known views; slowest fallback {:.2} ms at {slow_src:#x}+{slow_len:#x}; outside executing \
-         and presenting {:.1} ms (title ExecuteCommandLists whole {:.1})",
+         and presenting {:.1} ms (title ExecuteCommandLists whole {:.1}, of it heap slot scans {:.1})",
         us(C::ExecUs),
         us(C::LockUs),
         us(C::PrepUs),
@@ -449,6 +452,7 @@ pub(crate) fn log(frames: f64) {
         // The present's own execute counts in both.
         (wall - us(C::ExecUs) - us(C::PresentUs) + us(C::PresentExecUs)).max(0.0),
         us(C::QueueExecUs),
+        us(C::HeapSyncUs),
     );
     tracing::info!(
         "recording per frame: {:.1} ms in {:.0} draws and dispatches: pipeline waits {:.1}, bind \

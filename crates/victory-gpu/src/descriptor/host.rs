@@ -1051,11 +1051,13 @@ impl HostHeap {
             ONCE.call_once(|| tracing::warn!(start, len, "title heap memory not all committed: not synced"));
             return 0;
         }
-        let changed: Vec<u32> = {
-            let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        // The slots whose record differs from the one last seen, among
+        // `seen[a..b]`.
+        fn scan(seen: &[u64], a: usize, start: u64, step: u64) -> Vec<u32> {
             seen.iter()
                 .enumerate()
-                .filter_map(|(index, &was)| {
+                .filter_map(|(k, &was)| {
+                    let index = a + k;
                     let at = start + index as u64 * step;
                     // SAFETY: a descriptor slot in title memory.
                     let [tag, i, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
@@ -1067,6 +1069,42 @@ impl HostHeap {
                     (key != was).then_some(index as u32)
                 })
                 .collect()
+        }
+        #[cfg(feature = "diagnostics")]
+        let _scanning = crate::copystat::timed(crate::copystat::C::HeapSyncUs);
+        // Every slot, at every submission (~1 million on NVIDIA, 32 MB of
+        // title memory read: ~2-4 ms each, ~100 ms a world frame on one
+        // thread): in parts on several threads.
+        const PART: usize = 1 << 16;
+        let changed: Vec<u32> = {
+            let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() < 2 * PART {
+                scan(&seen, 0, start, step)
+            } else {
+                let parts = seen.len().div_ceil(PART);
+                let found: std::sync::Arc<Vec<Mutex<Vec<u32>>>> =
+                    std::sync::Arc::new((0..parts).map(|_| Mutex::default()).collect());
+                let (at, len) = (seen.as_ptr() as usize, seen.len());
+                let tasks = (0..parts)
+                    .map(|k| {
+                        let found = found.clone();
+                        Box::new(move || {
+                            let a = k * PART;
+                            let b = (a + PART).min(len);
+                            // SAFETY: `seen` stays locked (and alive) until
+                            // every part is done; only read.
+                            let seen = unsafe { std::slice::from_raw_parts((at as *const u64).add(a), b - a) };
+                            *found[k].lock().unwrap_or_else(|e| e.into_inner()) = scan(seen, a, start, step);
+                            0usize
+                        }) as crate::texture::Task
+                    })
+                    .collect();
+                crate::texture::run_tasks(tasks, crate::texture::threads());
+                found
+                    .iter()
+                    .flat_map(|f| std::mem::take(&mut *f.lock().unwrap_or_else(|e| e.into_inner())))
+                    .collect()
+            }
         };
         for &index in &changed {
             self.mirror(index, start + u64::from(index) * step, false);
