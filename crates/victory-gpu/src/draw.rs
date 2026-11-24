@@ -165,6 +165,13 @@ macro_rules! once {
 static UNMADE: AtomicU64 = AtomicU64::new(0);
 static UNMADE_PAST_HEAP: AtomicU64 = AtomicU64::new(0);
 
+/// `VICTORY_KEEP_UNMADE_TABLES=1`: run such draws anyway, reading the
+/// title's slots (the behaviour before; hangs the GPU within minutes).
+fn keep_unmade() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_UNMADE_TABLES").is_ok_and(|v| v == "1"))
+}
+
 fn unmade_table(past_heap: bool) {
     let n = UNMADE.fetch_add(1, Ordering::Relaxed) + 1;
     let past = UNMADE_PAST_HEAP.fetch_add(u64::from(past_heap), Ordering::Relaxed)
@@ -821,6 +828,9 @@ impl State {
             }
             let Some(first) = host.dynamic(n) else {
                 unmade_table(past.contains(&slot));
+                if keep_unmade() {
+                    continue;
+                }
                 return None;
             };
             self.fresh_tables.insert(key, first);
