@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Counters since the last line.
+#[derive(Clone, Copy)]
 pub(crate) enum C {
     Submissions,
     Copies,
@@ -65,12 +66,95 @@ pub(crate) enum C {
     /// from what was asked before (view memory, until remapped).
     CommitQueries,
     CommitHits,
+    /// Where a frame's time goes (round 3), all microseconds unless named
+    /// otherwise: inside `Host::execute` (any thread, the present's copy
+    /// included), of that waiting for another submission's lock,
+    /// preparing, on the GPU, copying back, and the deferred writes after.
+    ExecUs,
+    LockUs,
+    PrepUs,
+    GpuUs,
+    BackUs,
+    AfterUs,
+    /// Of the preparing: Copy steps (title destinations) and their count,
+    /// Fill steps (into upload memory), refresh flushes
+    /// (`Shadow::update`), texture batches (wall time), snapshots of
+    /// ranges shaders write (`Shadow::writing`) and their bytes.
+    TitleCopyUs,
+    TitleCopySteps,
+    FillUs,
+    FlushUs,
+    TexBatchUs,
+    SnapshotUs,
+    SnapshotBytes,
+    /// Inside the title's present (`queue::present`, the copy's execute
+    /// included) and of it the swap chain's `Present`.
+    PresentUs,
+    PresentExecUs,
+    SwapUs,
+    /// Recording draws and dispatches (title threads, summed) and their count.
+    RecordUs,
+    Records,
+    /// The runtime's view maps and unmaps reported.
+    Remaps,
+    /// Of the watch: waiting for the journal's lock; write-watch kernel
+    /// queries of unguarded askings (textures) and how many; kernel
+    /// queries in all; time in `guard()`.
+    JournalWaitUs,
+    TexKernelUs,
+    TexKernelCalls,
+    KernelCalls,
+    GuardUs,
+    /// Askings answered (in whole, in part) from the submission's earlier
+    /// askings of the same pages (`watch::Epoch`).
+    EpochSkips,
+    EpochPartial,
+    /// Region queries in fallbacks, and those answered from known
+    /// committed views.
+    FallbackQueries,
+    FallbackKnown,
 }
-const COUNTERS: usize = 37;
+const COUNTERS: usize = 37 + 32;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// Adds the time until it is dropped to a counter.
+pub(crate) struct Timed(C, std::time::Instant);
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        add(self.0, self.1.elapsed().as_micros() as u64);
+    }
+}
+
+pub(crate) fn timed(c: C) -> Timed {
+    Timed(c, std::time::Instant::now())
+}
+
+/// Times a draw or dispatch being recorded (until dropped), and counts it.
+pub(crate) fn recording() -> Timed {
+    add(C::Records, 1);
+    timed(C::RecordUs)
+}
+
+/// Adds the time since `started` to `c`.
+pub(crate) fn since(c: C, started: std::time::Instant) {
+    add(c, started.elapsed().as_micros() as u64);
+}
+
+/// The slowest fallback copy since the last line: microseconds, source, length.
+static SLOWEST_FALLBACK: Mutex<(u64, usize, usize)> = Mutex::new((0, 0, 0));
+
+/// A copy that met an unmapped page took `us` after its failed read.
+pub(crate) fn fallback(src: usize, len: usize, us: u64) {
+    add(C::FallbackUs, us);
+    let mut s = SLOWEST_FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+    if us > s.0 {
+        *s = (us, src, len);
+    }
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -173,6 +257,61 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::FallbackUs as usize]),
         c[C::CommitQueries as usize],
         c[C::CommitHits as usize],
+    );
+    // Where the frame's time went, over the same frames.
+    static LINE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let wall = {
+        let mut line = LINE.lock().unwrap_or_else(|e| e.into_inner());
+        let wall = line.map_or(0.0, |at| at.elapsed().as_secs_f64() * 1e3 / frames);
+        *line = Some(std::time::Instant::now());
+        wall
+    };
+    let at = |k: C| c[k as usize];
+    let us = |k: C| at(k) / 1e3;
+    let (slow_us, slow_src, slow_len) =
+        std::mem::take(&mut *SLOWEST_FALLBACK.lock().unwrap_or_else(|e| e.into_inner()));
+    tracing::info!(
+        "frame time per frame: {wall:.1} ms wall; executing {:.1} ms (lock wait {:.1}; \
+         preparing {:.1}: title copies {:.1} in {:.0} steps, fills {:.1}, refresh flushes {:.1} \
+         [watch {:.1}: kernel {:.1} in {:.0} calls ({:.0} for textures {:.1} ms), guard {:.1}, \
+         journal wait {:.1}; {:.0} askings from the submission's earlier ones, {:.0} in part], \
+         texture batches {:.1}, snapshots {:.1} ms {:.1} MB; on the GPU {:.1}; copying back \
+         {:.1}; after {:.1}); presenting {:.1} (swap chain {:.1}); recording {:.1} ms in {:.0} \
+         draws and dispatches (title threads); {:.0} remaps; fallback queries {:.0}, {:.0} \
+         known views; slowest fallback {:.2} ms at {slow_src:#x}+{slow_len:#x}; outside executing \
+         and presenting {:.1} ms",
+        us(C::ExecUs),
+        us(C::LockUs),
+        us(C::PrepUs),
+        us(C::TitleCopyUs),
+        at(C::TitleCopySteps),
+        us(C::FillUs),
+        us(C::FlushUs),
+        us(C::WatchUs),
+        us(C::WatchKernelUs),
+        at(C::KernelCalls),
+        at(C::TexKernelCalls),
+        us(C::TexKernelUs),
+        us(C::GuardUs),
+        us(C::JournalWaitUs),
+        at(C::EpochSkips),
+        at(C::EpochPartial),
+        us(C::TexBatchUs),
+        us(C::SnapshotUs),
+        mb(at(C::SnapshotBytes)),
+        us(C::GpuUs),
+        us(C::BackUs),
+        us(C::AfterUs),
+        us(C::PresentUs),
+        us(C::SwapUs),
+        us(C::RecordUs),
+        at(C::Records),
+        at(C::Remaps),
+        at(C::FallbackQueries),
+        at(C::FallbackKnown),
+        slow_us as f64 / 1e3,
+        // The present's own execute counts in both.
+        (wall - us(C::ExecUs) - us(C::PresentUs) + us(C::PresentExecUs)).max(0.0),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

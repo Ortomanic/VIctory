@@ -543,6 +543,8 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
+        let _recording = crate::copystat::recording();
+        #[cfg(feature = "diagnostics")]
         self.pass_log("dispatch", x * y * z, true);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -621,6 +623,8 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        #[cfg(feature = "diagnostics")]
+        let _recording = crate::copystat::recording();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -915,6 +919,8 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
+        let _recording = crate::copystat::recording();
+        #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
@@ -1006,6 +1012,8 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
+        let _recording = crate::copystat::recording();
+        #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
@@ -1043,6 +1051,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let _recording = crate::copystat::recording();
         #[cfg(feature = "diagnostics")]
         self.pass_log(&format!("indirect{kind}"), max, kind == 2);
         // Skip before the argument clamp can mutate the indirect buffer.
