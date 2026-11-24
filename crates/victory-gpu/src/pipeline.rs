@@ -141,6 +141,12 @@ impl Shader {
         self.translated.write().unwrap_or_else(|e| e.into_inner()).take().is_some()
     }
 
+    /// Whether it has no translation (none yet, or one in progress).
+    #[cfg(feature = "diagnostics")]
+    fn untranslated(&self) -> bool {
+        self.translated.read().unwrap_or_else(|e| e.into_inner()).is_none()
+    }
+
     /// The run-time translation settings its translation asked
     /// (`victory_shader::emit::SETTING_*`; 0 if not translated).
     #[cfg(feature = "diagnostics")]
@@ -837,8 +843,10 @@ mod live {
 
     /// The translation setting `bit` (`victory_shader::emit::SETTING_*`)
     /// changed: shaders whose translation asked it are translated again.
+    /// So are those being translated now (they may have read the old
+    /// value): [`Shader::forget`] waits for them.
     pub(crate) fn retranslate_asking(bit: u8) -> String {
-        summary(retranslate(|s| s.settings() & bit != 0))
+        summary(retranslate(|s| s.settings() & bit != 0 || s.untranslated()))
     }
 
     /// `VICTORY_PIPELINE_WAIT_MS` from now on: the per-frame pipeline wait
