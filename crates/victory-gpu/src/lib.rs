@@ -43,6 +43,8 @@ mod present_depth;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod rectangles;
 pub mod resource;
 pub mod root;
 #[cfg(all(windows, feature = "diagnostics"))]
