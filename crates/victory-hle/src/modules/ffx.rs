@@ -24,11 +24,14 @@
 //! (rebox's stub has them one higher; the title's phase count query showed
 //! which is right).
 //!
-//! Opt-in while unverified: `VICTORY_FFX=bilinear` serves the loader; by
-//! default the title's own loader (and the console upscaler, whose passes
-//! are dropped) is used. In two of four world runs with the stand-in the
-//! GPU later faulted (Xid 13, an MMU fault in some shader), which runs
-//! without it had not shown.
+//! Opt-in: `VICTORY_FFX=bilinear` serves the loader; by default the
+//! title's own loader (and the console upscaler, whose passes are dropped)
+//! is used. With the stand-in the world's presented frames carry the scene
+//! (the opening night flight: city lights, bloom); without it they are
+//! black. Runs with it on NVIDIA often end in a GPU hang (Xid 109, context
+//! switch timeout) a few seconds to minutes into the world, at different
+//! dispatches each time (`VICTORY_GPU_BREADCRUMBS`); runs without it had
+//! not shown one.
 #![allow(non_snake_case)]
 // Title code passes pointers the real library would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]

@@ -198,6 +198,45 @@ impl State {
     /// Our own commands replaced the host list's heaps, root signatures
     /// and pipeline: the title's are set again at its next draw or
     /// dispatch.
+    /// `n` dynamic slots of the title's bound view heap, held until the
+    /// list is reset, with that heap bound on the host list: the heap and
+    /// the first slot. For passes of the host's own in the title's list,
+    /// which then call [`State::compute_bindings_lost`].
+    pub(crate) fn own_slots(
+        &mut self,
+        list: &HostList,
+        n: u32,
+    ) -> Option<(&'static crate::descriptor::host::HostHeap, u32)> {
+        let (title, host) = self.heaps.iter().filter(|&&h| h != 0).find_map(|&h| {
+            let heap: &'static crate::descriptor::Heap = crate::descriptor::heap(h as This);
+            (!heap.samplers()).then(|| heap.host()).flatten().map(|host| (h, host))
+        })?;
+        let first = host.dynamic(n)?;
+        self.dynamic.push((title, first, n));
+        if self.host_heaps != self.heaps {
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+                .heaps
+                .iter()
+                .filter(|&&h| h != 0)
+                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                .map(|h| Some(h.heap.clone()))
+                .collect();
+            heaps.iter().flatten().for_each(|h| list.keep(h));
+            // SAFETY: an open list and shader-visible heaps.
+            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            self.host_heaps = self.heaps;
+            self.host_roots = [0; 2];
+        }
+        Some((host, first))
+    }
+
+    /// The host list's root signatures and pipeline were replaced by a pass
+    /// of the host's own; its descriptor heaps were not.
+    pub(crate) fn compute_bindings_lost(&mut self) {
+        self.host_roots = [0; 2];
+        self.host_pipeline = 0;
+    }
+
     pub(crate) fn host_bindings_lost(&mut self) {
         self.host_heaps = [usize::MAX; 2];
         self.host_roots = [0; 2];

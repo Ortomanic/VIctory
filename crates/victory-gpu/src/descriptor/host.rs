@@ -326,6 +326,27 @@ impl HostHeap {
         };
     }
 
+    /// Slot `index` (a dynamic one) is made by the caller, which writes
+    /// its view at [`HostHeap::slot_handles`] and holds `resource` there.
+    pub(crate) fn hold(&self, index: u32, resource: ID3D12Resource) {
+        self.keep(index, Some(resource));
+    }
+
+    /// Slot `index`'s CPU and GPU handles.
+    pub(crate) fn slot_handles(
+        &self,
+        index: u32,
+    ) -> (D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE) {
+        // SAFETY: a live shader-visible heap of ours.
+        let gpu = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
+        (
+            self.cpu(index),
+            D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu.ptr + u64::from(index) * u64::from(self.step),
+            },
+        )
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
