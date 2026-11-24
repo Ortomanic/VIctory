@@ -63,6 +63,8 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    #[cfg(feature = "diagnostics")]
+    target_views: Vec<Option<D3D12_RENDER_TARGET_VIEW_DESC>>,
     depth: usize,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
@@ -512,6 +514,8 @@ impl State {
             return;
         };
         self.targets.clear();
+        #[cfg(feature = "diagnostics")]
+        self.target_views.clear();
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -525,9 +529,15 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            let desc = record.desc();
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            {
+                if crate::scene_color::enabled() {
+                    self.target_views.push(desc);
+                }
+                crate::capture::note_target(record.resource);
+            }
+            rtvs.push(host.rtv(texture, desc.as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -881,6 +891,8 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    crate::scene_color::note_draw(self.depth, &self.targets, &self.target_views);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1244,6 +1256,8 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            crate::scene_color::note_draw(self.depth, &self.targets, &self.target_views);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1333,6 +1347,8 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            crate::scene_color::note_draw(self.depth, &self.targets, &self.target_views);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1446,6 +1462,8 @@ impl State {
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
+            #[cfg(feature = "diagnostics")]
+            crate::scene_color::note_draw(self.depth, &self.targets, &self.target_views);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
