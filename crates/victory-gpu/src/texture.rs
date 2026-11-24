@@ -44,10 +44,10 @@ pub(crate) struct Staging {
     /// Mips per array slice.
     mips: u32,
     memory: *const u8,
-    /// Original packed 16-bit format (86 or 115) when the host texture was
-    /// widened to R8G8B8A8_UNORM, so detiled 2-byte texels expand into the
-    /// 4-byte staging buffer.
-    widened_from: Option<u32>,
+    /// The title's format, and its texel bytes and the host's, when the host
+    /// texture is made in a stand-in format (`resource::widening`), so
+    /// detiled texels expand into the staging buffer.
+    widened_from: Option<(u32, usize, usize)>,
     last: Mutex<Last>,
 }
 
@@ -302,10 +302,9 @@ impl Staging {
             // The bytes the detiling wrote: each row's elements (4-byte
             // ones in a texture widened from a packed 16-bit format).
             let m = &self.layout.mips[mip as usize];
-            let element = if self.widened_from.is_some() {
-                4
-            } else {
-                self.layout.desc.element_bytes as usize
+            let element = match self.widened_from {
+                Some((_, _, host)) => host,
+                None => self.layout.desc.element_bytes as usize,
             };
             let bytes = m.width as usize * element;
             for z in 0..m.depth as usize {
@@ -333,8 +332,8 @@ fn tex_us(c: crate::copystat::C, started: std::time::Instant) {
 }
 
 /// Detiles a subresource of `layout` into `linear` (`row_pitch` bytes a
-/// row, `rows` rows a depth slice); a texture widened from a packed 16-bit
-/// format detiles its 2-byte texels into `packed` first and expands them.
+/// row, `rows` rows a depth slice); a texture made in a stand-in format
+/// detiles its title texels into `packed` first and expands them.
 #[allow(clippy::too_many_arguments)]
 fn detile_subresource(
     layout: &victory_formats::texture::Layout,
@@ -345,21 +344,21 @@ fn detile_subresource(
     row_pitch: usize,
     rows: usize,
     depth: usize,
-    widened_from: Option<u32>,
+    widened_from: Option<(u32, usize, usize)>,
     packed: &mut Vec<u8>,
 ) -> Result<(), victory_formats::texture::Error> {
-    let Some(packed_format) = widened_from else {
+    let Some((packed_format, texel, _)) = widened_from else {
         return layout.detile(tiled, mip, slice, linear, row_pitch, row_pitch * rows);
     };
     let width = layout
         .mips
         .get(mip as usize)
         .map_or(0, |m| m.width as usize);
-    let packed_pitch = width * 2;
+    let packed_pitch = width * texel;
     let packed_plane = packed_pitch * rows;
     packed.resize(packed_plane * depth, 0);
     layout.detile(tiled, mip, slice, packed, packed_pitch, packed_plane)?;
-    crate::resource::expand_packed16_rows(
+    crate::resource::expand_widened_rows(
         packed_format,
         width,
         rows * depth,
@@ -414,9 +413,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let title_format = crate::resource::pc_format(desc.format);
-    let widened_from = (d.Format.0 as u32 == crate::resource::RGBA8_UNORM
-        && crate::resource::PACKED_16.contains(&title_format))
-    .then_some(title_format);
+    let widened_from = crate::resource::widening(title_format, d.Format.0 as u32)
+        .map(|(title, host)| (title_format, title, host));
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -521,7 +519,7 @@ mod tests {
                     row_pitch,
                     rows,
                     1,
-                    Some(format),
+                    Some((format, 2, 4)),
                     &mut packed,
                 )
                 .unwrap();

@@ -485,9 +485,10 @@ pub(crate) struct CopyLocation {
 }
 
 /// Stages a buffer-to-texture `CopyTextureRegion` source into an upload buffer
-/// filled at submission. When the destination was widened from a packed 16-bit
-/// format to `R8G8B8A8_UNORM` on this GPU, the upload footprint is widened and
-/// the texels are expanded on the CPU at submission.
+/// filled at submission. When the destination is made in a stand-in format
+/// on this GPU (`resource::target_format`: R8G8B8A8_UNORM for a packed 16-bit
+/// one, R16G16B16A16_FLOAT for R9G9B9E5_SHAREDEXP), the upload footprint is
+/// widened and the texels are expanded on the CPU at submission.
 #[cfg(windows)]
 fn prepare_footprint_upload(
     list: &crate::host::HostList,
@@ -506,23 +507,23 @@ fn prepare_footprint_upload(
     let dst_fmt = unsafe { to.GetDesc() }.Format.0 as u32;
     let src_fmt = crate::resource::pc_format(src.footprint.format);
     let mut from = src;
-    if dst_fmt == crate::resource::RGBA8_UNORM && crate::resource::PACKED_16.contains(&src_fmt) {
+    if let Some((src_texel, dst_texel)) = crate::resource::widening(src_fmt, dst_fmt) {
         if src.footprint.width == 0 || src.footprint.height == 0 || src.footprint.depth == 0 {
             return None;
         }
-        if u64::from(src.footprint.row_pitch) < u64::from(src.footprint.width) * 2 {
+        if u64::from(src.footprint.row_pitch) < u64::from(src.footprint.width) * src_texel as u64 {
             tracing::warn!(
                 footprint = ?src.footprint,
-                "packed 16-bit copy footprint row pitch is smaller than a row"
+                "widened copy footprint row pitch is smaller than a row"
             );
             return None;
         }
         let row_pitch = u64::from(src.footprint.width)
-            .checked_mul(4)?
+            .checked_mul(dst_texel as u64)?
             .next_multiple_of(256);
         let widened = crate::resource::PlacedFootprint {
             offset: 0,
-            format: crate::resource::RGBA8_UNORM,
+            format: dst_fmt,
             row_pitch: u32::try_from(row_pitch).ok()?,
             ..src.footprint
         };
@@ -547,7 +548,7 @@ fn prepare_footprint_upload(
             // SAFETY: `staging` is the persistent mapping of `buffer`, kept
             // alive in the list's `uploads` until the list is reset.
             let dst = unsafe { std::slice::from_raw_parts_mut(dst_at as *mut u8, dst_len) };
-            crate::resource::expand_packed16_rows(
+            crate::resource::expand_widened_rows(
                 src_fmt, width, lines, &packed, src_pitch, dst, dst_pitch,
             );
         });

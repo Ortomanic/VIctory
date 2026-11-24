@@ -245,17 +245,31 @@ pub(crate) const RGBA8_UNORM: u32 = 28;
 /// B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
 pub(crate) const PACKED_16: [u32; 2] = [86, 115];
 
+/// R9G9B9E5_SHAREDEXP, which no PC GPU renders to or writes typed.
+pub(crate) const RGB9E5: u32 = 67;
+
+/// R16G16B16A16_FLOAT, which stands in for an R9G9B9E5_SHAREDEXP render
+/// target or unordered-access texture: half floats hold every shared-
+/// exponent value exactly (9-bit mantissas, exponents 2^-24..2^15).
+pub(crate) const RGBA16_FLOAT: u32 = 10;
+
+/// Formats a title renders to or writes typed that the host GPU may not,
+/// with the format that stands in for them (see [`target_format`]).
+const STAND_INS: [(u32, u32); 3] = [(86, RGBA8_UNORM), (115, RGBA8_UNORM), (RGB9E5, RGBA16_FLOAT)];
+
 /// Whether the host GPU lacks render-target or typed unordered-access
-/// support for `format` (asked once per format). NVIDIA has neither for
-/// B4G4R4A4 and no typed UAV for B5G5R5A1, which Grand Theft Auto VI's
-/// 2560x1440 UI targets need; AMD has both.
+/// support for `format` (asked once per format of [`STAND_INS`]). NVIDIA
+/// has neither for B4G4R4A4 and no typed UAV for B5G5R5A1, which Grand
+/// Theft Auto VI's 2560x1440 UI targets need; AMD has both. No PC GPU has
+/// either for R9G9B9E5_SHAREDEXP, which its 1920x1080 lighting targets are
+/// (render target and UAV, or UAV only).
 #[cfg(windows)]
 fn host_lacks_target(format: u32) -> bool {
     use std::sync::OnceLock;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-    static LACKS: [OnceLock<bool>; 2] = [OnceLock::new(), OnceLock::new()];
-    let Some(i) = PACKED_16.iter().position(|&f| f == format) else {
+    static LACKS: [OnceLock<bool>; STAND_INS.len()] = [const { OnceLock::new() }; STAND_INS.len()];
+    let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return false;
     };
     *LACKS[i].get_or_init(|| {
@@ -275,7 +289,11 @@ fn host_lacks_target(format: u32) -> bool {
         let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
         let lacks = asked.is_err() || support.Support1.0 & needed != needed;
         if lacks {
-            tracing::info!(format, "packed 16-bit render targets are R8G8B8A8_UNORM on this GPU");
+            tracing::info!(
+                format,
+                stand_in = STAND_INS[i].1,
+                "render targets and unordered-access textures of the format are made in a stand-in format on this GPU"
+            );
         }
         lacks
     })
@@ -289,14 +307,84 @@ fn host_lacks_target(_: u32) -> bool {
 /// The format a render target or unordered-access texture of `format` is
 /// made in on the host, and that render target views and pipelines name:
 /// R8G8B8A8_UNORM for a packed 16-bit format the GPU cannot render to or
-/// write typed (each channel keeps its value, with more precision); else
-/// the format as the host has it. Textures only sampled keep theirs.
+/// write typed (each channel keeps its value, with more precision),
+/// R16G16B16A16_FLOAT for R9G9B9E5_SHAREDEXP (exact); else the format as
+/// the host has it. Textures only sampled keep theirs.
 pub(crate) fn target_format(format: u32) -> u32 {
     let format = pc_format(format);
-    if PACKED_16.contains(&format) && host_lacks_target(format) {
-        RGBA8_UNORM
+    match STAND_INS.iter().find(|&&(f, _)| f == format) {
+        Some(&(_, stand_in)) if host_lacks_target(format) => stand_in,
+        _ => format,
+    }
+}
+
+/// A title texture in `title` format whose host copy is `host` because a
+/// stand-in format replaced it ([`target_format`]): the bytes of a texel in
+/// each. `None` if the host copy has the title's format.
+pub(crate) fn widening(title: u32, host: u32) -> Option<(usize, usize)> {
+    let title = pc_format(title);
+    if title == host || !STAND_INS.contains(&(title, host)) {
+        return None;
+    }
+    Some(if title == RGB9E5 { (4, 8) } else { (2, 4) })
+}
+
+/// Expands `lines` rows of `width` texels of a title texture's `format`
+/// (`src_pitch` bytes apart) into the stand-in format its host copy has
+/// ([`widening`]), `dst_pitch` bytes apart.
+pub(crate) fn expand_widened_rows(
+    format: u32,
+    width: usize,
+    lines: usize,
+    src: &[u8],
+    src_pitch: usize,
+    dst: &mut [u8],
+    dst_pitch: usize,
+) {
+    if pc_format(format) == RGB9E5 {
+        for_rows(width, lines, (src, src_pitch, 4), (dst, dst_pitch, 8), expand_rgb9e5);
     } else {
-        format
+        expand_packed16_rows(format, width, lines, src, src_pitch, dst, dst_pitch);
+    }
+}
+
+/// One R9G9B9E5_SHAREDEXP texel (R bits 0-8, G 9-17, B 18-26, exponent
+/// 27-31; each channel mantissa * 2^(exponent - 24)) as R16G16B16A16_FLOAT
+/// halves, alpha one. Exact: a half's 10-bit mantissa holds the 9 bits at
+/// every exponent (the smallest step, 2^-24, is the smallest half).
+fn rgb9e5_to_halves(packed: u32) -> [u16; 4] {
+    let exponent = (packed >> 27) as i32;
+    let half = |mantissa: u32| -> u16 {
+        if mantissa == 0 {
+            return 0;
+        }
+        // mantissa * 2^(exponent - 24), as a half: normalize the mantissa
+        // to 1.m with its top bit at `top`.
+        let top = 31 - mantissa.leading_zeros() as i32;
+        let e = exponent - 24 + top; // the value's binary exponent
+        if e < -14 {
+            // subnormal half: value / 2^-24
+            return (mantissa << (exponent as u32)) as u16;
+        }
+        let fraction = (mantissa << (10 - top)) & 0x3ff;
+        (((e + 15) as u16) << 10) | fraction as u16
+    };
+    [
+        half(packed & 0x1ff),
+        half((packed >> 9) & 0x1ff),
+        half((packed >> 18) & 0x1ff),
+        0x3c00,
+    ]
+}
+
+/// R9G9B9E5_SHAREDEXP texels in `src` (4 bytes each) as
+/// R16G16B16A16_FLOAT in `dst` (8 bytes each).
+fn expand_rgb9e5(src: &[u8], dst: &mut [u8]) {
+    for (s, d) in src.as_chunks::<4>().0.iter().zip(dst.as_chunks_mut::<8>().0) {
+        let h = rgb9e5_to_halves(u32::from_le_bytes(*s));
+        for (k, v) in h.iter().enumerate() {
+            d[k * 2..k * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        }
     }
 }
 
@@ -452,9 +540,11 @@ pub(crate) fn pack_rgba8_to_16_rows(
 }
 
 /// Whether a GPU-to-GPU copy or resolve between `to` and `from` mixes a
-/// native packed 16-bit texture with a widened (or different) format, logging
-/// once per packed format so callers can skip the command before recording
-/// barriers or marking the destination written.
+/// texture in a format [`STAND_INS`] names with one in its stand-in (or, for
+/// the packed 16-bit formats, any other format), logging once per format so
+/// callers can skip the command before recording barriers or marking the
+/// destination written: the host refuses copies between the formats.
+/// shortcut: such a copy is dropped, not converted.
 #[cfg(windows)]
 pub(crate) fn skip_mixed_packed_copy(
     op: &str,
@@ -468,21 +558,25 @@ pub(crate) fn skip_mixed_packed_copy(
     if to_fmt == from_fmt {
         return false;
     }
-    let Some(packed) = [from_fmt, to_fmt]
+    let mixed = |own: u32, other: u32| {
+        PACKED_16.contains(&own) || STAND_INS.contains(&(own, other))
+    };
+    let Some(native) = [(from_fmt, to_fmt), (to_fmt, from_fmt)]
         .into_iter()
-        .find(|f| PACKED_16.contains(f))
+        .find(|&(own, other)| mixed(own, other))
+        .map(|(own, _)| own)
     else {
         return false;
     };
-    static ONCE: [Once; 2] = [Once::new(), Once::new()];
-    if let Some(i) = PACKED_16.iter().position(|&f| f == packed) {
+    static ONCE: [Once; STAND_INS.len()] = [const { Once::new() }; STAND_INS.len()];
+    if let Some(i) = STAND_INS.iter().position(|&(f, _)| f == native) {
         ONCE[i].call_once(|| {
             tracing::warn!(
                 op,
-                packed_format = packed,
+                native_format = native,
                 to_format = to_fmt,
                 from_format = from_fmt,
-                "skipping GPU copy between packed 16-bit texture and widened R8G8B8A8_UNORM target"
+                "skipping GPU copy between a texture and one made in a stand-in format"
             );
         });
     }
@@ -536,8 +630,8 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    // Widened packed targets are typed R8G8B8A8_UNORM, so null view descs
-    // can stay null and inherit the resource's exact dimension.
+    // Targets made in a stand-in format are typed, so null view descs can
+    // stay null and inherit the resource's exact dimension.
     (format != own && format != target_format(own)).then_some(own)
 }
 
@@ -2180,6 +2274,38 @@ mod tests {
         assert_eq!(&repacked[6..10], &src_rows[6..10]);
     }
 
+    /// A half's value, exactly (every half is a dyadic rational).
+    fn half_value(h: u16) -> f64 {
+        let (e, m) = (i32::from((h >> 10) & 0x1f), f64::from(h & 0x3ff));
+        assert!(e < 31 && h >> 15 == 0, "{h:#06x} is not a finite positive half");
+        if e == 0 { m * 2f64.powi(-24) } else { (1024.0 + m) * 2f64.powi(e - 25) }
+    }
+
+    #[test]
+    fn rgb9e5_widens_to_exact_halves() {
+        // Every mantissa at every exponent, in each channel.
+        for exponent in 0..32u32 {
+            for mantissa in 0..512u32 {
+                let packed = mantissa | (mantissa << 9) | ((511 - mantissa) << 18) | (exponent << 27);
+                let scale = 2f64.powi(exponent as i32 - 24);
+                let h = rgb9e5_to_halves(packed);
+                assert_eq!(half_value(h[0]), f64::from(mantissa) * scale, "{packed:#x}");
+                assert_eq!(half_value(h[1]), f64::from(mantissa) * scale, "{packed:#x}");
+                assert_eq!(half_value(h[2]), f64::from(511 - mantissa) * scale, "{packed:#x}");
+                assert_eq!(h[3], 0x3c00);
+            }
+        }
+        // Rows: 1.0 (mantissa 256, exponent 16) and 65408 (the largest).
+        let src = [(256u32 | 16 << 27).to_le_bytes(), [0xaa; 4], (511u32 | 31 << 27).to_le_bytes()].concat();
+        let mut dst = [0u8; 24];
+        expand_widened_rows(RGB9E5, 1, 2, &src, 8, &mut dst, 16);
+        assert_eq!(&dst[..8], &[0x00, 0x3c, 0, 0, 0, 0, 0x00, 0x3c]);
+        assert_eq!(&dst[16..18], &0x7bfcu16.to_le_bytes());
+        assert_eq!(widening(RGB9E5, RGBA16_FLOAT), Some((4, 8)));
+        assert_eq!(widening(86, RGBA8_UNORM), Some((2, 4)));
+        assert_eq!((widening(RGB9E5, RGB9E5), widening(28, 28), widening(RGB9E5, 28)), (None, None, None));
+    }
+
     #[test]
     fn target_format_is_identity_for_non_packed_formats() {
         for format in 0..=200u32 {
@@ -2188,6 +2314,8 @@ mod tests {
                     [format, RGBA8_UNORM].contains(&target_format(format)),
                     "unexpected target format for {format}"
                 );
+            } else if format == RGB9E5 {
+                assert!([format, RGBA16_FLOAT].contains(&target_format(format)));
             } else if (118..=120).contains(&format) {
                 assert_eq!(target_format(format), format - 118 + 45);
             } else {
