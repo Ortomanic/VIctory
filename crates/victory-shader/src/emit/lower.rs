@@ -7047,7 +7047,9 @@ impl<'a> Lower<'a> {
             let Fields::Image { cache, .. } = &inst.fields else {
                 unreachable!()
             };
-            if *d16 || *a16 {
+            // With a16 the coordinates are 16-bit integers, unpacked as
+            // for loads; 16-bit data has no atomic form.
+            if *d16 {
                 return Err("a 16-bit image atomic");
             }
             // Compare-exchange consumes a replacement followed by a comparand.
@@ -7135,11 +7137,17 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
+            // shortcut: stores are taken to write all channels of a float
+            // format (the console converts by the view's format); one of
+            // the first 1-3 channels writes 0 to the others (DXIL's typed
+            // stores write all four), exact for a format with that many.
+            let channels = match *dmask {
+                0x1 => 1u8,
+                0x3 => 2,
+                0x7 => 3,
+                0xF => 4,
+                _ => return Err("an image store of some channels"),
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -7149,7 +7157,7 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
-            for k in 0..4u8 {
+            for k in 0..channels {
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
@@ -7166,6 +7174,8 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            let zero = self.s.m.f32(0);
+            vals.resize(4, zero);
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
