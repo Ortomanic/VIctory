@@ -58,9 +58,47 @@ lowered *split*: each console wave runs as two host waves of 32 ("halves").
   console's populated lanes, so `WaveSize(32)` is exact; no split.
 * **Refusal.** The same operations in a block some lanes skip (an `if` on
   a lane condition, a loop) set `split_refused` (`Lower::whole_wave`), and
-  so do one-wave groups (33..64 threads) with LDS (decided up front). Any
-  refusal or failure of the split form lowers the program again exactly as
+  so do one-wave groups (33..64 threads) with LDS (decided up front). Such
+  a program is then tried in the uniform form below when its group is one
+  console wave; any refusal or failure there too lowers it again exactly as
   before (`WaveSize(64)`), so the result is never worse than without it.
+
+## The uniform form (one console wave per group)
+
+`lower` (`Form::Uniform`), for wave64 compute groups of 33..=64 threads that
+still need 64 lanes after the split form: every host wave of the group is a
+half of the one console wave, so a group barrier is a meeting of the two
+halves, legal wherever both halves always arrive together. The form makes
+that everywhere, as the console does (and xcl's recompiler): control flow
+is uniform per console wave.
+
+* **Absolute lane conditions.** The program is structured again with
+  `structure::structure_absolute`: guards are EXEC's bit wherever EXEC is
+  not all lanes (not narrowed by what a lane knows on arrival), branch
+  conditions are not narrowed either, and mask joins stay per-lane joins
+  (never resolved to a constant true for "every lane that arrives").
+  These hold for every lane whatever path it took, so a lane can run a
+  block it would have skipped: its vector writes keep their old values
+  (guards), its masks have its bit clear, as on the console.
+* **Branches** (`Lower::uniform_branch`): a branch on a lane condition
+  takes the console wave's decision: every lane's condition
+  (`s_cbranch_execz`, `vccz`, SCC of `s_cmp_eq` of masks:
+  `Structured::wave_all`) or some lane's (`execnz`, `vccnz`, SCC of a mask
+  operation), each half's `WaveAllTrue` / `WaveAnyTrue` exchanged and
+  combined. Branches on scalar values (SCC atoms only) need no exchange.
+* **Exchanges** (ballots read as numbers, `v_readlane`, reductions) are
+  allowed in every block; in a block on a cycle the exchange ends with a
+  second barrier (its slots are written again on the next pass).
+  `v_readfirstlane` takes the lowest console lane in EXEC: each half's
+  first EXEC lane (ballot + `FirstbitLo`) and whether it has one are
+  exchanged, the lower half's wins when it has one.
+* **LDS**: the console runs a wave's LDS accesses in order, all lanes at
+  once; the halves get a group barrier before and after each LDS write or
+  atomic (merged when nothing is between them); reads need none.
+* Cost: one exchange (two or three barriers) per lane branch, two barriers
+  per LDS write. Groups of several console waves are not covered (a group
+  barrier there also waits for other console waves, whose control flow may
+  differ: xcl's counter-paired spin would be needed).
 
 ## Audit of wave intrinsics in the emitter (32 vs 64)
 
@@ -81,17 +119,16 @@ lowered *split*: each console wave runs as two host waves of 32 ("halves").
 
 ## Not done yet
 
-Measured with shader-lab (`VICTORY_HOST_WAVE32=1`), 237 of 1,705 translated
-compute programs still declare `WaveSize(64)` (302 before the exchanges):
-98 one-wave groups sharing LDS and 139 with lane operations. Nearly all
-are refused because the exchange point or LDS access is in a block some
-lanes skip (`s_cbranch_execz` regions, loops): VIctory lowers console
-control flow per lane, so the halves need not both reach it and a group
-barrier there is undefined. Covering them needs control flow uniform per
-console wave (both halves enter a block when any lane of the console wave
-is active, as xcl's recompiler does), with exchanges of the masks that
-decide it, or xcl's counter-paired spin, which still needs both halves to
-arrive. `ds_bpermute` (none in the corpus) is not exchanged.
+Measured with shader-lab (`VICTORY_HOST_WAVE32=1`, `runs/wave64c.tsv`),
+38 of 2,399 translated compute programs still declare `WaveSize(64)` (250
+before the uniform form, `runs/integrated-2.tsv`; 212 one-wave groups now
+declare `WaveSize(32)` and all validate). All 38 have groups of several
+console waves (128..1024 threads): their exchanges, LDS accesses or lane
+masks sit in blocks some console waves skip, where a group barrier is not
+reached by all. Covering them needs xcl's counter-paired spin between the
+two halves of each console wave (forward progress of co-resident waves),
+with control flow uniform per console wave as above. `ds_bpermute` (none
+in the corpus) is not exchanged.
 
 ## Verify
 
@@ -100,7 +137,8 @@ arrive. `ds_bpermute` (none in the corpus) is not exchanged.
   `a_dpp_program_is_split_with_relabelled_threads`,
   `whole_wave_operations_exchange_between_halves`,
   `exchanges_in_divergent_code_keep_wave64`, `blocks_run_once`,
-  `groups_of_one_half_declare_wave32`, `one_wave_lds_programs_keep_wave64`,
+  `groups_of_one_half_declare_wave32`, `one_wave_lds_programs_split_uniformly`,
+  `one_wave_groups_run_divergent_exchanges_uniformly`,
   `lane_independent_programs_are_unchanged`, `the_host_wave32_switch_parses`.
 * DXIL validation on Linux: `VICTORY_WAVE64_DUMP=/tmp/d cargo test ... wave64`
   then `LD_LIBRARY_PATH=dxc-linux/lib dxc-linux/bin/dxv /tmp/d/*.dxil`.

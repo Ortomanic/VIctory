@@ -44,7 +44,6 @@ pub(crate) struct Lowered {
     #[cfg(test)]
     pub wave_ops: bool,
     /// The wave size the program declares (`WaveSize`).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub wave_size: Option<u32>,
     /// A console wave64 compute program runs in host waves of 32
     /// ([`Split`]).
@@ -5390,9 +5389,7 @@ impl<'a> Lower<'a> {
                     // Lower half: own if it has one; upper half: own unless
                     // the lower half has one.
                     r = self.s.m.select(c, mine_first, own, theirs);
-                } else if self.split.is_some()
-                    && guard.is_none()
-                    && self.can_exchange(self.cur_ir)
+                } else if self.split.is_some() && guard.is_none() && self.can_exchange(self.cur_ir)
                 {
                     // Every lane is here: the console's first lane is the
                     // lower half's. (Elsewhere each half takes its own
