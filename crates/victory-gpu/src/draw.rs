@@ -1654,9 +1654,23 @@ mod args_probe {
 
     static PROBE: std::sync::Mutex<Option<Probe>> = std::sync::Mutex::new(None);
 
+    /// `VICTORY_ARGS_PROBE=<n>`: also every `n`th frame (without the pass
+    /// log or listed frames; runs that stop early may never reach a listed
+    /// one).
+    fn every() -> u64 {
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_ARGS_PROBE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+        })
+    }
+
     fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_PASS_LOG").is_some())
+        *ON.get_or_init(|| std::env::var_os("VICTORY_PASS_LOG").is_some() || every() > 0)
+    }
+
+    fn probed(frame: u64) -> bool {
+        crate::capture::listed(frame) || (every() > 0 && frame.is_multiple_of(every()))
     }
 
     /// Before the clamp (the arguments in unordered access): takes a slot
@@ -1681,7 +1695,7 @@ mod args_probe {
             summarize(p);
             p.done = true;
         }
-        if !crate::capture::listed(frame) {
+        if !probed(frame) {
             return None;
         }
         // A later listed frame: probed anew (the readback buffer reused;
@@ -1843,6 +1857,20 @@ mod args_probe {
                 g.4 += wa;
             }
         }
+        // G-buffer mesh dispatches (kind 10) that ran: the headline number.
+        let (gn, gz) = p
+            .notes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.kind == 10 && n.gbuffer && n.ran)
+            .fold((0u32, 0u32), |(t, z), (k, _)| {
+                // SAFETY: inside the mapped buffer.
+                let w: [u32; 3] = unsafe {
+                    (data.cast::<u8>().add(k * SLOT as usize) as *const [u32; 3]).read_unaligned()
+                };
+                (t + 1, z + u32::from(work(10, &w) != 0))
+            });
+        tracing::info!(frame = p.frame, "args probe total: G-buffer mesh executions nonzero {gz} of {gn}");
         tracing::info!(
             frame = p.frame,
             records = p.notes.len(),
