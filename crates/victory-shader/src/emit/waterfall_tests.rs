@@ -71,6 +71,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
         host_wave32: false,
         root_bounds: true,
+        heap_views: crate::emit::HEAP_VIEWS,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.

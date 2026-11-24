@@ -171,6 +171,13 @@ pub struct Options {
     /// length of the host's copy (see the module notes on root views): on by
     /// default, off only for diagnostics ([`root_bounds`]).
     pub root_bounds: bool,
+    /// View slots in the host's shader-visible view heap: heap indices
+    /// (from data in bindless and waterfall loads, which can be anything)
+    /// are clamped to the last of them. [`HEAP_VIEWS`] by default; a host
+    /// whose heap is larger must say so ([`set_host_heap_views`]), or the
+    /// slots past [`HEAP_VIEWS`] cannot be read and an index into them
+    /// reads slot `HEAP_VIEWS - 1` instead.
+    pub heap_views: u32,
 }
 
 impl Default for Options {
@@ -178,6 +185,7 @@ impl Default for Options {
         Options {
             host_wave32: false,
             root_bounds: true,
+            heap_views: HEAP_VIEWS,
         }
     }
 }
@@ -192,7 +200,26 @@ impl Options {
         Options {
             host_wave32: host_wave32(),
             root_bounds: root_bounds(),
+            heap_views: host_heap_views(),
         }
+    }
+}
+
+/// What the device said ([`set_host_heap_views`]); 0: not said.
+static HOST_HEAP_VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Tells the translator how many view slots the host's shader-visible view
+/// heap has ([`Options::heap_views`]). Call it before the first translation.
+pub fn set_host_heap_views(views: u32) {
+    HOST_HEAP_VIEWS.store(views, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The view slots translations clamp heap indices to ([`Options::host`]):
+/// what [`set_host_heap_views`] said, else [`HEAP_VIEWS`].
+pub fn host_heap_views() -> u32 {
+    match HOST_HEAP_VIEWS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => HEAP_VIEWS,
+        n => n,
     }
 }
 
@@ -450,6 +477,7 @@ fn emit_program(
         mesh_stride,
         host_wave32: opts.host_wave32,
         root_bounds: opts.root_bounds,
+        heap_views: opts.heap_views,
     })?;
     Ok(HostShader {
         stage: native.stage,

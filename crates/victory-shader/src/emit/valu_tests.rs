@@ -139,6 +139,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         mesh_stride: 0,
         host_wave32: false,
         root_bounds: true,
+        heap_views: super::HEAP_VIEWS,
     })
     .expect("lower");
 

@@ -73,6 +73,8 @@ pub(crate) struct Parts<'a> {
     pub host_wave32: bool,
     /// Reads through root views are bounds-checked ([`super::Options`]).
     pub root_bounds: bool,
+    /// View slots the host heap has ([`super::Options::heap_views`]).
+    pub heap_views: u32,
 }
 
 /// A console wave64 compute program on a host without 64-lane waves
@@ -159,6 +161,7 @@ fn lower_forms(parts: &Parts) -> Result<Lowered, ShaderError> {
                 mesh_stride: parts.mesh_stride,
                 host_wave32: parts.host_wave32,
                 root_bounds: parts.root_bounds,
+                heap_views: parts.heap_views,
             };
             if let Ok(l) = lower_as(&uniform, Form::Uniform)
                 && l.split
@@ -389,9 +392,9 @@ struct Lower<'a> {
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Heap indices are clamped below these (see [`Lower::heap_index`]): the
-/// most view and sampler slots a host heap has (`victory-gpu` caps its view
-/// heaps at 1,000,000, the D3D12 minimum for resource binding tier 2;
-/// sampler heaps hold at most 2,048).
+/// view slots a host heap has by default (1,000,000, the D3D12 minimum for
+/// resource binding tier 2; a host whose heaps hold more says so in
+/// [`super::Options::heap_views`]) and the most sampler slots (2,048).
 pub const HEAP_VIEWS: u32 = 1_000_000;
 pub const HEAP_SAMPLERS: u32 = 2048;
 
@@ -4944,11 +4947,13 @@ impl<'a> Lower<'a> {
         // An index from data (bindless tables, waterfall loops) can be
         // anything; past the host heap the host reads whatever memory
         // follows it as a descriptor (NVIDIA: MMU faults and hangs). The
-        // last slot the host can have stands in.
+        // last slot the host has stands in. It must be the host heap's real
+        // last slot: the host makes tables afresh up there (dynamic slots),
+        // and a clamp below them reads another table's descriptor instead.
         let last = self.s.m.i32(if sampler {
             HEAP_SAMPLERS - 1
         } else {
-            HEAP_VIEWS - 1
+            self.x.heap_views.max(1) - 1
         });
         let past = self.s.m.cmp(c, pred::IUGT, index, last);
         Ok(self.s.m.select(c, past, last, index))
@@ -8966,6 +8971,7 @@ mod tests {
             mesh_stride: 0,
             host_wave32,
             root_bounds: true,
+            heap_views: crate::emit::HEAP_VIEWS,
         })
         .inspect(|l| validate(&l.dxil))
     }
@@ -9199,6 +9205,7 @@ mod tests {
             mesh_stride: 0,
             host_wave32: false,
             root_bounds: true,
+            heap_views: crate::emit::HEAP_VIEWS,
         })
     }
 
@@ -9259,6 +9266,7 @@ mod tests {
             mesh_stride: 0,
             host_wave32,
             root_bounds: true,
+            heap_views: crate::emit::HEAP_VIEWS,
         })
         .unwrap()
     }
@@ -9633,6 +9641,7 @@ mod tests {
             mesh_stride: 0,
             host_wave32: false,
             root_bounds: true,
+            heap_views: crate::emit::HEAP_VIEWS,
         }).unwrap();
 
         let container =
@@ -9918,6 +9927,7 @@ mod tests {
             mesh_stride: 0,
             host_wave32: false,
             root_bounds: true,
+            heap_views: crate::emit::HEAP_VIEWS,
         })
         .map(|_| ())
     }
@@ -10045,6 +10055,7 @@ mod tests {
             mesh_stride: 0,
             host_wave32: false,
             root_bounds,
+            heap_views: crate::emit::HEAP_VIEWS,
         })
         .unwrap()
     }

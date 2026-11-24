@@ -374,6 +374,43 @@ const DYNAMIC: u32 = 1 << 16;
 /// portable limit if the host does not say. vkd3d-proton with
 /// `VK_EXT_descriptor_heap` reports what the driver's heap holds (RTX
 /// 5080, driver 620: 1,041,451); without it, 1,000,000.
+///
+/// Every host view heap has exactly this many slots, and translated
+/// shaders clamp view heap indices to its last one
+/// (`victory_shader::emit::Options::heap_views`, told in
+/// `shader_cache::options`): a clamp below the heap's end made tables in
+/// the dynamic slots past it read another table's descriptors at the clamp
+/// (wrong constants and descriptors of another kind: the world's skinning
+/// passes faulted the GPU, Xid 13), and a heap below the clamp is read past
+/// its end. Asked once; a heap that large is made once to be sure the host
+/// makes one (the portable limit if not).
+pub(crate) fn view_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let Some(host) = host() else {
+            return PORTABLE_VIEWS;
+        };
+        let max = max_views(&host.device);
+        if max > PORTABLE_VIEWS {
+            // SAFETY: plain heap creation.
+            let made = unsafe {
+                host.device
+                    .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: max,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })
+            };
+            if let Err(e) = made {
+                tracing::warn!(error = %e, max, "host view heap refused; the portable size instead");
+                return PORTABLE_VIEWS;
+            }
+        }
+        max
+    })
+}
+
 fn max_views(device: &ID3D12Device) -> u32 {
     let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
     // SAFETY: the query writes its own structure of the given size.
@@ -414,47 +451,41 @@ impl HostHeap {
                     })
             }
         };
-        let mut extra = if sampler { 0 } else { DYNAMIC };
-        let max = if sampler { u32::MAX } else { max_views(&host.device) };
-        let (heap, count) = if count.saturating_add(extra) <= max {
-            match make(count + extra) {
-                Ok(heap) => (heap, count),
+        let (heap, count, extra) = if sampler {
+            match make(count) {
+                Ok(heap) => (heap, count, 0),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
                 }
             }
         } else {
-            // shortcut: descriptors past the host's limit are left out (the
-            // tables reaching them are made afresh in dynamic slots); a title
-            // that indexes them directly needs remapping. The title slots
-            // mirrored stay those below the portable limit less the minimum
-            // of dynamic slots (translated shaders clamp direct indices below
-            // the portable limit); a larger host heap gives the rest to
-            // dynamic slots.
+            // A view heap has all the slots shaders can index (`view_limit`):
+            // the title's below the portable limit less the minimum of
+            // dynamic slots, the rest dynamic.
+            // shortcut: title slots past those are left out (the tables
+            // reaching them are made afresh in dynamic slots); a title that
+            // indexes them directly needs remapping.
+            let total = view_limit();
             let mirrored = count.min(PORTABLE_VIEWS - DYNAMIC);
-            let mut total = max;
-            let heap = loop {
-                match make(total) {
-                    Ok(heap) => break heap,
-                    Err(e) if total > PORTABLE_VIEWS => {
-                        tracing::warn!(error = %e, total, "host view heap refused; the portable size instead");
-                        total = PORTABLE_VIEWS;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, count, "no host view heap");
-                        return None;
-                    }
+            let heap = match make(total) {
+                Ok(heap) => heap,
+                Err(e) => {
+                    // Shaders clamp indices to `total - 1`: a smaller heap
+                    // would be read past its end.
+                    tracing::error!(error = %e, total, count, "no host view heap");
+                    return None;
                 }
             };
-            extra = total - mirrored;
-            tracing::warn!(
-                count,
-                mirrored,
-                dynamic = extra,
-                "host view heap capped at {total}"
-            );
-            (heap, mirrored)
+            if mirrored < count {
+                tracing::warn!(
+                    count,
+                    mirrored,
+                    dynamic = total - mirrored,
+                    "host view heap capped at {total}"
+                );
+            }
+            (heap, mirrored, total - mirrored)
         };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {

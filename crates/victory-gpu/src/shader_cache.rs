@@ -45,6 +45,8 @@ fn options() -> victory_shader::emit::Options {
         if let Some(host) = crate::host::host() {
             victory_shader::emit::set_host_wave32(host.wave32_only());
         }
+        // Heap indices clamp to the host view heap's last slot.
+        victory_shader::emit::set_host_heap_views(crate::descriptor::host::view_limit());
         let options = victory_shader::emit::Options::host();
         if options.host_wave32 {
             tracing::info!(
@@ -63,13 +65,14 @@ fn options() -> victory_shader::emit::Options {
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit and root view
 /// bounds, which a diagnostics build can change at run time, and the
-/// host's wave sizes).
+/// host's wave sizes and view heap size).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
         let wave32 = options().host_wave32;
         let root_bounds = options().root_bounds;
+        let heap_views = options().heap_views;
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -80,6 +83,7 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.extend_from_slice(&heap_views.to_le_bytes());
                 if wave32 {
                     bytes.extend_from_slice(b"wave32");
                 }
