@@ -6972,7 +6972,7 @@ mod tests {
         };
         let p = ir::build(&native.code, false, 256).unwrap();
         let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let res = resource::track_lanes(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
             native: &native,
@@ -6990,7 +6990,7 @@ mod tests {
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
-    fn lower_with(
+    fn lower_lanes(
         words: &[u32],
         layout: Vec<RootParam>,
         used: Vec<UsedResource>,
@@ -6998,7 +6998,7 @@ mod tests {
         lower_wave(words, layout, used, false)
     }
 
-    /// [`lower_with`] in wave64 if `wave64`.
+    /// [`lower_lanes`] in wave64 if `wave64`.
     fn lower_wave(
         words: &[u32],
         layout: Vec<RootParam>,
@@ -7022,7 +7022,7 @@ mod tests {
         };
         let p = ir::build(&native.code, wave64, 256).unwrap();
         let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let res = resource::track_lanes(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
             native: &native,
@@ -7123,7 +7123,7 @@ mod tests {
             .any(|i| i.name() == "v_perm_b32"));
 
         let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let res = resource::track_lanes(&p, &native.layout, native.stage, Some(&st)).unwrap();
 
         let io = io::raise(&p, &native).unwrap();
 
@@ -7197,7 +7197,7 @@ mod tests {
                 slot: 0,
             }]
         };
-        lower_with(&words, layout(), used()).unwrap();
+        lower_lanes(&words, layout(), used()).unwrap();
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.

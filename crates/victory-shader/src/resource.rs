@@ -139,12 +139,20 @@ pub struct Waterfall {
 }
 
 /// Traces every descriptor and scalar address of `p`, which runs as
+/// `stage`, to the root parameters in `layout`, as [`track_lanes`] with
+/// `p`'s per-lane form structured here (none if structurisation fails).
+pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resources, ShaderError> {
+    let st = crate::structure::structure(p).ok();
+    track_lanes(p, layout, stage, st.as_ref())
+}
+
+/// Traces every descriptor and scalar address of `p`, which runs as
 /// `stage`, to the root parameters in `layout`. Fails on the first one it
 /// cannot trace. `lanes`, `p` as one lane runs it, tells which paths the
 /// lanes that access a per-lane descriptor took and which writes they ran;
 /// without it, per-lane descriptors chosen by control flow are refused and
 /// per-lane writes are taken to run in every lane.
-pub fn track(
+pub fn track_lanes(
     p: &Program,
     layout: &[RootParam],
     stage: HwStage,
@@ -184,7 +192,7 @@ pub fn track(
                 if let Source::Loaded { load, .. } = source
                     && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
                     && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
-                    && t.first_lane_source(v).is_some()
+                    && t.first_lane_vgpr(v).is_some()
                 {
                     offset.push((v, load));
                 }
@@ -790,7 +798,7 @@ impl<'a> Tracer<'a> {
             return Ok(source);
         }
         let read = |w: &Term| match *w {
-            Term::Value(v) => self.first_lane_source(v),
+            Term::Value(v) => self.first_lane_vgpr(v),
             Term::Const(_) => None,
         };
         if let Some(sources) = words.iter().map(read).collect::<Option<Vec<_>>>() {
@@ -1007,7 +1015,7 @@ impl<'a> Tracer<'a> {
     }
 
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
-    fn first_lane_source(&self, v: Value) -> Option<Value> {
+    fn first_lane_vgpr(&self, v: Value) -> Option<Value> {
         let inst = self.def(v)?;
         let Fields::Valu(f) = &inst.fields else {
             return None;
@@ -1029,7 +1037,7 @@ impl<'a> Tracer<'a> {
         };
         (0..dwords)
             .map(|k| match self.origin(inst.read(Reg::S(code + k))?) {
-                Term::Value(v) => self.first_lane_source(v).map(|_| v),
+                Term::Value(v) => self.first_lane_vgpr(v).map(|_| v),
                 Term::Const(_) => None,
             })
             .collect()
@@ -1521,7 +1529,7 @@ impl<'a> Tracer<'a> {
                         let (_, read) = self.defs[x.0 as usize]?;
                         let same = reads.contains(&x)
                             && read < i
-                            && self.lane_term(Term::Value(self.first_lane_source(x)?))
+                            && self.lane_term(Term::Value(self.first_lane_vgpr(x)?))
                                 == self.lane_term(Term::Value(lane));
                         same.then_some(x)
                     })
@@ -1737,7 +1745,7 @@ pub(crate) mod tests {
     fn track_words(words: &[u32], layout: &[RootParam], stage: HwStage) -> Resources {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
-        track(&p, layout, stage, lanes(&p).as_ref()).unwrap()
+        track_lanes(&p, layout, stage, lanes(&p).as_ref()).unwrap()
     }
 
     /// `p` as one lane runs it, if it structures.
@@ -1990,7 +1998,7 @@ pub(crate) mod tests {
         .flat_map(|w: &u32| w.to_le_bytes())
         .collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
-        let err = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
+        let err = track_lanes(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
         assert_eq!(
             err,
             ShaderError::Unsupported {
@@ -2007,7 +2015,7 @@ pub(crate) mod tests {
             .flat_map(|w: &u32| w.to_le_bytes())
             .collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
-        let err = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
+        let err = track_lanes(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
         assert_eq!(
             err,
             ShaderError::Unsupported {
@@ -2547,7 +2555,7 @@ pub(crate) mod tests {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, wave64, 256).unwrap();
         let layout = [param(Table, 0, 1), param(Table, 1, 1)];
-        track(&p, &layout, HwStage::Cs, lanes(&p).as_ref())
+        track_lanes(&p, &layout, HwStage::Cs, lanes(&p).as_ref())
     }
 
     #[test]
@@ -2928,7 +2936,7 @@ pub(crate) mod tests {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
         let layout = [param(Table, 0, 1), param(Table, 1, 1)];
-        let err = track(&p, &layout, HwStage::Cs, None).unwrap_err();
+        let err = track_lanes(&p, &layout, HwStage::Cs, None).unwrap_err();
         assert!(
             matches!(
                 err,

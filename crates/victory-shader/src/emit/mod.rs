@@ -208,7 +208,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let res = resource::track_lanes(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
@@ -469,7 +469,7 @@ mod tests {
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
         let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let res = resource::track_lanes(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
         // dxil.dll, where there is one, checks the flags against the module.
@@ -511,7 +511,7 @@ mod tests {
         };
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
         let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let res = resource::track_lanes(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
@@ -672,7 +672,7 @@ mod tests {
             let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
             let st = crate::structure::structure(&p).unwrap();
             let res =
-                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+                crate::resource::track_lanes(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
@@ -741,7 +741,7 @@ mod tests {
         let c = super::Container::parse(&bytes).unwrap();
         let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
         let st = crate::structure::structure(&p).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let res = crate::resource::track_lanes(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
