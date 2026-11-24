@@ -21,10 +21,11 @@ pub(crate) struct HostHeap {
     count: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    made: Made,
     /// The record (view index and generation, 0: none) the title had at
-    /// each slot when we last looked ([`HostHeap::sync`]).
-    seen: Mutex<Vec<u64>>,
+    /// each slot when we last looked ([`HostHeap::sync`]). Lock-free:
+    /// syncs read them while title threads mirror slots for their draws.
+    seen: Box<[std::sync::atomic::AtomicU64]>,
     /// The watch's asking at the last [`HostHeap::sync`] (0: none yet).
     synced: Mutex<u64>,
     /// The host resource each slot views, held while the slot does: shaders
@@ -128,6 +129,32 @@ pub(crate) const SLOT_TABLE: u8 = 2;
 pub(crate) const SLOT_BINDLESS: u8 = 3;
 pub(crate) const SLOT_DEFERRED: u8 = 4;
 pub(crate) const SLOT_FAILED: u8 = 5;
+
+/// [`HostHeap::made`] in stripes of [`Made::STRIPE`] slots, each under its
+/// own lock (frame-perf3): one lock for the heap's million slots, held
+/// across making a view and the bindless registry, made the title's
+/// recording threads wait ~300 ms a world frame (summed) for each other
+/// and for heap syncs. A slot is still made by one thread at a time.
+struct Made(Box<[Mutex<Box<[u64]>>]>);
+
+impl Made {
+    const STRIPE: usize = 64;
+
+    fn new(count: usize) -> Made {
+        Made(
+            (0..count.div_ceil(Self::STRIPE))
+                .map(|k| Mutex::new(vec![0; Self::STRIPE.min(count - k * Self::STRIPE)].into()))
+                .collect(),
+        )
+    }
+
+    /// The stripe holding slot `index` (locked), and the slot's place in it.
+    fn lock(&self, index: u32) -> (std::sync::MutexGuard<'_, Box<[u64]>>, usize) {
+        let index = index as usize;
+        let stripe = self.0[index / Self::STRIPE].lock().unwrap_or_else(|e| e.into_inner());
+        (stripe, index % Self::STRIPE)
+    }
+}
 
 impl Drop for HostHeap {
     fn drop(&mut self) {
@@ -624,8 +651,8 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             strides,
-            made: Mutex::new(vec![0; count as usize]),
-            seen: Mutex::new(vec![0; count as usize]),
+            made: Made::new(count as usize),
+            seen: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             synced: Mutex::new(0),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new(Slots::new(extra as usize)),
@@ -914,27 +941,27 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        if let Some(seen) = self.seen.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
-            *seen = if tag == VIEW_TAG { key } else { 0 };
+        if let Some(seen) = self.seen.get(index as usize) {
+            seen.store(if tag == VIEW_TAG { key } else { 0 }, std::sync::atomic::Ordering::Relaxed);
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         let waiting = std::time::Instant::now();
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut made, k) = self.made.lock(index);
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::copystat::since(crate::copystat::C::RecMirrorLockUs, waiting);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            if made[k] != 0 {
+                made[k] = 0;
                 self.make_null(index);
                 super::bindless::clear(self.id(), index);
             }
             self.set_state(index, SLOT_NONE);
             return None;
         };
-        if made[index as usize] == key {
+        if made[k] == key {
             // A buffer view made for bindless reads is now named by a
             // table too (diagnostics count).
             if for_draw {
@@ -945,7 +972,7 @@ impl HostHeap {
             // changed without writing a view or copying descriptors there
             // (a copy of its own): bindless reads of such slots see the old
             // host descriptor until a table names the slot.
-            if for_draw && made[index as usize] != 0 {
+            if for_draw && made[k] != 0 {
                 static UNSEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = UNSEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
@@ -958,7 +985,7 @@ impl HostHeap {
             let later = !for_draw
                 && view.is_buffer()
                 && !(range.is_some() && super::bindless::enabled());
-            made[index as usize] = if later { 0 } else { key };
+            made[k] = if later { 0 } else { key };
             let kept = if later {
                 None
             } else {
@@ -1056,10 +1083,11 @@ impl HostHeap {
         }
         // The slots whose record differs from the one last seen, among
         // `seen[a..a + seen.len()]`.
-        fn scan(seen: &[u64], a: usize, start: u64, step: u64) -> Vec<u32> {
+        fn scan(seen: &[std::sync::atomic::AtomicU64], a: usize, start: u64, step: u64) -> Vec<u32> {
             seen.iter()
                 .enumerate()
-                .filter_map(|(k, &was)| {
+                .filter_map(|(k, was)| {
+                    let was = was.load(std::sync::atomic::Ordering::Relaxed);
                     let index = a + k;
                     let at = start + index as u64 * step;
                     // SAFETY: a descriptor slot in title memory.
@@ -1124,7 +1152,7 @@ impl HostHeap {
             crate::copystat::add(crate::copystat::C::HeapSyncScanned, total as u64);
         }
         let changed: Vec<u32> = {
-            let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+            let seen = &self.seen;
             if total < 2 * PART {
                 parts.iter().flat_map(|&(a, b)| scan(&seen[a..b], a, start, step)).collect()
             } else {
@@ -1137,9 +1165,14 @@ impl HostHeap {
                     .map(|(k, &(a, b))| {
                         let found = found.clone();
                         Box::new(move || {
-                            // SAFETY: `seen` stays locked (and alive) until
-                            // every part is done; only read.
-                            let seen = unsafe { std::slice::from_raw_parts((at as *const u64).add(a), b - a) };
+                            // SAFETY: `seen` lives until every part is done
+                            // (`run_tasks` returns then); atomics, only read.
+                            let seen = unsafe {
+                                std::slice::from_raw_parts(
+                                    (at as *const std::sync::atomic::AtomicU64).add(a),
+                                    b - a,
+                                )
+                            };
                             *found[k].lock().unwrap_or_else(|e| e.into_inner()) = scan(seen, a, start, step);
                             0usize
                         }) as crate::texture::Task
@@ -1168,7 +1201,13 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        if index >= self.count {
+            return None;
+        }
+        let key = {
+            let (made, k) = self.made.lock(index);
+            made[k]
+        };
         if key == 0 {
             return Some("null".into());
         }
