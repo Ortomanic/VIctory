@@ -1377,6 +1377,26 @@ impl State {
         let _recording = crate::copystat::recording();
         #[cfg(feature = "diagnostics")]
         self.pass_log(&format!("indirect{kind}"), max, kind == 2);
+        // What the title's memory holds there now (what the GPU last wrote
+        // was copied back after its submission): the first record and the
+        // count (diagnostics).
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::listed(crate::queue::presented() + 1)
+            && std::env::var_os("VICTORY_PASS_LOG").is_some()
+        {
+            let words = |at: u64, n: usize| -> Option<Vec<u32>> {
+                crate::texture::committed(at as *const u8, n * 4).then(|| {
+                    // SAFETY: committed title memory.
+                    (0..n).map(|k| unsafe { (at as *const u32).add(k).read_unaligned() }).collect()
+                })
+            };
+            tracing::info!(
+                "pass indirect args at {arguments:#x} stride {stride} max {max}: {:?} count at {:?}: {:?}",
+                words(arguments, (stride as usize / 4).clamp(1, 5)),
+                count.map(|c| format!("{c:#x}")),
+                count.and_then(|c| words(c, 1))
+            );
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
