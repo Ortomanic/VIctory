@@ -168,8 +168,7 @@ fn root_map(
         }
     }
     // One layout entry per root slot: a table's user SGPR, a root
-    // descriptor's two; an immediate sampler's words arrive in the user
-    // SGPRs its binding names.
+    // descriptor's two; none for an immediate sampler.
     let mut layout: Vec<RootParam> = Vec::new();
     for u in &used {
         if layout.iter().any(|p| p.slot == u.slot && p.root == u.root) {
@@ -178,7 +177,8 @@ fn root_map(
         let sgprs = match u.root {
             RootType::Table => 1,
             RootType::Descriptor => 2,
-            _ => u32::from(u.dwords),
+            // Fixed in the code (it builds the sampler's words itself).
+            _ => 0,
         };
         layout.push(RootParam {
             root: u.root,
