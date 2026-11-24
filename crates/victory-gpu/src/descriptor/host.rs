@@ -387,8 +387,11 @@ fn max_views(device: &ID3D12Device) -> u32 {
             .is_ok()
     };
     let max = if ok { options.MaxViewDescriptorHeapSize } else { 0 };
-    tracing::info!(max, "host view heap limit");
-    max.max(PORTABLE_VIEWS)
+    // `VICTORY_HOST_VIEWS=N`: no larger than N (not below the portable
+    // limit), for an A/B against the host's own.
+    let cap = std::env::var("VICTORY_HOST_VIEWS").ok().and_then(|v| v.trim().parse().ok());
+    tracing::info!(max, ?cap, "host view heap limit");
+    max.min(cap.unwrap_or(u32::MAX)).max(PORTABLE_VIEWS)
 }
 
 impl HostHeap {
