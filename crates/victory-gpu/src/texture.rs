@@ -182,19 +182,201 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+/// Textures due together of at least this many bytes are refreshed on
+/// several threads ([`refresh_all`]).
+const PARALLEL_BYTES: u64 = 1 << 20;
+
+/// Detiles each texture's memory into its staging buffer if it changed
+/// since the last time (and is mapped at all): the textures a submission
+/// samples between two title writes, on several threads when they are
+/// big. One after another, their hashing (and querying) took most of the
+/// world's texture time, inside the title's submissions.
+///
+/// From xcl 2cefc88 (1984742628): a big batch of title textures is
+/// detiled on several threads.
+pub(crate) fn refresh_all(due: Vec<Arc<Staging>>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if due.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let bytes: u64 = due.iter().map(|s| s.layout.size).sum();
+    let threads = if bytes < PARALLEL_BYTES { 1 } else { threads() };
+    #[cfg(feature = "diagnostics")]
+    {
+        stat(Stat::Checks, due.len() as u64);
+        stat(Stat::Batches, 1);
+        stat(Stat::Parallel, u64::from(threads > 1 && due.len() > 1));
+    }
+    let tasks = due
+        .into_iter()
+        .map(|s| Box::new(move || s.refresh_now()) as Task)
+        .collect();
+    let read = run_tasks(tasks, threads);
+    let preparing = &crate::host::PREPARING;
+    preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    preparing[3].fetch_add(read as u64, Relaxed);
+}
+
+/// Threads a big batch of textures is refreshed on, the submitting one
+/// among them: half the cores, at most 8 (`VICTORY_TEXTURE_THREADS`).
+fn threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 8))
+            })
+            .max(1)
+    })
+}
+
+/// A texture's refresh, returning the bytes of title memory read.
+type Task = Box<dyn Fn() -> usize + Send + Sync>;
+
+/// Tasks shared by the submitting thread and the pool's.
+struct Job {
+    tasks: Vec<Task>,
+    /// The next task to take.
+    next: std::sync::atomic::AtomicUsize,
+    /// Tasks not finished; the submitting thread waits for none.
+    left: Mutex<usize>,
+    finished: std::sync::Condvar,
+    read: std::sync::atomic::AtomicUsize,
+}
+
+impl Job {
+    /// Takes tasks until none are left to take.
+    fn work(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        loop {
+            let k = self.next.fetch_add(1, Relaxed);
+            let Some(task) = self.tasks.get(k) else {
+                return;
+            };
+            // A panicking task must not leave the submission waiting.
+            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).unwrap_or(0);
+            self.read.fetch_add(read, Relaxed);
+            let mut left = self.left.lock().unwrap_or_else(|e| e.into_inner());
+            *left -= 1;
+            if *left == 0 {
+                self.finished.notify_all();
+            }
+        }
+    }
+}
+
+/// Threads that help with [`Job`]s, made once.
+struct Pool {
+    jobs: Mutex<std::sync::mpsc::Sender<Arc<Job>>>,
+    workers: usize,
+}
+
+fn pool() -> Option<&'static Pool> {
+    static POOL: std::sync::OnceLock<Option<Pool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let (jobs, taken) = std::sync::mpsc::channel::<Arc<Job>>();
+        let taken = Arc::new(Mutex::new(taken));
+        let workers = (0..threads().saturating_sub(1))
+            .filter(|i| {
+                let taken = taken.clone();
+                std::thread::Builder::new()
+                    .name(format!("victory-texture-{i}"))
+                    .spawn(move || {
+                        loop {
+                            let job = taken.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            match job {
+                                Ok(job) => job.work(),
+                                Err(_) => return,
+                            }
+                        }
+                    })
+                    .is_ok()
+            })
+            .count();
+        (workers > 0).then(|| Pool {
+            jobs: Mutex::new(jobs),
+            workers,
+        })
+    })
+    .as_ref()
+}
+
+/// Runs `tasks` on up to `threads` threads, this one among them, and
+/// returns the sum of what they return. Pool threads busy elsewhere leave
+/// their share to the others.
+fn run_tasks(tasks: Vec<Task>, threads: usize) -> usize {
+    let pool = if threads > 1 && tasks.len() > 1 {
+        pool()
+    } else {
+        None
+    };
+    let Some(pool) = pool else {
+        return tasks.iter().map(|task| task()).sum();
+    };
+    let helpers = (threads - 1).min(tasks.len() - 1).min(pool.workers);
+    let job = Arc::new(Job {
+        left: Mutex::new(tasks.len()),
+        tasks,
+        next: Default::default(),
+        finished: std::sync::Condvar::new(),
+        read: Default::default(),
+    });
+    {
+        let jobs = pool.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..helpers {
+            let _ = jobs.send(job.clone());
+        }
+    }
+    job.work();
+    let mut left = job.left.lock().unwrap_or_else(|e| e.into_inner());
+    while *left > 0 {
+        left = job.finished.wait(left).unwrap_or_else(|e| e.into_inner());
+    }
+    job.read.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Texture counters (diagnostics), logged with the frame rate.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+enum Stat {
+    /// Textures checked.
+    Checks,
+    /// Checks that asked `VirtualQuery`, and that knew the memory
+    /// committed from the view regions kept (`watch::committed`).
+    Queried,
+    Known,
+    /// Batches of due textures, and those run on several threads.
+    Batches,
+    Parallel,
+}
+
+#[cfg(feature = "diagnostics")]
+static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[cfg(feature = "diagnostics")]
+fn stat(s: Stat, n: u64) {
+    STATS[s as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Logs the texture counters per frame over `frames` frames.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log(frames: f64) {
+    let [checks, queried, known, batches, parallel] =
+        std::array::from_fn(|i| STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "textures per frame: {checks:.0} checked in {batches:.1} batches ({parallel:.1} on {} \
+         threads); {queried:.0} asked VirtualQuery, {known:.0} known committed",
+        threads()
+    );
+}
+
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let started = std::time::Instant::now();
-        let read = self.refresh_now();
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
-    }
-
-    /// Returns the bytes of title memory read.
+    /// since the last time (and is mapped at all); returns the bytes of
+    /// title memory read.
     fn refresh_now(&self) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
@@ -218,11 +400,20 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
+        // View regions found committed are known until the runtime remaps
+        // them (`watch::committed`): asking `VirtualQuery` region by region
+        // (a view per 64 KiB page in physical-page memory) took most of the
+        // refreshes' time.
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        let is_committed = committed(self.memory, size);
+        let (is_committed, asked) = crate::watch::committed_asking(start, size);
         #[cfg(feature = "diagnostics")]
-        tex_us(crate::copystat::C::TexQueryUs, started);
+        {
+            tex_us(crate::copystat::C::TexQueryUs, started);
+            stat(if asked { Stat::Queried } else { Stat::Known }, 1);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = asked;
         if !is_committed {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
@@ -453,6 +644,78 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 mod tests {
     use super::*;
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    /// Tasks run on several threads run once each and their results add
+    /// up as on one, a panicking one among them, from several submitting
+    /// threads at once.
+    #[test]
+    fn tasks_on_several_threads_run_once_each() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let submit = || {
+            let runs: Arc<Vec<AtomicUsize>> = Arc::new((0..97).map(|_| AtomicUsize::new(0)).collect());
+            let tasks: Vec<Task> = (0..97)
+                .map(|k| {
+                    let runs = runs.clone();
+                    Box::new(move || {
+                        runs[k].fetch_add(1, Relaxed);
+                        if k == 13 {
+                            panic!("a task that panics");
+                        }
+                        std::thread::yield_now();
+                        k
+                    }) as Task
+                })
+                .collect();
+            let read = run_tasks(tasks, 4);
+            assert_eq!(read, (0..97).sum::<usize>() - 13);
+            assert!(runs.iter().all(|r| r.load(Relaxed) == 1));
+        };
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(submit);
+            }
+        });
+        // One thread, or one task: on the caller.
+        assert_eq!(run_tasks(vec![Box::new(|| 5usize) as Task], 8), 5);
+        assert_eq!(run_tasks((0..3usize).map(|k| Box::new(move || k) as Task).collect(), 1), 3);
+    }
+
+    /// Hashing a submission's due textures in physical-page memory, one
+    /// after another and on the pool.
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn texture_hashing_timing() {
+        const TEXTURES: usize = 48;
+        const SIZE: usize = 2 << 20;
+        let textures: Vec<Arc<Vec<u8>>> = (0..TEXTURES)
+            .map(|t| Arc::new((0..SIZE).map(|i| (i * 31 + t) as u8).collect()))
+            .collect();
+        let tasks = || -> Vec<Task> {
+            textures
+                .iter()
+                .map(|t| {
+                    let t = t.clone();
+                    Box::new(move || {
+                        std::hint::black_box(blake3::hash(&t));
+                        t.len()
+                    }) as Task
+                })
+                .collect()
+        };
+        run_tasks(tasks(), threads()); // warm up the pool
+        for n in [1, 2, 4, threads()] {
+            let started = std::time::Instant::now();
+            for _ in 0..10 {
+                assert_eq!(run_tasks(tasks(), n), TEXTURES * SIZE);
+            }
+            let took = started.elapsed() / 10;
+            println!(
+                "{TEXTURES} textures of {} MiB on {n} threads: {took:?} ({:.1} GB/s)",
+                SIZE >> 20,
+                (TEXTURES * SIZE) as f64 / took.as_secs_f64() / 1e9
+            );
+        }
+    }
 
     #[test]
     fn detile_widened_packed16_expands_into_rgba8_staging() {

@@ -1354,7 +1354,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        batch.due.push(staging.clone());
                     }
                     continue;
                 }
@@ -1378,6 +1378,10 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Of those, the ones to refresh at the next flush: together, so that
+    /// big ones share threads ([`crate::texture::refresh_all`]). Nothing
+    /// before the flush writes title memory or the staging buffers.
+    due: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -1407,6 +1411,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        crate::texture::refresh_all(std::mem::take(&mut self.due));
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
@@ -1817,6 +1822,7 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                crate::texture::log(logged_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
