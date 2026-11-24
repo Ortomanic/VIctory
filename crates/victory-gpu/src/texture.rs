@@ -51,14 +51,27 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// What a texture's staging buffer holds: the hash of the memory detiled,
+/// and (memory watched) the write-watch asking it was read after, with
+/// room to read the memory into.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
     read: Vec<u8>,
+}
+
+impl Last {
+    /// Whether `memory` (the texture's, as now) differs from what was last
+    /// detiled; it is noted as detiled.
+    fn changed(&mut self, memory: &[u8]) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let hash = blake3::hash(memory);
+        #[cfg(feature = "diagnostics")]
+        tex_us(crate::copystat::C::TexHashUs, started);
+        self.hash.replace(hash) != Some(hash)
+    }
 }
 
 thread_local! {
@@ -395,9 +408,17 @@ impl Staging {
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
             #[cfg(feature = "diagnostics")]
             tex_us(crate::copystat::C::TexReadUs, started);
-            self.detile(&last.read);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+            // The watch is per page, and a title writes next to its
+            // textures and writes again what they hold: the same bytes as
+            // at the last detiling are not detiled again (from xcl 69f0635
+            // by theaustinayers).
+            let read = std::mem::take(&mut last.read);
+            if last.changed(&read) {
+                self.detile(&read);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+            }
+            last.read = read;
             return size;
         }
         // View regions found committed are known until the runtime remaps
@@ -427,16 +448,10 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        let hash = blake3::hash(tiled);
-        #[cfg(feature = "diagnostics")]
-        tex_us(crate::copystat::C::TexHashUs, started);
-        #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if !last.changed(tiled) {
             return size;
         }
-        last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -644,6 +659,21 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 mod tests {
     use super::*;
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    /// Memory is detiled when it differs from what was last detiled, the
+    /// first time, and when it changes back.
+    #[test]
+    fn memory_as_last_detiled_is_not_detiled_again() {
+        let mut last = Last::default();
+        let (a, mut b) = (vec![7u8; 3 << 16], vec![7u8; 3 << 16]);
+        assert!(last.changed(&a), "first");
+        assert!(!last.changed(&a), "the same bytes");
+        assert!(!last.changed(&b), "the same bytes elsewhere");
+        b[(3 << 16) - 1] = 8;
+        assert!(last.changed(&b), "its last byte");
+        assert!(last.changed(&a), "back as it was");
+        assert!(last.changed(&a[1..]), "a byte shorter");
+    }
 
     /// Tasks run on several threads run once each and their results add
     /// up as on one, a panicking one among them, from several submitting
