@@ -86,6 +86,10 @@ fn build() -> &'static [u8; 32] {
                 if !root_bounds {
                     bytes.extend_from_slice(b"unbounded root views");
                 }
+                if !victory_shader::emit::wave64_uniform() {
+                    tracing::warn!("VICTORY_WAVE64_UNIFORM=0: no uniform wave64 form");
+                    bytes.extend_from_slice(b"no uniform wave64");
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

@@ -126,7 +126,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     // Still needing 64-lane waves: one console wave per group runs with
     // control flow uniform per console wave.
     let needs64 = first.as_ref().is_none_or(|l| l.wave_size == Some(64));
-    if needs64 && uniform_candidate(parts) {
+    if needs64 && uniform_candidate(parts) && super::wave64_uniform() {
         let abs = crate::structure::structure_absolute(parts.p);
         if let Ok(abs) = abs {
             let uniform = Parts {

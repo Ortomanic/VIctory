@@ -120,6 +120,19 @@ pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
+/// Whether wave64 one-wave groups may run in the uniform split form on
+/// 32-lane hosts (otherwise they keep needing 64-lane waves, which such
+/// hosts refuse). With the `diagnostics` feature, `VICTORY_WAVE64_UNIFORM=0`
+/// turns it off, to tell whether that form is behind a host GPU hang. Part
+/// of the translation: the shader cache keys on it.
+pub fn wave64_uniform() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !cfg!(feature = "diagnostics")
+            || std::env::var("VICTORY_WAVE64_UNIFORM").map_or(true, |v| v.trim() != "0")
+    })
+}
+
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
