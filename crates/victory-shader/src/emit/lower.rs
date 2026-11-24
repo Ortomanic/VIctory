@@ -6015,7 +6015,13 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            // `_l`: DXIL's gather reads the most detailed level and has no
+            // level operand, so the LOD (the last address, after the
+            // coordinates) is not applied: exact for LOD 0, which is what a
+            // compute shader's `Gather*` compiles to (no derivatives to
+            // pick a level); another LOD would gather the wrong mip.
+            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
+            | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -7844,6 +7850,12 @@ mod tests {
         lowers_image(&[0xF094_0F08, 0x4082_0004]).unwrap();
         // The same with 32-bit coordinates: v[4:6]
         lowers_image(&[0xF094_0F08, 0x0082_0004]).unwrap();
+    }
+
+    #[test]
+    fn image_gather4_l_translates() {
+        // image_gather4_l v[0:3], v[4:6], ... dmask:0x1 dim:2D (s, t, lod)
+        lowers_image(&[0xF110_0108, 0x0082_0004]).unwrap();
     }
 
     #[test]
