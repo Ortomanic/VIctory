@@ -22,6 +22,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// The record (view index and generation, 0: none) the title had at
+    /// each slot when we last looked ([`HostHeap::sync`]).
+    seen: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -511,6 +514,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            seen: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new(Slots::new(extra as usize)),
         };
@@ -780,6 +784,9 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        if let Some(seen) = self.seen.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
+            *seen = if tag == VIEW_TAG { key } else { 0 };
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -792,6 +799,17 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            // Diagnostic: a slot made from another record that the title
+            // changed without writing a view or copying descriptors there
+            // (a copy of its own): bindless reads of such slots see the old
+            // host descriptor until a table names the slot.
+            if for_draw && made[index as usize] != 0 {
+                static UNSEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = UNSEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::warn!(index, n, "title heap slot changed unseen (copied by the title itself)");
+                }
+            }
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -805,6 +823,47 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// Mirrors the slots whose record the title changed without our seeing
+    /// it (heap slots at `start`, `step` bytes apart): the title copies
+    /// descriptors itself (32-byte records moved by its own code, not by
+    /// `CopyDescriptors`). A table names its slots at each draw, which mirrors
+    /// them, but code indexing the heap from data (bindless skinning jobs,
+    /// waterfall loops) reads whatever the host slot still holds: another
+    /// kind of view than the title's (a texture's descriptor read as a
+    /// buffer's address and size: the world's skinning passes faulted the
+    /// GPU, Xid 13 at one shader address). Run before each submission.
+    /// Returns the slots mirrored.
+    pub(crate) fn sync(&self, start: u64, step: u64) -> usize {
+        // Title memory: read only where committed.
+        let len = u64::from(self.count) * step;
+        if !crate::watch::committed(start as usize, len as usize) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(start, len, "title heap memory not all committed: not synced"));
+            return 0;
+        }
+        let changed: Vec<u32> = {
+            let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+            seen.iter()
+                .enumerate()
+                .filter_map(|(index, &was)| {
+                    let at = start + index as u64 * step;
+                    // SAFETY: a descriptor slot in title memory.
+                    let [tag, i, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    let key = if tag == VIEW_TAG {
+                        u64::from(generation) << 32 | u64::from(i)
+                    } else {
+                        0
+                    };
+                    (key != was).then_some(index as u32)
+                })
+                .collect()
+        };
+        for &index in &changed {
+            self.mirror(index, start + u64::from(index) * step, false);
+        }
+        changed.len()
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -950,6 +1009,48 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
     Some((start / 4, u32::try_from(dwords).ok()?))
 }
 
+/// The elements of a buffer view that lie in its host copy: `count`
+/// elements of `element` bytes from element `first` of a host buffer of
+/// `width` bytes, cut at the buffer's end; `None` if none do.
+///
+/// vkd3d-proton with `VK_EXT_descriptor_heap` writes a buffer view's range
+/// as the description gives it, not cut to the resource
+/// (`vkd3d_get_metadata_buffer_view_for_resource_heap`), and robust buffer
+/// access only checks reads against that range: a view reaching past its
+/// host copy reads (and writes) whatever lies after the copy, a GPU page
+/// fault on NVIDIA (Xid 13). A console view may reach past its buffer
+/// object into the title memory after it; the host copy has none of that,
+/// so those reads give 0 here, as reads past a console view's records do.
+fn in_copy(first: u64, count: u32, element: u64, width: u64) -> Option<u32> {
+    if element == 0 {
+        return Some(count);
+    }
+    let fits = (width / element).saturating_sub(first);
+    let n = u64::from(count).min(fits);
+    if n < u64::from(count) {
+        static CUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let cut = CUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if cut.is_power_of_two() {
+            tracing::warn!(
+                first,
+                count,
+                element,
+                width,
+                kept = n,
+                cut,
+                "buffer view past its host copy cut at the copy's end"
+            );
+        }
+    }
+    u32::try_from(n).ok().filter(|&n| n > 0)
+}
+
+/// The host copy's size in bytes.
+fn width(buffer: &ID3D12Resource) -> u64 {
+    // SAFETY: a live buffer.
+    unsafe { buffer.GetDesc() }.Width
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -992,6 +1093,15 @@ fn buffer_srv(
         );
         return None;
     }
+    let element = element_size(&desc);
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    buffer.NumElements = in_copy(
+        buffer.FirstElement,
+        buffer.NumElements,
+        element,
+        width(&shadow.buffer),
+    )?;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1057,6 +1167,19 @@ fn buffer_uav(
         once!(offset, element, "unordered buffer view not on an element of its host copy");
         return None;
     }
+    let element = if buffer.StructureByteStride > 0 {
+        u64::from(buffer.StructureByteStride)
+    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        4
+    } else {
+        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    };
+    buffer.NumElements = in_copy(
+        buffer.FirstElement,
+        buffer.NumElements,
+        element,
+        width(&shadow.buffer),
+    )?;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {

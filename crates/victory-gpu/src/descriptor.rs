@@ -129,6 +129,49 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     Some((heap, heap.index(handle)?))
 }
 
+/// Brings every host heap made so far up to date with descriptors the title
+/// copied itself ([`host::HostHeap::sync`]), before a submission runs.
+/// `VICTORY_SYNC_HEAPS=0` turns it off (diagnostics A/B).
+#[cfg(windows)]
+pub(crate) fn sync_shader_heaps() {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("VICTORY_SYNC_HEAPS").is_ok_and(|v| v.trim() == "0")) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let heaps: Vec<usize> = SHADER_HEAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|&(_, _, at)| at)
+        .collect();
+    let mut synced = 0;
+    for at in heaps {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+            continue;
+        };
+        synced += host.sync(heap.start, u64::from(step));
+    }
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    use std::sync::atomic::Ordering::Relaxed;
+    let runs = RUNS.fetch_add(1, Relaxed) + 1;
+    let slots = SLOTS.fetch_add(synced as u64, Relaxed) + synced as u64;
+    let micros = MICROS.fetch_add(started.elapsed().as_micros() as u64, Relaxed)
+        + started.elapsed().as_micros() as u64;
+    if runs.is_power_of_two() && runs >= 64 {
+        tracing::info!(
+            runs,
+            slots,
+            ms_per_run = micros as f64 / runs as f64 / 1000.0,
+            "heap slots the title copied itself, mirrored before submissions"
+        );
+    }
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap.
 #[cfg(windows)]

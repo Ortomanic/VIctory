@@ -129,6 +129,7 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
         once.sort_unstable();
         once.dedup();
         crate::draw::SUBMITTING.fetch_add(1, Ordering::AcqRel);
+        crate::descriptor::sync_shader_heaps();
         for &l in &once {
             crate::list::with_state_pub(l, |host, state| host.set_lost(!state.before_run()));
         }
