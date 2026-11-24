@@ -828,6 +828,8 @@ impl State {
                 .max()
                 .unwrap_or(1);
             // The table and what its entries hold (record words).
+            #[cfg(feature = "diagnostics")]
+            let keyed = std::time::Instant::now();
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -838,7 +840,12 @@ impl State {
                 }
                 (table, h.finish())
             };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::since(crate::copystat::C::RecKeyUs, keyed);
             if let Some(&first) = self.fresh_tables.get(&key) {
+                rec_timed!(RecHitUs);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::RecTableHits, 1);
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -848,12 +855,23 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let first = {
+                rec_timed!(RecDynamicUs);
+                host.dynamic(n)
+            };
+            let Some(first) = first else {
                 unmade_table(past.contains(&slot));
                 if keep_unmade() {
                     continue;
                 }
                 return None;
+            };
+            #[cfg(feature = "diagnostics")]
+            let making = {
+                use crate::copystat::{C, add};
+                add(C::RecTableMisses, 1);
+                add(C::RecEntriesMade, u64::from(n));
+                crate::copystat::timed(C::RecMakeUs)
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
@@ -886,6 +904,8 @@ impl State {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            drop(making);
             made.push((slot, first * 32));
         }
         Some(made)

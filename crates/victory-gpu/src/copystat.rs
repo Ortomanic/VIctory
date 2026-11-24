@@ -134,8 +134,19 @@ pub(crate) enum C {
     /// the GPU wrote (title memory read and merged).
     BackCompared,
     BackPieces,
+    /// Of the recording's tables made afresh (`State::tables`): hashing
+    /// their contents, those found made in the list and their time, slots
+    /// taken (`HostHeap::dynamic`), the tables made and their entries, and
+    /// the time making them.
+    RecKeyUs,
+    RecTableHits,
+    RecHitUs,
+    RecDynamicUs,
+    RecTableMisses,
+    RecEntriesMade,
+    RecMakeUs,
 }
-const COUNTERS: usize = C::BackPieces as usize + 1;
+const COUNTERS: usize = C::RecMakeUs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -338,7 +349,9 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "recording per frame: {:.1} ms in {:.0} draws and dispatches: pipeline waits {:.1}, bind \
-         {:.1} (tables {:.1}: host slots {:.1}, what they read {:.1}; root views {:.1}), vertex \
+         {:.1} (tables {:.1}: host slots {:.1}, what they read {:.1}, fresh tables keyed {:.1}, \
+         {:.0} found made {:.1}, slots taken {:.1}, {:.0} made with {:.0} entries {:.1}; root \
+         views {:.1}), vertex \
          and index {:.1}, notes {:.1}; buffer lookups {:.0} in {:.1} ms (all threads)",
         us(C::RecordUs),
         at(C::Records),
@@ -347,6 +360,13 @@ pub(crate) fn log(frames: f64) {
         us(C::RecTablesUs),
         us(C::RecMirrorUs),
         us(C::RecReadableUs),
+        us(C::RecKeyUs),
+        at(C::RecTableHits),
+        us(C::RecHitUs),
+        us(C::RecDynamicUs),
+        at(C::RecTableMisses),
+        at(C::RecEntriesMade),
+        us(C::RecMakeUs),
         us(C::RecRootViewsUs),
         us(C::RecIaUs),
         us(C::RecNoteUs),
