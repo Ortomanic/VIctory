@@ -47,34 +47,55 @@ pub(crate) struct Shadow {
     before: Mutex<Vec<(usize, Vec<u8>)>>,
 }
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// Snapshot memory kept for reuse (already touched, so no page faults:
+/// a fresh snapshot's first writes fault page by page, which held the
+/// world's snapshots to ~3 GB/s), by size class: buffers of at least
+/// `1 << class` bytes.
+static POOL: Mutex<Vec<Vec<Vec<u8>>>> = Mutex::new(Vec::new());
+
+/// Bytes of snapshot memory the pool keeps at most.
+const POOL_BYTES: usize = 1 << 30;
+
+/// The smallest class for `n` bytes (classes from 64 KiB up).
+fn class_for(n: usize) -> usize {
+    n.max(PIECE).next_power_of_two().trailing_zeros() as usize
+}
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one.
 fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
+    let class = class_for(n);
+    let kept = POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(class)
+        .and_then(Vec::pop);
+    let mut v = kept.unwrap_or_else(|| Vec::with_capacity(1 << class));
     v.clear();
     v
 }
 
-/// Returns a snapshot buffer to the pool (at most 16 kept, the largest).
+/// Returns a snapshot buffer to the pool (kept while the pool holds less
+/// than [`POOL_BYTES`]).
 fn give_back(v: Vec<u8>) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    if pool.len() > 16 {
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(16);
+    let capacity = v.capacity();
+    if capacity < PIECE {
+        return;
     }
+    // The class whose buffers it can stand for.
+    let class = (usize::BITS - 1 - capacity.leading_zeros()) as usize;
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let held: usize = pool
+        .iter()
+        .enumerate()
+        .map(|(c, list)| list.len() << c)
+        .sum();
+    if held + (1 << class) > POOL_BYTES {
+        return;
+    }
+    if pool.len() <= class {
+        pool.resize_with(class + 1, Vec::new);
+    }
+    pool[class].push(v);
 }
 
 /// Makes the snapshots `before` (by offset, disjoint, not touching) cover
@@ -123,8 +144,8 @@ const PIECE: usize = 64 << 10;
 
 /// Bytes from which a copy or compare is split over threads, and the bytes
 /// of each part.
-const PARALLEL: usize = 8 << 20;
-const PART: usize = 4 << 20;
+const PARALLEL: usize = 2 << 20;
+const PART: usize = 1 << 20;
 
 /// Runs `part(offset, n)` over `[0, len)` in parts of `step`, on the
 /// texture refresh threads when `len` is `big` or more (the submitting
@@ -143,6 +164,34 @@ fn in_parts(len: usize, step: usize, big: usize, part: impl Fn(usize, usize) + S
                 part(at, step.min(len - at));
                 0usize
             }) as crate::texture::Task
+        })
+        .collect();
+    crate::texture::run_tasks(tasks, crate::texture::threads());
+}
+
+/// Copies of (source, destination, length), not overlapping, as one job on
+/// several threads when they come to [`PARALLEL`] bytes or more.
+fn copy_all(copies: &[(usize, usize, usize)]) {
+    let total: usize = copies.iter().map(|c| c.2).sum();
+    if total < PARALLEL {
+        for &(src, dst, len) in copies {
+            // SAFETY: the caller's ranges, valid and apart.
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+        }
+        return;
+    }
+    let tasks = copies
+        .iter()
+        .flat_map(|&(src, dst, len)| {
+            (0..len.div_ceil(PART)).map(move |i| {
+                let (at, n) = (i * PART, PART.min(len - i * PART));
+                Box::new(move || {
+                    // SAFETY: a part of the caller's ranges; all parts are
+                    // done before `run_tasks` returns.
+                    unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+                    n
+                }) as crate::texture::Task
+            })
         })
         .collect();
     crate::texture::run_tasks(tasks, crate::texture::threads());
@@ -365,6 +414,28 @@ impl Shadow {
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        if before.is_empty() {
+            // As one job on several threads: the ranges are many and most
+            // are small.
+            let mut copies = Vec::with_capacity(union.len());
+            for &(from, to) in &union {
+                let mut bytes = pooled(to - from);
+                copies.push((self.data as usize + from, bytes.as_mut_ptr() as usize, to - from));
+                before.push((from, bytes));
+            }
+            copy_all(&copies);
+            for ((_, bytes), &(_, _, len)) in before.iter_mut().zip(&copies) {
+                // SAFETY: `copy_all` wrote the first `len` bytes (room
+                // for them was taken by `pooled`).
+                unsafe { bytes.set_len(len) };
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::SnapshotBytes,
+                copies.iter().map(|c| c.2 as u64).sum(),
+            );
+            return;
+        }
         for (from, to) in union {
             let _taken = cover(&mut before, from, to, host);
             #[cfg(feature = "diagnostics")]
@@ -825,6 +896,42 @@ mod tests {
         // Before all: a new first snapshot.
         assert_eq!(cover(&mut before, 0, 50, at), 50);
         assert_eq!(before.iter().map(|b| b.0).collect::<Vec<_>>(), [0, 100]);
+    }
+
+    #[test]
+    fn differing_pieces_are_found_at_title_piece_bounds() {
+        // Small (one thread) and big (several) ranges, starting in a piece
+        // and on its bound.
+        for (len, phase) in [(0, 0), (100, 7), (3 * PIECE + 5, 0), (40 << 20, 12345), (40 << 20, 0)] {
+            let old: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+            let mut host = old.clone();
+            let first = (PIECE - phase % PIECE).min(len);
+            let mut want = Vec::new();
+            for at in [0, first.saturating_sub(1), first + 3 * PIECE + 9, len.saturating_sub(1)] {
+                if at < len {
+                    host[at] ^= 0xff;
+                    let (a, b) = if at < first {
+                        (0, first)
+                    } else {
+                        let a = first + (at - first) / PIECE * PIECE;
+                        (a, (a + PIECE).min(len))
+                    };
+                    want.push((a, b - a));
+                }
+            }
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(differing_pieces(&host, &old, phase), want, "len {len} phase {phase}");
+        }
+    }
+
+    #[test]
+    fn big_extends_copy_every_byte() {
+        let src: Vec<u8> = (0..(PARALLEL + PART / 2 + 3)).map(|i| (i % 251) as u8).collect();
+        let mut v = vec![1, 2, 3];
+        extend_par(&mut v, &src);
+        assert_eq!(&v[..3], &[1, 2, 3]);
+        assert!(v[3..] == src[..]);
     }
 
     #[test]

@@ -103,9 +103,14 @@ pub(crate) enum C {
     PreludeUs,
     /// Of the host slots: waiting for the heap's made-slot lock.
     RecMirrorLockUs,
-    /// Recording draws and dispatches (title threads, summed) and their count.
+    /// Recording draws and dispatches (title threads, summed) and their count;
+    /// of it on threads that also submit.
     RecordUs,
     Records,
+    RecordSubmitterUs,
+    /// The title's ExecuteCommandLists, whole (heap sync and list states
+    /// around `Host::execute` included).
+    QueueExecUs,
     /// The runtime's view maps and unmaps reported.
     Remaps,
     /// Of the watch: waiting for the journal's lock; write-watch kernel
@@ -226,10 +231,33 @@ pub(crate) fn timed(c: C) -> Timed {
     Timed(c, std::time::Instant::now())
 }
 
-/// Times a draw or dispatch being recorded (until dropped), and counts it.
-pub(crate) fn recording() -> Timed {
+/// Times a draw or dispatch being recorded (until dropped), and counts it;
+/// on a thread that submits too, also as [`C::RecordSubmitterUs`].
+pub(crate) fn recording() -> Recording {
     add(C::Records, 1);
-    timed(C::RecordUs)
+    Recording(std::time::Instant::now())
+}
+
+pub(crate) struct Recording(std::time::Instant);
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        let us = self.0.elapsed().as_micros() as u64;
+        add(C::RecordUs, us);
+        if SUBMITTER.with(std::cell::Cell::get) {
+            add(C::RecordSubmitterUs, us);
+        }
+    }
+}
+
+thread_local! {
+    /// Whether this thread submitted title lists (`Host::execute`).
+    static SUBMITTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread submits title lists.
+pub(crate) fn submitter() {
+    SUBMITTER.with(|s| s.set(true));
 }
 
 /// Adds the time since `started` to `c`.
@@ -370,9 +398,9 @@ pub(crate) fn log(frames: f64) {
          texture batches {:.1}, bindless {:.1} (sweep {:.1}), preludes {:.1}, snapshots {:.1} ms {:.1} MB; on the GPU {:.1}; copying back \
          {:.1} ({:.1} MB compared in {:.1} ms, {:.0} pieces written by the GPU, written in {:.1} ms, \
          asked after {:.1} ms, {:.0} ranges without a snapshot); after {:.1}); presenting {:.1} (ready {:.1}, execute {:.1} of it GPU {:.1}, compose {:.1}, meter {:.1}, swap chain {:.1}); recording {:.1} ms in {:.0} \
-         draws and dispatches (title threads); {:.0} remaps; fallback queries {:.0}, {:.0} \
+         draws and dispatches (title threads; {:.1} on submitting threads); {:.0} remaps; fallback queries {:.0}, {:.0} \
          known views; slowest fallback {:.2} ms at {slow_src:#x}+{slow_len:#x}; outside executing \
-         and presenting {:.1} ms",
+         and presenting {:.1} ms (title ExecuteCommandLists whole {:.1})",
         us(C::ExecUs),
         us(C::LockUs),
         us(C::PrepUs),
@@ -413,12 +441,14 @@ pub(crate) fn log(frames: f64) {
         us(C::SwapUs),
         us(C::RecordUs),
         at(C::Records),
+        us(C::RecordSubmitterUs),
         at(C::Remaps),
         at(C::FallbackQueries),
         at(C::FallbackKnown),
         slow_us as f64 / 1e3,
         // The present's own execute counts in both.
         (wall - us(C::ExecUs) - us(C::PresentUs) + us(C::PresentExecUs)).max(0.0),
+        us(C::QueueExecUs),
     );
     tracing::info!(
         "recording per frame: {:.1} ms in {:.0} draws and dispatches: pipeline waits {:.1}, bind \

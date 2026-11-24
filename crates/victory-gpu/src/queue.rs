@@ -120,6 +120,11 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         let _held = crate::held::hold();
+        #[cfg(feature = "diagnostics")]
+        let _submitting = {
+            crate::copystat::submitter();
+            crate::copystat::timed(crate::copystat::C::QueueExecUs)
+        };
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let host_lists: Vec<_> = lists
