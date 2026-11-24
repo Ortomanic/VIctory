@@ -2,7 +2,10 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it; on a host
+//! without 64-lane waves ([`Options::host_wave32`]) a wave64 program whose
+//! cross-lane operations stay within 32 lanes runs in 32-lane waves instead
+//! (`docs/wave64-on-wave32.md`).
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
