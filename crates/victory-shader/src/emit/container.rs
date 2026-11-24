@@ -3,6 +3,8 @@
 //! program (`DXIL`), laid out as validator version 1.6 lays them out, plus
 //! the container hash that D3D12 checks.
 
+pub(crate) const BARYCENTRICS: u8 = 28;
+
 /// One signature element: one row (D3D12 links stages by semantic).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SigElement {
@@ -44,6 +46,7 @@ impl SigElement {
             18 => 68,
             19 => 67,
             20 => 69,
+            BARYCENTRICS => 23,
             30 => 25, // cull primitive
             _ => 0,
         }
