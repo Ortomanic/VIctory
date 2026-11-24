@@ -1684,6 +1684,16 @@ mod args_probe {
         if !crate::capture::listed(frame) {
             return None;
         }
+        // A later listed frame: probed anew (the readback buffer reused;
+        // the last summary was taken from it).
+        if let Some(p) = probe.as_mut()
+            && p.done
+            && frame > p.frame + 4
+        {
+            p.frame = frame;
+            p.notes.clear();
+            p.done = false;
+        }
         if probe.is_none() {
             let host = crate::host::host()?;
             let heap = D3D12_HEAP_PROPERTIES {
