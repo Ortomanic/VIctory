@@ -662,6 +662,22 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.execute_inner(runs, None);
+    }
+
+    /// Runs a title's submission: as [`execute`](Self::execute), but first,
+    /// under the same lock, brings the shader-visible heaps up to date with
+    /// slots the title copied itself ([`crate::descriptor::sync_shader_heaps`],
+    /// `bindless`: the lists' shaders index the heap from data). Outside the
+    /// lock, another queue's sync could rewrite a host slot while this
+    /// submission's GPU work still read it (Marvisak/VIctory#994, reported
+    /// by MichaelSmithAI). Internal submissions (clamp, captures,
+    /// copy-backs) use `execute`, which does not sync.
+    pub(crate) fn execute_title(&self, runs: &[&HostList], bindless: bool) {
+        self.execute_inner(runs, Some(bindless));
+    }
+
+    fn execute_inner(&self, runs: &[&HostList], sync_heaps: Option<bool>) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         #[cfg(feature = "diagnostics")]
@@ -669,6 +685,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let entered = std::time::Instant::now();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(bindless) = sync_heaps {
+            crate::descriptor::sync_shader_heaps(bindless);
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]

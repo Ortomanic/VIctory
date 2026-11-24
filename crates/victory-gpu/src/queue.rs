@@ -137,11 +137,11 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
         once.sort_unstable();
         once.dedup();
         crate::draw::SUBMITTING.fetch_add(1, Ordering::AcqRel);
-        crate::descriptor::sync_shader_heaps(host_lists.iter().any(|l| l.bindless()));
         for &l in &once {
             crate::list::with_state_pub(l, |host, state| host.set_lost(!state.before_run()));
         }
-        host.execute(&host_lists);
+        // The heap sync runs inside the submission lock (`execute_title`).
+        host.execute_title(&host_lists, host_lists.iter().any(|l| l.bindless()));
         for &l in &once {
             crate::list::with_state_pub(l, |_, state| state.after_run());
         }
