@@ -1187,8 +1187,32 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         let _mirroring = crate::copystat::timed(crate::copystat::C::HeapSyncMirrorUs);
-        for &index in &changed {
-            self.mirror(index, start + u64::from(index) * step, false);
+        // ~1 µs each (making the view, the bindless registry), ~25,000 a
+        // world frame: in parts on several threads where many. Slots are
+        // made concurrently anyway (title threads mirror their draws').
+        const MIRRORS: usize = 512;
+        if changed.len() < 2 * MIRRORS {
+            for &index in &changed {
+                self.mirror(index, start + u64::from(index) * step, false);
+            }
+        } else {
+            let changed = std::sync::Arc::new(changed.clone());
+            let heap = std::ptr::from_ref(self) as usize;
+            let tasks = (0..changed.len().div_ceil(MIRRORS))
+                .map(|k| {
+                    let changed = changed.clone();
+                    Box::new(move || {
+                        // SAFETY: this heap outlives the job (`run_tasks`
+                        // returns once every part is done).
+                        let heap = unsafe { &*(heap as *const HostHeap) };
+                        for &index in changed.iter().skip(k * MIRRORS).take(MIRRORS) {
+                            heap.mirror(index, start + u64::from(index) * step, false);
+                        }
+                        0usize
+                    }) as crate::texture::Task
+                })
+                .collect();
+            crate::texture::run_tasks(tasks, crate::texture::threads());
         }
         drop(synced);
         #[cfg(feature = "diagnostics")]
