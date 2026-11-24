@@ -160,16 +160,20 @@ macro_rules! once {
     }};
 }
 
-/// Draws and dispatches dropped because a table past the host heap could
-/// not be made (no free dynamic slots).
+/// Draws and dispatches dropped because a table to make afresh could not
+/// be made (no free dynamic slots): all, and those past the host heap.
+static UNMADE: AtomicU64 = AtomicU64::new(0);
 static UNMADE_PAST_HEAP: AtomicU64 = AtomicU64::new(0);
 
-fn unmade_past_heap() {
-    let n = UNMADE_PAST_HEAP.fetch_add(1, Ordering::Relaxed) + 1;
+fn unmade_table(past_heap: bool) {
+    let n = UNMADE.fetch_add(1, Ordering::Relaxed) + 1;
+    let past = UNMADE_PAST_HEAP.fetch_add(u64::from(past_heap), Ordering::Relaxed)
+        + u64::from(past_heap);
     if n.is_power_of_two() {
         tracing::warn!(
             n,
-            "a draw or dispatch dropped: a table past the host heap could not be made"
+            past,
+            "a draw or dispatch dropped: a table to make afresh could not be made"
         );
     }
 }
@@ -725,10 +729,13 @@ impl State {
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
     ///
-    /// `None` when a table reaching past the host heap could not be made
-    /// (no free dynamic slots): the shader would index the title's slot,
-    /// past the end of the host heap, and read whatever memory follows it
-    /// as descriptors (NVIDIA: MMU faults, hangs). The draw must not run.
+    /// `None` when a table to make afresh could not be made (no free
+    /// dynamic slots): the shader would index the title's slots instead,
+    /// which the host has not made (a constant buffer table) or does not
+    /// have (past the host heap: the host's dynamic slots, or memory after
+    /// the heap). Constants read from there bound the world's loops
+    /// (CS_Visibility hung the GPU, Xid 109); descriptors read from there
+    /// fault (Xid 13). The draw must not run.
     fn tables(
         &mut self,
         list: &HostList,
@@ -742,15 +749,12 @@ impl State {
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
-        // Tables that must be made: without a host slot of their own.
+        // Tables without host slots of their own (for the count).
         let mut past: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
-                continue;
-            }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
                 continue;
             };
@@ -816,14 +820,7 @@ impl State {
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
-                // Without its fresh table the shader would read the title's
-                // slots, which for constant buffer tables hold no constant
-                // view: a texture or null descriptor read as a buffer gives
-                // a wild address on AMD and the device is removed (#59).
-                // The draw or dispatch is dropped instead.
-                if past.contains(&slot) {
-                    unmade_past_heap();
-                }
+                unmade_table(past.contains(&slot));
                 return None;
             };
             self.fresh_tables.insert(key, first);
