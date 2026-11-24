@@ -12,9 +12,9 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! shortcut: the budget (half a second of waiting per title frame,
+//! `VICTORY_PIPELINE_WAIT_MS`) is a guess; a pass the title runs only once
+//! and whose pipeline takes longer is lost.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -94,8 +94,19 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+/// Waiting allowed per title frame, over all threads: 500 ms unless
+/// `VICTORY_PIPELINE_WAIT_MS` says otherwise (0: never wait, a draw whose
+/// pipeline is not made yet is dropped until it is; one-off passes such as
+/// a colour-grading bake may then be lost).
+fn budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .map_or(Duration::from_millis(500), Duration::from_millis)
+    })
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -191,7 +202,7 @@ fn wait_in(p: &Pending, frame: u64, spent: &Mutex<Spent>) {
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        let rest = BUDGET.saturating_sub(spent().used(Instant::now()));
+        let rest = budget().saturating_sub(spent().used(Instant::now()));
         if rest.is_zero() {
             break;
         }
@@ -314,9 +325,10 @@ mod tests {
             w.join().unwrap();
         }
         let both = started.elapsed();
-        assert!(both >= BUDGET && both < BUDGET + BUDGET / 2, "{both:?}");
+        let budget = budget();
+        assert!(both >= budget && both < budget + budget / 2, "{both:?}");
         let later = Instant::now();
         wait_in(&Pending::new(Vec::new(), None), frame, &OWN);
-        assert!(later.elapsed() < BUDGET / 10);
+        assert!(later.elapsed() < budget / 10);
     }
 }
