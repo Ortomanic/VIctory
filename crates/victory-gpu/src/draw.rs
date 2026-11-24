@@ -109,6 +109,66 @@ static SHARED_HITS: AtomicU64 = AtomicU64::new(0);
 static MADE_SHARED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 static MADE_OWN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Title submissions under way (from before their lists' slots are taken
+/// back to after they are lent back), and lends since the start, with a
+/// condition variable for recording threads waiting for slots.
+pub(crate) static SUBMITTING: AtomicU64 = AtomicU64::new(0);
+static LENDS: (std::sync::Mutex<u64>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+/// The start of the current second and the microseconds recording threads
+/// waited in it for dynamic slots to be lent back.
+static SLOT_WAITS: std::sync::Mutex<Option<(std::time::Instant, u64)>> = std::sync::Mutex::new(None);
+/// Of each second (about a world frame), the most recording threads
+/// together wait for slots.
+const SLOT_WAIT_BUDGET_US: u64 = 50_000;
+/// Waits for dynamic slots to be lent back (another submission finished),
+/// within the frame's budget; false if none was or the budget is spent.
+static SLOT_WAITED: AtomicU64 = AtomicU64::new(0);
+static SLOT_WAIT_US: AtomicU64 = AtomicU64::new(0);
+
+/// Slots were lent back: waiting recording threads try again.
+fn lent_back() {
+    let (count, lent) = &LENDS;
+    *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    lent.notify_all();
+}
+
+/// No dynamic slots were free: waits (within the frame's budget) until a
+/// title submission under way finishes and lends its slots back. True if
+/// some were lent back meanwhile.
+fn wait_for_lent_slots() -> bool {
+    if SUBMITTING.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let left = {
+        let mut waits = SLOT_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        let window = waits.get_or_insert((std::time::Instant::now(), 0));
+        if window.0.elapsed() > std::time::Duration::from_secs(1) {
+            *window = (std::time::Instant::now(), 0);
+        }
+        SLOT_WAIT_BUDGET_US.saturating_sub(window.1)
+    };
+    if left == 0 {
+        return false;
+    }
+    let started = std::time::Instant::now();
+    let (count, lent) = &LENDS;
+    let guard = count.lock().unwrap_or_else(|e| e.into_inner());
+    let before = *guard;
+    let (guard, _) = lent
+        .wait_timeout_while(guard, std::time::Duration::from_micros(left), |n| *n == before)
+        .unwrap_or_else(|e| e.into_inner());
+    let got = *guard != before;
+    drop(guard);
+    let us = started.elapsed().as_micros() as u64;
+    if let Some(window) = SLOT_WAITS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        window.1 += us;
+    }
+    SLOT_WAITED.fetch_add(1, Ordering::Relaxed);
+    SLOT_WAIT_US.fetch_add(us, Ordering::Relaxed);
+    got
+}
+
 /// `VICTORY_SHARE_TABLES=0`: tables made afresh are not shared between
 /// lists (each list makes its own, as before).
 fn share_tables() -> bool {
@@ -120,8 +180,10 @@ fn share_tables() -> bool {
 /// lists not run (their slots were taken), and draws and dispatches
 /// dropped because a table to make afresh could not be made.
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
-pub(crate) fn take_slot_stats() -> [u64; 9] {
+pub(crate) fn take_slot_stats() -> [u64; 11] {
     [
+        SLOT_WAITED.swap(0, Ordering::Relaxed),
+        SLOT_WAIT_US.swap(0, Ordering::Relaxed),
         MADE_SHARED[0].swap(0, Ordering::Relaxed),
         MADE_SHARED[1].swap(0, Ordering::Relaxed),
         MADE_OWN[0].swap(0, Ordering::Relaxed),
@@ -301,6 +363,9 @@ impl State {
         }
         LENT.fetch_add(u64::from(lent), Ordering::Relaxed);
         self.lent = true;
+        if lent > 0 {
+            lent_back();
+        }
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -971,7 +1036,14 @@ impl State {
             }
             let first = {
                 rec_timed!(RecDynamicUs);
-                host.dynamic(n)
+                let mut first = host.dynamic(n);
+                // Out of slots: a submission under way gives its back when
+                // it finishes (the world's first frames take more than
+                // there are, held by lists recorded and not yet run).
+                while first.is_none() && wait_for_lent_slots() {
+                    first = host.dynamic(n);
+                }
+                first
             };
             let Some((first, token)) = first else {
                 unmade_table(past.contains(&slot));

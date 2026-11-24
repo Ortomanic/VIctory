@@ -387,15 +387,15 @@ pub(crate) fn log(frames: f64) {
     );
     // Dynamic descriptor slots (tables made afresh): how many are taken
     // and how they come back.
-    let [made_shared, slots_shared, made_own, slots_own, shared, lent, reclaimed, lost, unmade] =
+    let [waits, wait_us, made_shared, slots_shared, made_own, slots_own, shared, lent, reclaimed, lost, unmade] =
         crate::draw::take_slot_stats();
     let (all, now, high, stolen) = crate::descriptor::dynamic_use();
     tracing::info!(
         "dynamic descriptor slots: {all} in all, {now} taken now, at most {high} at once; per \
          frame {:.0} tables made shareable ({:.0} slots), {:.0} with constants ({:.0} slots), {:.0} \
          found made by another list, {:.0} slots lent back after runs, {:.1} lent runs taken back, {:.1} runs taken from lent \
-         slots, {:.1} lists not run (lent slots taken), {:.1} draws and dispatches dropped (a \
-         table not made)",
+         slots, {:.1} lists not run (lent slots taken), {:.1} waits for slots lent back {:.1} ms, \
+         {:.1} draws and dispatches dropped (a table not made)",
         made_shared as f64 / frames,
         slots_shared as f64 / frames,
         made_own as f64 / frames,
@@ -405,6 +405,8 @@ pub(crate) fn log(frames: f64) {
         reclaimed as f64 / frames,
         stolen as f64 / frames,
         lost as f64 / frames,
+        waits as f64 / frames,
+        wait_us as f64 / 1e3 / frames,
         unmade as f64 / frames,
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
