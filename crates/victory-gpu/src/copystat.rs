@@ -130,8 +130,12 @@ pub(crate) enum C {
     RecNoteUs,
     RecFindUs,
     RecFinds,
+    /// Copy-back: bytes compared with their snapshot, and 64 KiB pieces
+    /// the GPU wrote (title memory read and merged).
+    BackCompared,
+    BackPieces,
 }
-const COUNTERS: usize = C::RecFinds as usize + 1;
+const COUNTERS: usize = C::BackPieces as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -293,7 +297,7 @@ pub(crate) fn log(frames: f64) {
          [watch {:.1}: kernel {:.1} in {:.0} calls ({:.0} for textures {:.1} ms), guard {:.1}, \
          journal wait {:.1}; {:.0} askings from the submission's earlier ones, {:.0} in part], \
          texture batches {:.1}, snapshots {:.1} ms {:.1} MB; on the GPU {:.1}; copying back \
-         {:.1}; after {:.1}); presenting {:.1} (swap chain {:.1}); recording {:.1} ms in {:.0} \
+         {:.1} ({:.1} MB compared, {:.0} pieces written by the GPU); after {:.1}); presenting {:.1} (swap chain {:.1}); recording {:.1} ms in {:.0} \
          draws and dispatches (title threads); {:.0} remaps; fallback queries {:.0}, {:.0} \
          known views; slowest fallback {:.2} ms at {slow_src:#x}+{slow_len:#x}; outside executing \
          and presenting {:.1} ms",
@@ -318,6 +322,8 @@ pub(crate) fn log(frames: f64) {
         mb(at(C::SnapshotBytes)),
         us(C::GpuUs),
         us(C::BackUs),
+        mb(at(C::BackCompared)),
+        at(C::BackPieces),
         us(C::AfterUs),
         us(C::PresentUs),
         us(C::SwapUs),

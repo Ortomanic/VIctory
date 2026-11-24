@@ -40,9 +40,10 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// The copy's bytes before the submission ran, covering the ranges its
+    /// shaders write: what the GPU wrote differs. By offset, disjoint, ranges
+    /// that overlap or touch merged into one.
+    before: Mutex<Vec<(usize, Vec<u8>)>>,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -65,14 +66,99 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool (at most 8 kept, the largest).
+/// Returns a snapshot buffer to the pool (at most 16 kept, the largest).
 fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
-    if pool.len() > 8 {
+    if pool.len() > 16 {
         pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(8);
+        pool.truncate(16);
     }
+}
+
+/// Makes the snapshots `before` (by offset, disjoint, not touching) cover
+/// `[from, to)`: the snapshots it overlaps or touches become one, the parts
+/// none covered taken from `host` (offsets `a..b`). Returns the bytes newly
+/// taken.
+fn cover<'a>(
+    before: &mut Vec<(usize, Vec<u8>)>,
+    from: usize,
+    to: usize,
+    host: impl Fn(usize, usize) -> &'a [u8],
+) -> usize {
+    // The snapshots the range overlaps or touches: `first..last`.
+    let first = before.partition_point(|(at, bytes)| at + bytes.len() < from);
+    let last = first + before[first..].partition_point(|&(at, _)| at <= to);
+    if last == first + 1 {
+        let (at, bytes) = &before[first];
+        if *at <= from && to <= at + bytes.len() {
+            return 0;
+        }
+    }
+    let (start, end) = if last > first {
+        let (at, bytes) = &before[last - 1];
+        (before[first].0.min(from), (at + bytes.len()).max(to))
+    } else {
+        (from, to)
+    };
+    let merged: Vec<(usize, Vec<u8>)> = before.drain(first..last).collect();
+    let kept: usize = merged.iter().map(|(_, b)| b.len()).sum();
+    let mut grown = pooled(end - start);
+    let mut at = start;
+    for (taken, bytes) in merged {
+        grown.extend_from_slice(host(at, taken));
+        grown.extend_from_slice(&bytes);
+        at = taken + bytes.len();
+        give_back(bytes);
+    }
+    grown.extend_from_slice(host(at, end));
+    before.insert(first, (start, grown));
+    end - start - kept
+}
+
+/// Merges the GPU's writes into title memory, 8 bytes at a time: where
+/// `host` differs from `old` (the GPU wrote) `title` takes the host's
+/// bytes, and `host` then takes `title`'s. Whether `title` changed.
+fn merge_written(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let mut changed = false;
+    let words = title.len() / 8 * 8;
+    for ((t, h), o) in title[..words]
+        .chunks_exact_mut(8)
+        .zip(host[..words].chunks_exact_mut(8))
+        .zip(old[..words].chunks_exact(8))
+    {
+        let tw = u64::from_ne_bytes(t.try_into().unwrap_or_default());
+        let hw = u64::from_ne_bytes(h.try_into().unwrap_or_default());
+        let ow = u64::from_ne_bytes(o.try_into().unwrap_or_default());
+        let diff = hw ^ ow;
+        if diff == 0 {
+            if hw != tw {
+                h.copy_from_slice(t);
+            }
+            continue;
+        }
+        // 0xff in each byte the GPU wrote.
+        let mask = ((((diff & LOW) + LOW) | diff) & HIGH) >> 7;
+        let mask = mask * 0xff;
+        let merged = (tw & !mask) | (hw & mask);
+        changed |= merged != tw;
+        t.copy_from_slice(&merged.to_ne_bytes());
+        h.copy_from_slice(&merged.to_ne_bytes());
+    }
+    for ((t, h), o) in title[words..]
+        .iter_mut()
+        .zip(host[words..].iter_mut())
+        .zip(&old[words..])
+    {
+        if *h != *o && *t != *h {
+            *t = *h;
+            changed = true;
+        }
+        *h = *t;
+    }
+    changed
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -154,35 +240,15 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
+        if from >= to {
+            return;
+        }
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
-            return;
-        }
-        // Parts newly covered from the copy, the rest as it was taken.
+        let _taken = cover(&mut before, from, to, host);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(
-            crate::copystat::C::SnapshotBytes,
-            (end - start - before.as_ref().map_or(0, |(_, b)| b.len())) as u64,
-        );
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
-            }
-            None => grown.extend_from_slice(host(start, end)),
-        }
-        *before = Some((start, grown));
+        crate::copystat::add(crate::copystat::C::SnapshotBytes, _taken as u64);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -198,13 +264,13 @@ impl Shadow {
         len: usize,
         regions: &mut crate::host::Regions,
     ) -> usize {
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
+        if let Some((taken, before)) = snapshot
+            .iter()
+            .find(|(taken, before)| *taken <= from && to <= taken + before.len())
             && from < to
         {
             let before = &before[from - taken..to - taken];
@@ -214,6 +280,8 @@ impl Shadow {
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
             let mut at = from;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
                 // SAFETY: inside the mapping; only the submitting thread
@@ -222,17 +290,11 @@ impl Shadow {
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::BackPieces, 1);
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
+                    if merge_written(title, host, old) {
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n, regions);
                         written += n;
@@ -257,16 +319,21 @@ impl Shadow {
                 }
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
-        }
         written
+    }
+
+    /// After the submission's copy-back: the steps that declared `ranges`
+    /// (title start, end) are done with them (one submission runs at a
+    /// time), and the snapshots with the last ranges.
+    pub(crate) fn written_back(&self, ranges: &[(usize, usize)]) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|r| !ranges.contains(r));
+        if pending.is_empty() {
+            let taken = std::mem::take(&mut *self.before.lock().unwrap_or_else(|e| e.into_inner()));
+            for (_, bytes) in taken {
+                give_back(bytes);
+            }
+        }
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -511,4 +578,59 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_cover_ranges_without_the_gaps_between() {
+        let host: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let at = |a: usize, b: usize| &host[a..b];
+        let mut before = Vec::new();
+        assert_eq!(cover(&mut before, 100, 200, at), 100);
+        assert_eq!(cover(&mut before, 1000, 1100, at), 100);
+        // Inside one: nothing new.
+        assert_eq!(cover(&mut before, 120, 180, at), 0);
+        assert_eq!(before.len(), 2);
+        // Touching the first: merged with it.
+        assert_eq!(cover(&mut before, 200, 300, at), 100);
+        assert_eq!(before.len(), 2);
+        assert_eq!((before[0].0, before[0].1.len()), (100, 200));
+        // Bridging both: one snapshot, the old bytes kept as taken.
+        before[1].1[0] = 0xee;
+        assert_eq!(cover(&mut before, 250, 1050, at), 700);
+        assert_eq!(before.len(), 1);
+        let (start, bytes) = &before[0];
+        assert_eq!((*start, bytes.len()), (100, 1000));
+        assert_eq!(bytes[1000 - 100], 0xee);
+        assert_eq!(&bytes[..900], &host[100..1000]);
+        assert_eq!(&bytes[901..], &host[1001..1100]);
+        // Before all: a new first snapshot.
+        assert_eq!(cover(&mut before, 0, 50, at), 50);
+        assert_eq!(before.iter().map(|b| b.0).collect::<Vec<_>>(), [0, 100]);
+    }
+
+    #[test]
+    fn merged_writes_take_the_gpu_bytes_and_keep_the_title_elsewhere() {
+        for len in [0, 5, 8, 64, 67] {
+            let old: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let mut host = old.clone();
+            let mut title: Vec<u8> = old.iter().map(|b| b ^ 0x55).collect();
+            // The GPU writes every third byte, some to the title's value.
+            for i in (0..len).step_by(3) {
+                host[i] = if i % 2 == 0 { 0xa0 } else { title[i] };
+            }
+            let mut want = title.clone();
+            let mut changed = false;
+            for i in (0..len).step_by(3) {
+                changed |= want[i] != host[i];
+                want[i] = host[i];
+            }
+            assert_eq!(merge_written(&mut title, &mut host, &old), changed, "len {len}");
+            assert_eq!(title, want, "len {len}");
+            assert_eq!(host, want, "len {len}");
+        }
+    }
 }

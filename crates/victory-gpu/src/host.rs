@@ -738,15 +738,16 @@ impl Host {
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        // Per buffer copy, the ranges declared (start, end), each once.
+        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
+                if let Step::GpuWrite(shadow, address, len) = step {
+                    let range = (*address, address + len);
+                    match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                        Some((_, ranges)) => ranges.push(range),
+                        None => back.push((shadow.clone(), vec![range])),
+                    }
                 }
             }
         }
@@ -754,10 +755,23 @@ impl Host {
         // whole pass, not again for the next submission: the title may
         // have freed or remapped memory by then.
         let mut regions = Regions::default();
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len, &mut regions);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        for (shadow, ranges) in &mut back {
+            ranges.sort_unstable();
+            ranges.dedup();
+            // Overlapping (or touching) ranges are compared once, as
+            // their snapshots were merged ([`crate::shadow::Shadow::writing`]).
+            let mut union: Vec<(usize, usize)> = Vec::new();
+            for &(from, to) in ranges.iter() {
+                match union.last_mut() {
+                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                    _ => union.push((from, to)),
+                }
+            }
+            for (from, to) in union {
+                let written = shadow.copy_back(from, to - from, &mut regions);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
+            shadow.written_back(ranges);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
