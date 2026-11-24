@@ -60,8 +60,18 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    // View memory cannot be write-watched: where it is known to be a view,
+    // the kernel is not asked. Under Wine every query takes the process's
+    // virtual-memory lock, which the title's mapping threads hold across
+    // wineserver calls: a microsecond alone, tens to thousands of them
+    // with four threads mapping views (/tmp/wwbench2 `contend`).
+    let view = guarded && known_view(first * PAGE);
+    #[cfg(feature = "diagnostics")]
+    if view {
+        crate::copystat::add(crate::copystat::C::KernelSkips, 1);
+    }
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
+    let failed = view || unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
@@ -112,19 +122,25 @@ struct Guards {
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
     /// Blocks that could not be guarded because nothing is committed there
-    /// (placeholders between the tiled heap's page views): nothing to
-    /// write, so not reported written until the runtime maps them
-    /// ([`title_memory_remapped`]) or the next frame ([`new_frame`]), which
-    /// bounds a commit the runtime does not report. Reported written at
-    /// every asking before, each was copied (reading as zeros through the
-    /// unmapped-page fallback) at every submission.
-    holes: BTreeSet<usize>,
+    /// (placeholders between the tiled heap's page views), with the frame
+    /// ([`FRAME`]) they were last found so: nothing to write, so not
+    /// reported written until the runtime maps them
+    /// ([`title_memory_remapped`]). Once a frame a hole is looked at again
+    /// (one region query for its run), which bounds a commit the runtime
+    /// does not report to a frame. Reported written at every asking before
+    /// round 1, each was copied (reading as zeros through the unmapped-page
+    /// fallback) at every submission; reported again at each frame's first
+    /// asking after it, ~800 such fallback copies a world frame.
+    holes: BTreeMap<usize, u64>,
 }
+
+/// Counts presented frames ([`new_frame`]).
+static FRAME: AtomicU64 = AtomicU64::new(1);
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
-    holes: BTreeSet::new(),
+    holes: BTreeMap::new(),
 });
 
 /// What [`mapped`] found, by the start of the allocation (or region) asked
@@ -149,10 +165,34 @@ fn forget_kinds(kinds: &mut BTreeMap<usize, (usize, bool)>, from: usize, to: usi
     }
 }
 
-/// A frame was presented: holes are asked about again (once a frame, not
-/// at every submission), in case memory was committed there unreported.
+/// A frame was presented: holes are looked at again (once a frame, not at
+/// every submission), in case memory was committed there unreported.
 pub(crate) fn new_frame() {
-    guards().holes.clear();
+    FRAME.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Whether `block` is a hole: found so this frame, or found uncommitted
+/// now (then so are the holes after it in the same region, noted with it).
+/// A hole found committed is a hole no longer.
+fn still_hole(g: &mut Guards, block: usize, frame: u64) -> bool {
+    match g.holes.get(&block) {
+        None => false,
+        Some(&seen) if seen == frame => true,
+        Some(_) => match uncommitted(block * BLOCK) {
+            Some(end) => {
+                for (_, seen) in g.holes.range_mut(block..(end / BLOCK).max(block + 1)) {
+                    *seen = frame;
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::HoleChecks, 1);
+                true
+            }
+            None => {
+                g.holes.remove(&block);
+                false
+            }
+        },
+    }
 }
 
 /// Counts the runtime's mappings and unmappings of title memory
@@ -176,9 +216,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let frame = FRAME.load(Ordering::Acquire);
     for block in first..=last {
         let open = block < last && !g.clean.contains(&block);
-        if open && g.holes.contains(&block) {
+        if open && still_hole(&mut g, block, frame) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::HoleSkips, 1);
         } else if open {
@@ -196,6 +237,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     Some(written)
+}
+
+/// Whether [`mapped`] found the allocation at `at` to be a view (and the
+/// runtime has not remapped it since); false if not or not known.
+fn known_view(at: usize) -> bool {
+    let kinds = KINDS.lock().unwrap_or_else(|e| e.into_inner());
+    kinds
+        .range(..=at)
+        .next_back()
+        .is_some_and(|(_, &(end, view))| view && at < end)
 }
 
 /// Whether the current allocation at `at` is a mapped view, as last found
@@ -343,7 +394,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         // part stays as it was (reported written at every asking).
         match uncommitted(block * BLOCK).map(|end| (end / BLOCK).min(to)) {
             Some(past) if past > block => {
-                g.holes.extend(block..past);
+                let frame = FRAME.load(Ordering::Acquire);
+                g.holes.extend((block..past).map(|b| (b, frame)));
                 block = past;
             }
             _ => block += 1,
@@ -407,7 +459,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
-    let holes: Vec<usize> = g.holes.range(span).copied().collect();
+    let holes: Vec<usize> = g.holes.range(span).map(|(&b, _)| b).collect();
     for block in holes {
         g.holes.remove(&block);
     }
@@ -592,7 +644,8 @@ mod tests {
 
     /// Blocks of a guarded range with nothing committed (placeholders
     /// between page views, as xmem maps them) are reported written once,
-    /// then not until the runtime maps them or a frame passes.
+    /// then not until the runtime maps them, or a later frame finds them
+    /// committed without a report.
     #[test]
     fn uncommitted_blocks_are_holes_until_mapped() {
         use windows_sys::Win32::System::Memory::{
@@ -623,8 +676,9 @@ mod tests {
             (section, base)
         };
         assert_ne!(base, 0);
-        // Block `i` of the placeholder shows section block `i`.
-        let map = |i: usize| {
+        // Block `i` of the placeholder shows section block `i`; `report`:
+        // as the runtime does.
+        let map = |i: usize, report: bool| {
             let at = base + i * BLOCK;
             // SAFETY: a block of our placeholder, split off and mapped.
             let view = unsafe {
@@ -642,25 +696,34 @@ mod tests {
                 )
             };
             assert_eq!(view.Value as usize, at);
-            title_memory_remapped(at, BLOCK);
+            if report {
+                title_memory_remapped(at, BLOCK);
+            }
         };
-        map(0);
+        map(0, true);
         let pages = |blocks: &[usize]| -> Vec<usize> {
             blocks.iter().flat_map(|&b| (base + b * BLOCK) / PAGE..(base + (b + 1) * BLOCK) / PAGE).collect()
         };
         let (start, end) = (base, base + 4 * BLOCK);
         assert_eq!(guard(start, end), Some(pages(&[0, 1, 2, 3])));
         assert_eq!(guard(start, end), Some(Vec::new()));
-        map(2);
+        map(2, true);
         assert_eq!(guard(start, end), Some(pages(&[2])));
         assert_eq!(guard(start, end), Some(Vec::new()));
         // SAFETY: a byte of a mapped block; the handler opens it.
         unsafe { ((base + 2 * BLOCK + 9) as *mut u8).write_volatile(7) };
         assert_eq!(guard(start, end), Some(pages(&[2])));
+        // Still uncommitted a frame later: looked at, not reported.
         new_frame();
-        assert_eq!(guard(start, end), Some(pages(&[1, 3])));
         assert_eq!(guard(start, end), Some(Vec::new()));
-        for i in [0, 2] {
+        // Mapped without a report: seen at the next frame.
+        map(3, false);
+        assert_eq!(guard(start, end), Some(Vec::new()));
+        new_frame();
+        assert_eq!(guard(start, end), Some(pages(&[3])));
+        assert_eq!(guard(start, end), Some(Vec::new()));
+        assert!(guards().holes.contains_key(&(base / BLOCK + 1)));
+        for i in [0, 2, 3] {
             // SAFETY: our views.
             unsafe {
                 windows_sys::Win32::System::Memory::UnmapViewOfFile(
