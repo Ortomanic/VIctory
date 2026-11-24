@@ -9093,11 +9093,10 @@ mod tests {
         for (name, words, n, lds) in cases {
             for threads in [[64, 1, 1], [8, 8, 1], [6, 6, 1], [4, 4, 4]] {
                 let l = lower_wave64(words, n, threads, lds, true);
-                assert_eq!((l.wave_size, l.split), (Some(32), true), "{name} {threads:?}");
-                dump(
-                    &format!("wave64_uniform_{name}_{}.dxil", threads.iter().product::<u32>()),
-                    &l.dxil,
-                );
+                let what = format!("{name} {threads:?}");
+                assert_eq!((l.wave_size, l.split), (Some(32), true), "{what}");
+                let size = threads.iter().product::<u32>();
+                dump(&format!("wave64_uniform_{name}_{size}.dxil"), &l.dxil);
             }
             let l = lower_wave64(words, n, [128, 1, 1], lds, true);
             assert_eq!((l.wave_size, l.split), (Some(64), false), "{name}");
