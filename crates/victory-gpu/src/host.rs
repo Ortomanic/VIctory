@@ -705,7 +705,7 @@ impl Host {
                 crate::descriptor::bindless::refresh(m, all, writes_bindless);
             }
             for (shadow, _, writes) in m.shadows.iter().filter(|_| writes_bindless) {
-                for &(from, to) in writes {
+                for &(from, to) in writes.iter() {
                     batch.gpu_write(shadow, from as usize, (to - from) as usize);
                 }
             }

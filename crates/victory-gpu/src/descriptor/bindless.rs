@@ -49,7 +49,15 @@ struct PerShadow {
     shadow: Arc<Shadow>,
     reads: BTreeMap<(u64, u64), u32>,
     writes: BTreeMap<(u64, u64), u32>,
+    /// `reads` and `writes` merged as in [`Merged`], until either changes
+    /// (frame-perf3: rebuilding every copy's at each change, ~2 ms under
+    /// the registry's lock, ran ~4 times a world frame while title threads
+    /// making views waited for the lock).
+    merged: Option<(Ranges, Ranges)>,
 }
+
+/// Merged ranges (start, end), shared by the [`Merged`] built from them.
+pub(crate) type Ranges = Arc<[(u64, u64)]>;
 
 /// A slot's range: its copy (by address), title start and end, unordered.
 type Slot = (usize, u64, u64, bool);
@@ -87,7 +95,7 @@ pub(crate) struct Merged {
     /// Per copy: the ranges read or written (title start, end), merged
     /// within a page of each other, and the unordered ranges merged
     /// (start, end).
-    pub(crate) shadows: Vec<(Arc<Shadow>, Vec<(u64, u64)>, Vec<(u64, u64)>)>,
+    pub(crate) shadows: Vec<(Arc<Shadow>, Ranges, Ranges)>,
     /// Slots, bytes of the ranges read, bytes of the unordered ranges
     /// (diagnostics).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
@@ -114,6 +122,7 @@ impl Registry {
         };
         self.generation += 1;
         if let Some(per) = self.shadows.get_mut(&at) {
+            per.merged = None;
             count(&mut per.reads, (from, to), false);
             if unordered {
                 count(&mut per.writes, (from, to), false);
@@ -147,7 +156,9 @@ pub(crate) fn set(
             shadow: shadow.clone(),
             reads: BTreeMap::new(),
             writes: BTreeMap::new(),
+            merged: None,
         });
+        per.merged = None;
         count(&mut per.reads, (from, to), true);
         if unordered {
             count(&mut per.writes, (from, to), true);
@@ -187,12 +198,19 @@ pub(crate) fn merged() -> Arc<Merged> {
             slots: r.slots.len(),
             ..Merged::default()
         };
-        for per in r.shadows.values() {
-            let reads = merge(per.reads.keys(), crate::watch::PAGE as u64);
+        for per in r.shadows.values_mut() {
+            let (reads, writes) = per
+                .merged
+                .get_or_insert_with(|| {
+                    (
+                        merge(per.reads.keys(), crate::watch::PAGE as u64).into(),
+                        merge(per.writes.keys(), 0).into(),
+                    )
+                })
+                .clone();
             if reads.is_empty() {
                 continue;
             }
-            let writes = merge(per.writes.keys(), 0);
             m.span_bytes += reads.iter().map(|(a, b)| b - a).sum::<u64>();
             m.write_bytes += writes.iter().map(|(a, b)| b - a).sum::<u64>();
             m.shadows.push((per.shadow.clone(), reads, writes));
@@ -284,7 +302,7 @@ pub(crate) fn refresh(m: &Merged, all: bool, writes: bool) {
             .and_then(|&(from, _)| crate::watch::allocation(from as usize))
             .is_some_and(|(_, _, view)| !view)
             && shadow.write_watched();
-        for &(from, to) in ranges {
+        for &(from, to) in ranges.iter() {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             {
