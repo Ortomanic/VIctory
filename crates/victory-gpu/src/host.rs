@@ -384,7 +384,8 @@ pub(crate) struct HostList {
     /// its GPU commands.
     lost: AtomicBool,
     /// What its shaders do through heap descriptors at slots from data
-    /// (`victory_shader::emit::BINDLESS_READS`, `BINDLESS_WRITES`).
+    /// (`victory_shader::emit::BINDLESS_READS`, `BINDLESS_WRITES`,
+    /// `BINDLESS_IMAGE_WRITES`: only buffer writes are copied back).
     bindless: std::sync::atomic::AtomicU8,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.

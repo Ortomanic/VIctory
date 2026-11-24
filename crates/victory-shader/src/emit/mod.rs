@@ -317,8 +317,12 @@ pub struct HostShader {
 
 /// [`HostShader::bindless`]: reads through descriptors from data.
 pub const BINDLESS_READS: u8 = 1;
-/// [`HostShader::bindless`]: writes (stores, atomics) through them.
+/// [`HostShader::bindless`]: writes (stores, atomics) through them, to
+/// buffers.
 pub const BINDLESS_WRITES: u8 = 2;
+/// [`HostShader::bindless`]: writes through them to images only: what
+/// buffer memory shaders may write is not copied back for these.
+pub const BINDLESS_IMAGE_WRITES: u8 = 4;
 
 /// [`HostShader::bindless`] of a program: its image and buffer accesses
 /// whose descriptor is loaded from a heap (a table or the heap itself) at
@@ -347,7 +351,12 @@ fn bindless(p: &ir::Program, res: &resource::Resources, layout: &[crate::native:
             continue;
         };
         let name = inst.name();
-        bits |= if name.contains("store") || name.contains("atomic") {
+        let writes = name.contains("store") || name.contains("atomic");
+        bits |= if writes && name.starts_with("image_") {
+            // Textures (an image descriptor is never a buffer's): the host
+            // copies back no buffer memory for these (frame-perf3).
+            BINDLESS_IMAGE_WRITES
+        } else if writes {
             BINDLESS_WRITES
         } else {
             BINDLESS_READS
@@ -771,15 +780,15 @@ mod tests {
             user_data,
             slot: 0,
         };
-        let bits = |access: u32, soffset: u32, heap: RootType| {
+        let bits_of = |load: u32, access: u32, access1: u32, soffset: u32, heap: RootType| {
             // As `resource::tests::heap_indices_from_root_constants_in_a_merged_stage`:
             // user data from s8, the constant s14, the heap (or table) s18.
             let words = [
                 0x8F08_850E, // s_lshl_b32 s8, s14, 5
                 0xBE93_0380, // s_mov_b32 s19, 0
-                0xF408_0209,
-                soffset, // s_load_dwordx4 s[8:11], s[18:19], <soffset>
-                access, 0x8002_0400, // buffer_{load,store}_format_x v4, v0, s[8:11], 0 idxen
+                load,
+                soffset, // s_load_dwordx{4,8} s[8:..], s[18:19], <soffset>
+                access, access1, // buffer_{load,store}_format_x v4, v0, s[8:11], 0 idxen (or an image access)
                 0xBF81_0000, // s_endpgm
             ];
             let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -789,6 +798,8 @@ mod tests {
             let res = resource::track_lanes(&p, &layout, HwStage::Ms, st.as_ref()).unwrap();
             bindless(&p, &res, &layout)
         };
+        const LOAD_X4: u32 = 0xF408_0209;
+        let bits = |access: u32, soffset: u32, heap: RootType| bits_of(LOAD_X4, access, 0x8002_0400, soffset, heap);
         const LOAD: u32 = 0xE000_2000;
         const STORE: u32 = 0xE010_2000;
         const BY_S8: u32 = 0x1000_0000;
@@ -797,6 +808,13 @@ mod tests {
         assert_eq!(bits(STORE, BY_S8, RootType::ResourceHeap), BINDLESS_WRITES);
         assert_eq!(bits(LOAD, BY_S8, RootType::Table), BINDLESS_READS);
         assert_eq!(bits(STORE, FIXED, RootType::Table), 0);
+        // image_store v4, v0, s[8:15] dmask:0x1 dim:1D, its descriptor
+        // loaded with s_load_dwordx8: an image write.
+        const LOAD_X8: u32 = 0xF40C_0209;
+        assert_eq!(
+            bits_of(LOAD_X8, 0xF020_0100, 0x0002_0400, BY_S8, RootType::ResourceHeap),
+            BINDLESS_IMAGE_WRITES
+        );
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
