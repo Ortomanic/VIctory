@@ -132,6 +132,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    watch_command_drain(image.base());
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -175,6 +176,63 @@ fn watch(base: usize, size: usize) {
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+}
+
+/// Debugging aid for GTA VI 1.0.2.1: `VICTORY_WATCH_DRAIN=1` logs, once a
+/// second, the fields that gate the command-channel drain (RVAs from static
+/// analysis of that build: manager pointer at 0xa924088).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn watch_command_drain(base: usize) {
+    if std::env::var_os("VICTORY_WATCH_DRAIN").is_none() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let read = |at: usize, len: usize| -> Option<u64> {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                fn ReadProcessMemory(
+                    process: *mut std::ffi::c_void,
+                    from: *const std::ffi::c_void,
+                    to: *mut std::ffi::c_void,
+                    len: usize,
+                    got: *mut usize,
+                ) -> i32;
+            }
+            let mut value = 0u64;
+            let mut got = 0;
+            // SAFETY: the kernel validates the source; the destination is a local u64.
+            let ok = unsafe {
+                ReadProcessMemory(
+                    GetCurrentProcess(),
+                    at as _,
+                    (&raw mut value).cast(),
+                    len,
+                    &mut got,
+                )
+            };
+            (ok != 0 && got == len).then_some(value)
+        };
+        for _ in 0..120 {
+            if let Some(mgr) = read(base + 0xa924088, 8).filter(|&m| m != 0) {
+                let mgr = mgr as usize;
+                eprintln!(
+                    "VIctory drain: frame={:?} skip_inc={:?} run={:?} direct={:?} b1555={:?} delay={:?} lock={:x?} recursion={:?} mix_buffers={:?} device_ready={:?}",
+                    read(mgr + 0x1548, 4),
+                    read(mgr + 0x3cdf8, 1),
+                    read(mgr + 0x3ce99, 1),
+                    read(mgr + 0x1554, 1),
+                    read(mgr + 0x1555, 1),
+                    read(base + 0x9ae9988, 4),
+                    read(mgr + 0x3ced0, 8),
+                    read(mgr + 0x3ced0 + 0x10, 4),
+                    read(mgr + 0x3d3fc, 4),
+                    read(mgr + 0x3dd84, 1),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     });
 }

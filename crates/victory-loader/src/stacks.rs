@@ -102,9 +102,10 @@ pub fn dump_stacks() {
         }
         let (frames, (priority, base)) = frames_of(thread);
         eprintln!(
-            "  thread {id} \"{}\" start {} priority {priority} (base {base})",
+            "  thread {id} \"{}\" start {} priority {priority} (base {base}) title-index {:?}",
             name_of(thread),
-            locate(start_of(thread))
+            locate(start_of(thread)),
+            title_index(thread)
         );
         for (i, pc) in frames.into_iter().enumerate() {
             eprintln!("    #{i:<2} {}", locate(pc as usize));
@@ -112,6 +113,52 @@ pub fn dump_stacks() {
         // SAFETY: we opened it.
         unsafe { CloseHandle(thread) };
     }
+}
+
+/// Diagnostics: the title's own thread index (TLS block slot 1, +0x1454 in
+/// GTA VI 1.0.2.1), which its locks record as their owner.
+fn title_index(thread: HANDLE) -> Option<u32> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = BasicInfo {
+        exit_status: 0,
+        teb: std::ptr::null(),
+        client_id: [0; 2],
+        affinity: 0,
+        priority: 0,
+        base_priority: 0,
+    };
+    // SAFETY: writes `info`, whose layout and size are the system's.
+    let status = unsafe {
+        NtQueryInformationThread(
+            thread,
+            ThreadBasicInformation,
+            (&raw mut info).cast(),
+            size_of::<BasicInfo>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 || info.teb.is_null() {
+        return None;
+    }
+    let read = |at: usize| -> Option<u64> {
+        let mut value = 0u64;
+        let mut got = 0;
+        // SAFETY: the kernel validates the source; the destination is local.
+        let ok = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                at as _,
+                (&raw mut value).cast(),
+                8,
+                &mut got,
+            )
+        };
+        (ok != 0 && got == 8).then_some(value)
+    };
+    let array = read(info.teb as usize + 0x58).filter(|&a| a != 0)?;
+    let block = read(array as usize + 8).filter(|&b| b != 0)?;
+    read(block as usize + 0x1454).map(|v| v as u32)
 }
 
 /// The thread's frames and its current and base scheduling priority (0-31).

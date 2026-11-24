@@ -64,8 +64,11 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
-    let text = format!("{text}
-{}", title_output());
+    let text = format!(
+        "{text}
+{}",
+        title_output()
+    );
     eprint!("{text}");
     append_to_log(&text);
 }
@@ -76,9 +79,16 @@ fn append_to_log(text: &str) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file);
     if let Ok(mut f) = opened {
-        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+        let _ = write!(
+            f,
+            "unix time {now}, process {}\n{text}\n",
+            std::process::id()
+        );
     }
 }
 
@@ -105,7 +115,9 @@ fn title_output() -> String {
     let Ok(said) = SAID.try_lock() else {
         return String::new();
     };
-    said.iter().map(|l| format!("  title said: {l}\n")).collect()
+    said.iter()
+        .map(|l| format!("  title said: {l}\n"))
+        .collect()
 }
 
 /// Installs the handlers; call once before running title code.
@@ -414,8 +426,7 @@ unsafe fn thrown(p: &[usize]) -> String {
         let types = p[3] + rva(p[2] + 12);
         let name = |i: usize| {
             let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
-            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
-                .to_string_lossy()
+            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char).to_string_lossy()
         };
         let first = name(0);
         let value = match &*first {
@@ -497,6 +508,62 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
+    #[cfg(feature = "diagnostics")]
+    if !to_file && code == EXCEPTION_BREAKPOINT && locate(at).ends_with("+0x4dcbc9d") {
+        // Read the append-buffer header and classify a bounded payload prefix locally.
+        use windows_sys::Win32::System::{
+            Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess,
+        };
+        let mut header = [0u8; 0x20];
+        let mut read = 0;
+        // SAFETY: the kernel copies readable bytes into a bounded local buffer.
+        let ok = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                context.Rcx as _,
+                header.as_mut_ptr().cast(),
+                header.len(),
+                &mut read,
+            )
+        };
+        if ok != 0 && read == header.len() {
+            let current = u32::from_le_bytes(header[0x18..0x1c].try_into().unwrap());
+            let capacity = u32::from_le_bytes(header[0x10..0x14].try_into().unwrap());
+            line(format!(
+                "  append check: cursor={current:#x}, capacity={capacity:#x}, requested={:#x}, available={:#x}",
+                context.R8, context.Rbx
+            ));
+            let dst = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            for (label, addr) in [("destination", dst), ("incoming", context.Rdx)] {
+                let mut prefix = [0u8; 64];
+                let mut obtained = 0;
+                // SAFETY: the kernel checks the read and bounds the destination.
+                let ok = unsafe {
+                    ReadProcessMemory(
+                        GetCurrentProcess(),
+                        addr as _,
+                        prefix.as_mut_ptr().cast(),
+                        prefix.len(),
+                        &mut obtained,
+                    )
+                };
+                if ok != 0 && obtained == prefix.len() {
+                    let head: String = prefix.iter().take(16).map(|b| format!("{b:02x}")).collect();
+                    let printable: String = prefix
+                        .iter()
+                        .map(|&b| {
+                            if b.is_ascii_graphic() || b == b' ' {
+                                b as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect();
+                    line(format!("  append {label}: {head} {printable}"));
+                }
+            }
+        }
+    }
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
