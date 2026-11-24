@@ -672,8 +672,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = self.address_term(&a)? {
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
         let h = if a.param == CODE {
@@ -2537,6 +2536,18 @@ impl<'a> Lower<'a> {
             // vertex fetch call, whose results arrive as inputs.
             return Err("a register the emitter does not model");
         }
+        if name == "s_getpc_b64" {
+            // The program counter reads as the next instruction's byte offset
+            // in the program (high half 0): addresses the code computes from
+            // it are then offsets into the constant table after the code
+            // (see `Address::param` `CODE`).
+            let code = dst_code.ok_or("a missing operand")?;
+            let next = self.s.m.i32(inst.machine.offset as u32 + 4);
+            let zero = self.s.m.i32(0);
+            self.write(inst, Reg::S(code), next, None);
+            self.write(inst, Reg::S(code + 1), zero, None);
+            return Ok(());
+        }
         let c = self.cur;
         let src32 = |l: &mut Self, k: usize| -> Result<V, Why> {
             // SOPK arithmetic reads its destination as the first source.
@@ -3278,8 +3289,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = self.address_term(&a)? {
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
         for k in 0..count {
@@ -3444,14 +3454,35 @@ impl<'a> Lower<'a> {
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
         match src {
             Source::Built { address, .. } => {
-                let x = match address.dynamic {
-                    Some(v) => Some(self.i32_of(v)?),
-                    None => None,
-                };
+                let x = self.address_term(address)?;
                 Ok((address.offset, x))
             }
             _ => Ok((0, None)),
         }
+    }
+
+    /// The computed term of an address, as the code reads it: from the
+    /// first active lane when it moved the address to SGPRs.
+    // shortcut: that lane is taken at the use, not at the move; the compiler
+    // moves only values it knows uniform there, so any lane gives the same.
+    fn address_term(&mut self, a: &Address) -> Result<Option<V>, Why> {
+        let Some(v) = a.dynamic else {
+            return Ok(None);
+        };
+        let x = self.i32_of(v)?;
+        if !a.first_lane {
+            return Ok(Some(x));
+        }
+        self.s.flags |= flags::WAVE_OPS;
+        let i32t = self.s.t.i32;
+        Ok(Some(self.s.op(
+            self.cur,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            i32t,
+            118,
+            &[x],
+        )))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.

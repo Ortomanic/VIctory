@@ -31,6 +31,10 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// The computed term is read from the first active lane: the code
+    /// moved the address to SGPRs with `v_readfirstlane_b32`, so `dynamic`
+    /// is the per-lane value before that move.
+    pub first_lane: bool,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -287,10 +291,13 @@ enum Term {
 
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
 /// optional computed term.
+#[derive(Default)]
 struct Sum {
     base: Option<Value>,
     offset: u32,
     dynamic: Option<Value>,
+    /// `dynamic` is read from the first active lane ([`Address::first_lane`]).
+    first_lane: bool,
 }
 
 struct Tracer<'a> {
@@ -483,34 +490,37 @@ impl<'a> Tracer<'a> {
         let v = match t {
             Term::Const(c) => {
                 return Sum {
-                    base: None,
                     offset: c,
-                    dynamic: None,
+                    ..Sum::default()
                 };
             }
             Term::Value(v) => v,
         };
         let dynamic = Sum {
-            base: None,
-            offset: 0,
             dynamic: Some(v),
+            ..Sum::default()
+        };
+        let based = Sum {
+            base: Some(v),
+            ..Sum::default()
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
-                    base: Some(v),
-                    offset: 0,
-                    dynamic: None,
-                },
+                Some((_, 0)) => based,
                 _ => dynamic,
             };
         }
         if self.getpc(v).is_some() {
-            return Sum {
-                base: Some(v),
-                offset: 0,
-                dynamic: None,
-            };
+            return based;
+        }
+        if let Some(lanes) = self.first_lane_source(v) {
+            // The base is uniform, so only the computed term changes.
+            let mut s = self.sum(lanes);
+            if s.base.is_none() && s.dynamic.is_some() {
+                return dynamic;
+            }
+            s.first_lane |= s.dynamic.is_some();
+            return s;
         }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
@@ -527,7 +537,92 @@ impl<'a> Tracer<'a> {
             base: x.base.or(y.base),
             offset: x.offset.wrapping_add(y.offset),
             dynamic: x.dynamic.or(y.dynamic),
+            first_lane: x.first_lane || y.first_lane,
         }
+    }
+
+    /// The VGPR value `v_readfirstlane_b32` writing `v` reads, traced
+    /// through VGPR copies.
+    fn first_lane_source(&self, v: Value) -> Option<Term> {
+        let inst = self.def(v)?;
+        if inst.name() != "v_readfirstlane_b32" {
+            return None;
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        self.vterm(inst, f.src.first()?)
+    }
+
+    /// `v` is an address in the program's code chosen by control flow: a
+    /// phi whose arguments all add to an `s_getpc_b64` result (or are such
+    /// phis). Lowering reads the program counter as the byte offset in the
+    /// program, so `v`'s own value is then that offset.
+    fn code_value(&self, v: Value, seen: &mut Vec<Value>) -> bool {
+        if let Some(Term::Value(x)) = self.first_lane_source(v) {
+            return self.code_value(x, seen);
+        }
+        let Some((b, i)) = self.phis[v.0 as usize] else {
+            return false;
+        };
+        if seen.contains(&v) {
+            return true; // the value the loop carries
+        }
+        if seen.len() >= MAX_JOINS {
+            return false;
+        }
+        seen.push(v);
+        let all = self.p.blocks[b].phis[i].args.iter().all(|&a| {
+            let t = self.origin(a);
+            let s = self.sum(t);
+            match (s.base, t) {
+                (Some(base), _) => self.getpc(base).is_some(),
+                (None, Term::Value(x)) if s.dynamic == Some(x) => self.code_value(x, seen),
+                _ => false,
+            }
+        });
+        seen.pop();
+        all
+    }
+
+    /// `hi` is the high half of an address in the program's code: the
+    /// `s_getpc_b64` high dword, possibly plus a carry, or a phi of such.
+    fn code_high(&self, hi: Term, seen: &mut Vec<Value>) -> bool {
+        let Term::Value(v) = hi else { return false };
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            if seen.contains(&v) {
+                return true;
+            }
+            if seen.len() >= MAX_JOINS {
+                return false;
+            }
+            seen.push(v);
+            let all = self.p.blocks[b].phis[i]
+                .args
+                .iter()
+                .all(|&a| self.code_high(self.origin(a), seen));
+            seen.pop();
+            return all;
+        }
+        if let Some(lanes) = self.first_lane_source(v) {
+            return self.code_high(lanes, seen);
+        }
+        let Some(inst) = self.def(v) else {
+            return false;
+        };
+        if inst.name() == "s_getpc_b64" {
+            return inst.writes.get(1).is_some_and(|w| w.1 == v);
+        }
+        if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
+            return self.code_high(a, seen) || self.code_high(b, seen);
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return false;
+        };
+        inst.name() == "v_add_co_ci_u32"
+            && f.src[..2.min(f.src.len())]
+                .iter()
+                .any(|o| self.vterm(inst, o).is_some_and(|t| self.code_high(t, seen)))
     }
 
     /// The `s_getpc_b64` writing `lo` as its low dword.
@@ -623,9 +718,8 @@ impl<'a> Tracer<'a> {
                     lo,
                     hi,
                     Sum {
-                        base: None,
                         offset: off,
-                        dynamic: None,
+                        ..Sum::default()
                     },
                 )
             }
@@ -639,11 +733,30 @@ impl<'a> Tracer<'a> {
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
+        if let (None, Some(d), None) = (s.base, s.dynamic, extra.dynamic)
+            && self.code_value(d, &mut Vec::new())
+            && self.code_high(hi, &mut Vec::new())
+        {
+            return Ok(Address {
+                param: CODE,
+                offset: s.offset.wrapping_add(extra.offset),
+                dynamic: Some(d),
+                first_lane: s.first_lane,
+            });
+        }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
+        let first_lane = if s.dynamic.is_some() {
+            s.first_lane
+        } else {
+            extra.first_lane
+        };
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
-            if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
+            if !self.high_half(hi, high)
+                && !high.is_some_and(|h| self.carried(hi, h))
+                && !self.code_high(hi, &mut Vec::new())
+            {
                 return Err("an address with an untracked high half");
             }
             return Ok(Address {
@@ -652,6 +765,7 @@ impl<'a> Tracer<'a> {
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                first_lane,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
@@ -679,6 +793,7 @@ impl<'a> Tracer<'a> {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+            first_lane,
         })
     }
 
@@ -700,6 +815,9 @@ impl<'a> Tracer<'a> {
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
             return self.carried(a, high) || self.carried(b, high);
+        }
+        if let Some(lanes) = self.first_lane_source(v) {
+            return self.carried(lanes, high);
         }
         let Some(inst) = self.def(v) else {
             return false;
@@ -830,15 +948,7 @@ impl<'a> Tracer<'a> {
             {
                 (hi, bits) = (x, bits | more);
             }
-            let address = self.address(
-                lo,
-                hi,
-                Sum {
-                    base: None,
-                    offset: 0,
-                    dynamic: None,
-                },
-            )?;
+            let address = self.address(lo, hi, Sum::default())?;
             return Ok(Source::Built {
                 address,
                 bits,
@@ -1769,6 +1879,7 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            first_lane: false,
         }
     }
 
@@ -1932,6 +2043,65 @@ pub(crate) mod tests {
             "{offsets:?}"
         );
     }
+
+    /// A table in the code indexed per lane, moved to SGPRs with
+    /// `v_readfirstlane_b32` (world compute programs index their constant
+    /// tables this way).
+    #[test]
+    fn code_addresses_moved_to_sgprs_keep_their_computed_term() {
+        let r = track_words(
+            &[
+                0xBE80_1F00, // s_getpc_b64 s[0:1]
+                0x8000_FF00,
+                0x0000_0100, // s_add_u32 s0, s0, 0x100
+                0x8201_8001, // s_addc_u32 s1, s1, 0
+                0xD70F_6A01,
+                0x0000_0100, // v_add_co_u32 v1, vcc, v0, s0
+                0x5004_0601, // v_add_co_ci_u32 v2, vcc, s1, v3, vcc
+                0x7E04_0501, // v_readfirstlane_b32 s2, v1
+                0x7E06_0502, // v_readfirstlane_b32 s3, v2
+                0xF400_0101,
+                0xFA00_0000, // s_load_dword s4, s[2:3], null
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        let [(_, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!((a.param, a.offset), (CODE, 4 + 0x100));
+        assert!(a.dynamic.is_some() && a.first_lane, "{a:?}");
+    }
+
+    /// An address in the code chosen by control flow: each path adds its
+    /// own term to the program counter.
+    #[test]
+    fn code_addresses_joined_by_control_flow_are_the_joined_value() {
+        let r = track_words(&CODE_PHI, &[], HwStage::Cs);
+        let [(_, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!((a.param, a.offset, a.first_lane), (CODE, 0, false));
+        assert!(a.dynamic.is_some());
+    }
+
+    const CODE_PHI: [u32; 14] = [
+        0xBE80_1F00, // s_getpc_b64 s[0:1]
+        0xBF06_8005, // s_cmp_eq_u32 s5, 0
+        0xBF85_0003, // s_cbranch_scc1 -> 0x18
+        0xD70F_6A01,
+        0x0000_0100, // v_add_co_u32 v1, vcc, v0, s0
+        0xBF82_0002, // s_branch -> 0x20
+        0xD70F_6A01,
+        0x0000_0103, // 0x18: v_add_co_u32 v1, vcc, v3, s0
+        0x7E04_0501, // 0x20: v_readfirstlane_b32 s2, v1
+        0xBE83_0301, // s_mov_b32 s3, s1
+        0xF400_0101,
+        0xFA00_0000, // s_load_dword s4, s[2:3], null
+        0xBE84_0304, // s_mov_b32 s4, s4
+        S_ENDPGM,
+    ];
 
     #[test]
     fn descriptors_selected_by_scc_are_traced_per_outcome() {

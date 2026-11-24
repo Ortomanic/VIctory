@@ -604,6 +604,80 @@ mod tests {
         }
     }
 
+    /// A compute program storing a dword of the constant table after its
+    /// code, at an address each path computes from its own program counter
+    /// read and joins by a phi, then moves to SGPRs with
+    /// `v_readfirstlane_b32`. Tracking refused the address ("an address
+    /// from a phi"); lowering reads the program counter as the byte offset
+    /// in the program.
+    #[test]
+    fn a_code_address_joined_by_control_flow_is_lowered() {
+        let words = [
+            0xBE80_1F00u32, // s_getpc_b64 s[0:1]
+            0xBF06_8005,    // s_cmp_eq_u32 s5, 0
+            0xBF85_0003,    // s_cbranch_scc1 -> 0x18
+            0xD70F_6A01,
+            0x0000_0100, // v_add_co_u32 v1, vcc, v0, s0
+            0xBF82_0002, // s_branch -> 0x20
+            0xD70F_6A01,
+            0x0000_0103, // 0x18: v_add_co_u32 v1, vcc, v3, s0
+            0x7E04_0501, // 0x20: v_readfirstlane_b32 s2, v1
+            0xBE83_0301, // s_mov_b32 s3, s1
+            0xF400_0101,
+            0xFA00_0000, // s_load_dword s4, s[2:3], null
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], null
+            0x7E0A_0204, // v_mov_b32 v5, s4
+            0xE070_1000,
+            0x8002_0500, // buffer_store_dword v5, v0, s[8:11], 0 offen
+            S_ENDPGM,
+            0x1234_5678, // the table
+        ];
+        let param = |root, user_data, slot| crate::native::RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 6,
+            layout: vec![
+                param(RootType::Constants, 5, 1),
+                param(RootType::Table, 6, 0),
+            ],
+            used: vec![crate::native::UsedResource {
+                kind: crate::native::ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 1,
+                dwords: 4,
+                user_data: 6,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 7 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        let host = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(host.user_data.len(), 2, "{:?}", host.user_data);
+    }
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
