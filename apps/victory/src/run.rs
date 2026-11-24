@@ -185,7 +185,7 @@ fn watch(base: usize, size: usize) {
 /// analysis of that build: manager pointer at 0xa924088).
 #[cfg(all(windows, feature = "diagnostics"))]
 fn watch_command_drain(base: usize) {
-    if std::env::var_os("VICTORY_WATCH_DRAIN").is_none() {
+    if std::env::var_os("VICTORY_WATCH_DRAIN").is_none_or(|v| v.is_empty()) {
         return;
     }
     std::thread::spawn(move || {
