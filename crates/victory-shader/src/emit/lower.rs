@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -1549,12 +1550,14 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -1914,7 +1917,7 @@ impl<'a> Lower<'a> {
         if !self.x.root_bounds {
             return (off, None);
         }
-        let views = self.s.root_cbvs.iter().chain(&self.s.root_srvs);
+        let views = self.s.root_cbvs.iter().chain(&self.s.root_srvs).chain(&self.s.root_uavs);
         let Some(slot) = views.copied().find(|r| r.1 == h).map(|r| r.0) else {
             return (off, None);
         };
@@ -4670,6 +4673,17 @@ impl<'a> Lower<'a> {
         off: V,
     ) -> Result<(V, V, V), Why> {
         let stride = used.map_or(0, |u| u.stride);
+        if self.on_root_descriptor(src) && stride > 0 {
+            // A root descriptor is a bare address on the host, with no stride
+            // of its own: its raw view at byte index * stride + off
+            // (LooperSalty/victory 398ae78 by itsRevela).
+            let c = self.cur;
+            let s = self.s.m.i32(stride);
+            let at = self.s.m.bin(c, Bin::Mul, index, s);
+            let at = self.s.m.bin(c, Bin::Add, at, off);
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            return Ok((h, at, self.s.m.undef(self.s.t.i32)));
+        }
         if stride >= 4 && stride.is_multiple_of(4) {
             let h = self.handle(site, src, false, (12 | u, stride))?;
             return Ok((h, index, off));
@@ -4688,6 +4702,29 @@ impl<'a> Lower<'a> {
         let byte = self.s.m.bin(c, Bin::Add, start, off);
         let h = self.handle(site, src, false, (11 | u, 0))?;
         Ok((h, byte, self.s.m.undef(self.s.t.i32)))
+    }
+
+    /// Whether `src` is a descriptor built around a root SRV's or UAV's
+    /// address.
+    fn on_root_descriptor(&self, src: &Source) -> bool {
+        matches!(src, Source::Built { address, .. }
+            if self
+                .x
+                .native
+                .layout
+                .get(address.param)
+                .is_some_and(|rp| rp.root == RootType::Descriptor))
+    }
+
+    /// `guard` narrowed to the lanes whose access [`Self::root_bounds`] found
+    /// inside its root view: a write or atomic outside one is dropped (the
+    /// console drops out-of-range buffer writes; the host's root views have
+    /// no bounds, so it would write past the copy).
+    fn and_inside(&mut self, guard: Option<V>, inside: Option<V>) -> Option<V> {
+        match (guard, inside) {
+            (Some(g), Some(i)) => Some(self.s.m.bin(self.cur, Bin::And, g, i)),
+            (g, i) => g.or(i),
+        }
     }
 
     /// The dword at a computed byte address of a constant buffer (its
@@ -5047,7 +5084,12 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
-                    _ => Err("a root UAV or typed root view"),
+                    (RootType::Descriptor, Some(ResourceType::Uav) | None, p)
+                        if p == 11 | 0x1000 =>
+                    {
+                        Ok(self.s.root_uav_handle(rp.slot))
+                    }
+                    _ => Err("a typed root view"),
                 }
             }
             Source::Phi { block, args } => {
@@ -8399,6 +8441,9 @@ impl<'a> Lower<'a> {
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
+            let (at0, inside) = self.root_bounds(h, coords[0], 4);
+            let coords = [at0, coords[1], coords[2]];
+            let guard = self.and_inside(guard, inside);
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
             };
@@ -8458,6 +8503,7 @@ impl<'a> Lower<'a> {
                 vals = wide;
             }
             let mut args = Vec::new();
+            let mut inside = None;
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
@@ -8471,17 +8517,13 @@ impl<'a> Lower<'a> {
                 }
                 (69, "bufferStore.f32")
             } else {
-                match index {
-                    Some(index) => {
-                        let (h, a, b) = self.indexed_buffer(site, src, used, u, index, off)?;
-                        args.push(h);
-                        args.extend([a, b]);
-                    }
-                    None => {
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([off, iu]);
-                    }
-                }
+                let (h, a, b) = match index {
+                    Some(index) => self.indexed_buffer(site, src, used, u, index, off)?,
+                    None => (self.handle(site, src, false, (11 | u, 0))?, off, iu),
+                };
+                let (a, bounds) = self.root_bounds(h, a, 4 * count);
+                inside = bounds;
+                args.extend([h, a, b]);
                 args.extend(&vals);
                 args.resize(3 + 4, iu);
                 (140, "rawBufferStore.i32")
@@ -8490,6 +8532,7 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
+            let guard = self.and_inside(guard, inside);
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
@@ -8534,6 +8577,8 @@ impl<'a> Lower<'a> {
             match index {
                 Some(index) => {
                     let (h, a, b) = self.indexed_buffer(site, src, used, u, index, off)?;
+                    let (a, bounds) = self.root_bounds(h, a, 4 * count);
+                    inside = bounds;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
@@ -10320,6 +10365,11 @@ mod tests {
     /// user data 0..1 (`s[0:1]`), runs `body` (its result in v1, offsets
     /// from v0, the thread id) and branches on v1.
     fn lower_root_srv(body: &[u32], root_bounds: bool) -> super::Lowered {
+        lower_root_view(body, root_bounds, ResourceType::Srv)
+    }
+
+    /// [`lower_root_srv`] with a root view of resource type `kind`.
+    fn lower_root_view(body: &[u32], root_bounds: bool, kind: ResourceType) -> super::Lowered {
         let mut words = body.to_vec();
         words.extend([
             v_readfirstlane_s0(1),
@@ -10342,7 +10392,7 @@ mod tests {
                 slot: 2,
             }],
             used: vec![UsedResource {
-                kind: ResourceType::Srv,
+                kind,
                 root: RootType::Descriptor,
                 table_offset_dwords: 0,
                 lower_bound: 0,
@@ -10390,6 +10440,36 @@ mod tests {
         0xE9C0_1000,
         0x8000_0100,
     ];
+
+    /// Writes and atomics through a root UAV (a descriptor the code builds
+    /// around its address) bind it as `u2` and are bounds-checked like reads:
+    /// the length comes from the view's own user-data dword, and a write
+    /// outside is dropped. Before, these stopped with "a root UAV or typed
+    /// root view".
+    #[test]
+    fn root_uav_writes_are_bounds_checked() {
+        use crate::emit::UserData;
+        let length = UserData {
+            index: 0,
+            slot: 2,
+            root: RootType::Descriptor,
+            dword: 0,
+        };
+        // s_mov_b32 s2, -1; s_mov_b32 s3, 0x27fac; then buffer_store_dword
+        // or buffer_atomic_add v1, v0, s[0:3], 0 offen.
+        let built = |op: u32| [0xBE82_03C1, 0xBE83_03FF, 0x0002_7FAC, 0xE000_1000 | op << 18, 0x8000_0100];
+        for (name, op) in [("store", 0x1C), ("atomic", 0x32)] {
+            let checked = lower_root_view(&built(op), true, ResourceType::Uav);
+            assert_eq!(checked.root_uavs, [2], "{name}");
+            assert!(checked.root_srvs.is_empty(), "{name}");
+            assert_eq!(checked.user_data, [length], "{name}");
+            dump(&format!("root_uav_bounds_{name}.dxil"), &checked.dxil);
+            let unchecked = lower_root_view(&built(op), false, ResourceType::Uav);
+            assert_eq!(unchecked.root_uavs, [2], "{name}");
+            assert!(unchecked.user_data.is_empty(), "{name}");
+            assert_ne!(checked.dxil, unchecked.dxil, "{name}");
+        }
+    }
 
     /// Reads through a root SRV at offsets the shader computes (global
     /// loads, typed-format vertex fetch) are bounds-checked against the

@@ -256,9 +256,26 @@ pub(crate) fn dispatched() -> u64 {
 /// cut at the buffer's end, CBVs rounded up to whole 16-byte rows).
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end) for refreshes.
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<(u64, u32)> {
+/// Largest root UAV range refreshed, kept and copied back per submission.
+const ROOT_UAV_MAX: u64 = 4 << 20;
+
+fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<(u64, u32)> {
     let shadow = crate::shadow::find(address, 1)?;
     let left = shadow.left(address);
+    if uav {
+        // Written by shaders: refreshed, then copied back after the
+        // submission, up to a cap (the snapshot that finds what the GPU wrote
+        // costs per byte and submission). The shader drops writes and zeroes
+        // reads past the length it is given, so nothing outside is touched.
+        let len = left.min(ROOT_UAV_MAX);
+        if left > ROOT_UAV_MAX {
+            static CUT: std::sync::Once = std::sync::Once::new();
+            CUT.call_once(|| tracing::warn!(left, "a root UAV cut to its refresh and copy-back cap"));
+        }
+        shadow.refresh(list, address, len);
+        shadow.gpu_writes(list, address, len);
+        return Some((shadow.gpu(address), u32::try_from(len).unwrap_or(u32::MAX)));
+    }
     let len = left.min(if srv { 1 << 20 } else { 1 << 16 });
     let bounds = if srv { left } else { len.next_multiple_of(16) };
     let bounds = u32::try_from(bounds).unwrap_or(u32::MAX);
@@ -742,24 +759,30 @@ impl State {
             let views_started = std::time::Instant::now();
             // Root views first: the user data holds their lengths.
             let mut lengths: Vec<(u8, u32)> = Vec::new();
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            for (views, srv, uav) in [
+                (&stage.root_cbvs, false, false),
+                (&stage.root_srvs, true, false),
+                (&stage.root_uavs, false, true),
+            ] {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some((gpu, len)) = root_view(list, *address, srv) else {
+                    let Some((gpu, len)) = root_view(list, *address, srv, uav) else {
                         continue;
                     };
                     lengths.push((slot, len));
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        match (compute, srv, uav) {
+                            (false, _, true) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                            (true, _, true) => l.SetComputeRootUnorderedAccessView(param, gpu),
+                            (false, false, _) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                            (false, true, _) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                            (true, false, _) => l.SetComputeRootConstantBufferView(param, gpu),
+                            (true, true, _) => l.SetComputeRootShaderResourceView(param, gpu),
                         }
                     }
                 }
@@ -865,7 +888,7 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));

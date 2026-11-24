@@ -28,9 +28,10 @@
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
 //!   a heap sampler it uses must be a comparison sampler on the host.
-//! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
-//!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
-//!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
+//! * **Root CBVs, root SRVs and root UAVs** (raw buffers) as root descriptors
+//!   `b<i>` / `t<i>` / `u<i>` in [`ROOT_CBV_SPACE`], `i` the title's root
+//!   parameter index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`],
+//!   [`HostShader::root_uavs`]); the
 //!   address the title sets is the buffer's. The host binds them as raw
 //!   device addresses without bounds checks (vkd3d-proton: root SRVs
 //!   always, root CBVs with descriptor heaps), so with
@@ -306,6 +307,10 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
+    /// [`ROOT_CBV_SPACE`]. Writes through one are bounds-checked like reads
+    /// (with [`Options::root_bounds`]): a store outside the view is dropped.
+    pub root_uavs: Vec<u8>,
     /// Whether the program reads ([`BINDLESS_READS`]) or writes
     /// ([`BINDLESS_WRITES`]) memory through heap descriptors at slots it
     /// computes from data ([`bindless`]): which slots the host cannot know.
@@ -564,6 +569,7 @@ fn emit_program(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
         bindless: bindless(p, res, &native.layout),
         zero_filled_phis: l.zero_filled_phis,
     })
@@ -1135,6 +1141,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
             bindless: 0,
             zero_filled_phis: false,
         };
@@ -1147,6 +1154,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
                 bindless: 0,
                 zero_filled_phis: false,
             })
