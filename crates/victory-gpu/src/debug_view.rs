@@ -51,13 +51,20 @@ pub(crate) enum View {
     /// A colour slot of the G-buffer pass; whether it holds normals.
     Slot(usize, bool),
     Depth,
+    /// Each colour slot, then the depth, for [`CYCLE_FRAMES`] presented
+    /// frames each, round and round (to tell the slots apart).
+    Cycle,
 }
+
+/// Presented frames each texture is shown for by [`View::Cycle`].
+const CYCLE_FRAMES: u64 = 16;
 
 pub(crate) fn parse(value: &str) -> Option<View> {
     match value.trim().to_ascii_lowercase().as_str() {
         "albedo" | "color" | "colour" => Some(View::Slot(ALBEDO_SLOT, false)),
         "normals" | "normal" => Some(View::Slot(NORMALS_SLOT, true)),
         "depth" => Some(View::Depth),
+        "cycle" => Some(View::Cycle),
         other => other
             .strip_prefix("rt")
             .and_then(|n| n.parse().ok())
@@ -73,7 +80,10 @@ fn view() -> Option<View> {
         let view = parse(&raw);
         match view {
             Some(view) => tracing::info!(?view, "debug view: the G-buffer is shown instead of the scene"),
-            None => tracing::warn!(value = raw, "VICTORY_DEBUG_VIEW: not albedo, normals, depth or rt0-rt7"),
+            None => tracing::warn!(
+                value = raw,
+                "VICTORY_DEBUG_VIEW: not albedo, normals, depth, cycle or rt0-rt7"
+            ),
         }
         view
     })
@@ -135,11 +145,13 @@ static STATE: Mutex<State> = Mutex::new(State {
 static FIRST_SHOWN: AtomicU64 = AtomicU64::new(0);
 
 /// Diagnostics captures: every 64th presented frame from the first one the
-/// debug view showed, so a run saves the view without listing frames.
+/// debug view showed (with [`View::Cycle`], the first frame of each
+/// texture), so a run saves the view without listing frames.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn capture_wanted(frame: u64) -> bool {
     let first = FIRST_SHOWN.load(Relaxed);
-    first != 0 && frame >= first && (frame - first) % 64 == 0
+    let every = if view() == Some(View::Cycle) { CYCLE_FRAMES } else { 64 };
+    first != 0 && frame >= first && (frame - first) % every == 0
 }
 
 /// The format to sample a host texture in: a depth's red plane, a typed
@@ -239,8 +251,25 @@ pub(crate) fn take(frame: u64) -> Option<(Arc<HostTexture>, DXGI_FORMAT, Mode)> 
     if frame.saturating_sub(pass.frame) > HOLD_FRAMES {
         return None;
     }
+    let first = match FIRST_SHOWN.compare_exchange(0, frame, Relaxed, Relaxed) {
+        Ok(_) => frame,
+        Err(first) => first,
+    };
+    let view = match view {
+        View::Cycle => {
+            let used = pass.count() as u64;
+            let k = ((frame - first) / CYCLE_FRAMES % (used + 1)) as usize;
+            pass.colors
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.is_some())
+                .nth(k)
+                .map_or(View::Depth, |(n, _)| View::Slot(n, false))
+        }
+        view => view,
+    };
     let (held, mode) = match view {
-        View::Depth => (pass.depth.clone(), Mode::Depth),
+        View::Depth | View::Cycle => (pass.depth.clone(), Mode::Depth),
         View::Slot(n, normals) => {
             let held = pass.colors.get(n)?.clone()?;
             // Unsigned normalized normals are stored mapped already.
@@ -272,7 +301,6 @@ pub(crate) fn take(frame: u64) -> Option<(Arc<HostTexture>, DXGI_FORMAT, Mode)> 
             "debug view: showing the G-buffer pass's texture"
         );
         state.logged = Some(key);
-        let _ = FIRST_SHOWN.compare_exchange(0, frame, Relaxed, Relaxed);
     }
     Some((held.copy, held.format, mode))
 }
@@ -286,6 +314,7 @@ mod tests {
         assert_eq!(parse("albedo"), Some(View::Slot(ALBEDO_SLOT, false)));
         assert_eq!(parse(" Normals"), Some(View::Slot(NORMALS_SLOT, true)));
         assert_eq!(parse("depth"), Some(View::Depth));
+        assert_eq!(parse("cycle"), Some(View::Cycle));
         assert_eq!(parse("rt4"), Some(View::Slot(4, false)));
         assert_eq!(parse("rt8"), None);
         assert_eq!(parse("lit"), None);
