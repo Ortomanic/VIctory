@@ -169,6 +169,14 @@ fn wait_for_lent_slots() -> bool {
     got
 }
 
+/// `VICTORY_LEND_SLOTS=0`: a list keeps its dynamic slots until it is
+/// reset (the behaviour before: the world ran out of them within its first
+/// frame, and the draws needing more were dropped).
+fn lend_slots() -> bool {
+    static LEND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEND.get_or_init(|| std::env::var("VICTORY_LEND_SLOTS").map_or(true, |v| v != "0"))
+}
+
 /// `VICTORY_SHARE_TABLES=0`: tables made afresh are not shared between
 /// lists (each list makes its own, as before).
 fn share_tables() -> bool {
@@ -351,7 +359,7 @@ impl State {
     /// title runs again and again keeps them).
     pub(crate) fn after_run(&mut self) {
         self.runs += 1;
-        if self.runs > 1 || self.lent || self.lost {
+        if self.runs > 1 || self.lent || self.lost || !lend_slots() {
             return;
         }
         let mut lent = 0;
