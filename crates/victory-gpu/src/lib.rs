@@ -54,9 +54,13 @@ pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod upscale;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use upscale::upscale;
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};

@@ -195,6 +195,15 @@ impl State {
         };
     }
 
+    /// Our own commands replaced the host list's heaps, root signatures
+    /// and pipeline: the title's are set again at its next draw or
+    /// dispatch.
+    pub(crate) fn host_bindings_lost(&mut self) {
+        self.host_heaps = [usize::MAX; 2];
+        self.host_roots = [0; 2];
+        self.host_pipeline = 0;
+    }
+
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
     }

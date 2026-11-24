@@ -126,6 +126,15 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
+/// [`with_state`] for other modules of this crate.
+#[cfg(windows)]
+pub(crate) fn with_state_pub(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
+    with_state(this, f);
+}
+
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.

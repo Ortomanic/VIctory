@@ -15,6 +15,8 @@ pub mod d3d12x;
 pub mod display;
 pub mod dsp;
 #[cfg(windows)]
+pub mod ffx;
+#[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
 pub mod files;
@@ -60,6 +62,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(media::module());
     #[cfg(windows)]
     all.push(dstorage::module());
+    #[cfg(windows)]
+    all.push(ffx::module());
     #[cfg(windows)]
     all.push(files::module());
     #[cfg(windows)]
