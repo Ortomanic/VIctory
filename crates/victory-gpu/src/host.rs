@@ -1301,6 +1301,12 @@ impl HostList {
         self.bindless.fetch_or(bits, Ordering::Relaxed);
     }
 
+    /// Whether shaders of the list index the heap from data
+    /// ([`HostList::note_bindless`]).
+    pub(crate) fn bindless(&self) -> bool {
+        self.bindless.load(Ordering::Relaxed) != 0
+    }
+
     /// Notes a pipeline the list binds.
     pub(crate) fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());

@@ -135,9 +135,21 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 /// copied itself ([`host::HostHeap::sync`]), before a submission runs.
 /// `VICTORY_SYNC_HEAPS=0` turns it off (diagnostics A/B).
 #[cfg(windows)]
-pub(crate) fn sync_shader_heaps() {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *OFF.get_or_init(|| std::env::var("VICTORY_SYNC_HEAPS").is_ok_and(|v| v.trim() == "0")) {
+pub(crate) fn sync_shader_heaps(bindless: bool) {
+    // `VICTORY_SYNC_HEAPS`: 0 never, `all` before every submission; by
+    // default only before submissions whose shaders index the heap from
+    // data, the reads this is for (tables mirror their slots when a draw
+    // names them). A slot changed meanwhile keeps its old record in `seen`
+    // and is mirrored at the next such submission. Each sync reads every
+    // slot of every heap (~1 million, 2-4 ms): at ~30 submissions a world
+    // frame, ~90 ms of it.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_SYNC_HEAPS").as_deref().map(str::trim) {
+        Ok("0") => 0,
+        Ok("all") => 2,
+        _ => 1,
+    });
+    if mode == 0 || (mode == 1 && !bindless) {
         return;
     }
     let started = std::time::Instant::now();
