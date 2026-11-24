@@ -1203,11 +1203,7 @@ impl State {
     fn pass_log(&self, kind: &str, count: u32, compute: bool) {
         // `VICTORY_PASS_LOG=<n>` with n > 1: every nth frame too (runs that
         // stop early may never reach a listed one).
-        static ON: std::sync::OnceLock<(bool, u64)> = std::sync::OnceLock::new();
-        let (on, every) = *ON.get_or_init(|| match std::env::var("VICTORY_PASS_LOG") {
-            Ok(v) => (true, v.trim().parse().ok().filter(|&n: &u64| n > 1).unwrap_or(0)),
-            Err(_) => (false, 0),
-        });
+        let (on, every) = pass_log();
         let frame = crate::queue::presented() + 1;
         if !on || !(crate::capture::listed(frame) || (every > 0 && frame.is_multiple_of(every))) {
             return;
@@ -1429,7 +1425,7 @@ impl State {
         // count (diagnostics).
         #[cfg(feature = "diagnostics")]
         if crate::capture::listed(crate::queue::presented() + 1)
-            && std::env::var_os("VICTORY_PASS_LOG").is_some()
+            && pass_log().0
         {
             let words = |at: u64, n: usize| -> Option<Vec<u32>> {
                 crate::texture::committed(at as *const u8, n * 4).then(|| {
@@ -1634,6 +1630,42 @@ impl State {
     }
 }
 
+/// `VICTORY_PASS_LOG`: whether it is on, and its `<n>` (every nth frame
+/// too, if over 1).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn pass_log() -> (bool, u64) {
+    let v = PASS_LOG.get(|| parse_pass_log(std::env::var("VICTORY_PASS_LOG").ok().as_deref()));
+    (v > 0, if v > 1 { v } else { 0 })
+}
+
+/// 0 off, 1 on, n > 1 on and every nth frame.
+#[cfg(feature = "diagnostics")]
+static PASS_LOG: crate::live::Number = crate::live::Number::new();
+
+#[cfg(feature = "diagnostics")]
+fn parse_pass_log(value: Option<&str>) -> u64 {
+    value.map_or(0, |v| v.trim().parse().ok().filter(|&n: &u64| n > 1).unwrap_or(1))
+}
+
+/// Live controls: `VICTORY_PASS_LOG` from now on.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_pass_log(value: Option<&str>) {
+    PASS_LOG.set(parse_pass_log(value));
+}
+
+/// Live controls: `VICTORY_ARGS_PROBE` from now on.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_args_probe(value: Option<&str>) {
+    args_probe::set(value);
+}
+
+/// `VICTORY_ARGS_PROBE`'s n (0: off).
+#[cfg(feature = "diagnostics")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn args_probe_every() -> u64 {
+    args_probe::every()
+}
+
 /// With `VICTORY_PASS_LOG` (diagnostics): the first record of each indirect
 /// execution of listed frames as the GPU read it before the argument clamp
 /// and after it (with the list's budget word then), copied from the host
@@ -1670,16 +1702,23 @@ mod args_probe {
     /// `VICTORY_ARGS_PROBE=<n>`: also every `n`th frame (without the pass
     /// log or listed frames; runs that stop early may never reach a listed
     /// one).
-    fn every() -> u64 {
-        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        *EVERY.get_or_init(|| {
-            std::env::var("VICTORY_ARGS_PROBE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
-        })
+    pub(crate) fn every() -> u64 {
+        EVERY.get(|| parse(std::env::var("VICTORY_ARGS_PROBE").ok().as_deref()))
+    }
+
+    static EVERY: crate::live::Number = crate::live::Number::new();
+
+    fn parse(value: Option<&str>) -> u64 {
+        value.and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    }
+
+    /// Live controls: `VICTORY_ARGS_PROBE` from now on.
+    pub(crate) fn set(value: Option<&str>) {
+        EVERY.set(parse(value));
     }
 
     fn on() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_PASS_LOG").is_some() || every() > 0)
+        super::pass_log().0 || every() > 0
     }
 
     fn probed(frame: u64) -> bool {

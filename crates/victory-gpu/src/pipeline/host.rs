@@ -254,7 +254,11 @@ const QUADS: i32 = 32;
 
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) shader: Arc<Shader>,
+    /// Its translation as the pipeline was made from it (live controls may
+    /// translate the shader again meanwhile).
+    translation: Arc<Translated>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
@@ -265,9 +269,7 @@ pub(crate) struct Stage {
 
 impl Stage {
     pub(crate) fn translated(&self) -> &Translated {
-        self.shader
-            .translated()
-            .expect("host pipelines are made from translated shaders")
+        &self.translation
     }
 }
 
@@ -289,6 +291,9 @@ pub(crate) struct HostPipeline {
     /// rectangle from its three vertices: its draws run as triangle lists
     /// with the title's own vertex counts.
     pub(crate) rect_gs: bool,
+    /// Made with our debug pixel shader in place of the title's.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) debug_ps: bool,
 }
 
 /// `VICTORY_DEBUG_PS=1`: graphics pipelines that draw depth-tested
@@ -296,22 +301,51 @@ pub(crate) struct HostPipeline {
 /// slope, instead of the title's: the geometry of every draw whose vertex
 /// or mesh stage translates, lit or not, its pixel shader translated or not.
 pub(crate) fn debug_ps() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    use std::sync::atomic::Ordering::Relaxed;
+    // 0: not read yet, 1: off, 2: on.
+    if DEBUG_PS.load(Relaxed) == 0 {
         let on = std::env::var_os("VICTORY_DEBUG_PS").is_some();
-        if on {
+        if DEBUG_PS.compare_exchange(0, 1 + u8::from(on), Relaxed, Relaxed).is_ok() && on {
             tracing::info!("graphics pipelines draw with the debug pixel shader (VICTORY_DEBUG_PS)");
         }
-        on
-    })
+    }
+    DEBUG_PS.load(Relaxed) == 2
+}
+
+static DEBUG_PS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static PS_FALLBACK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Live controls: [`debug_ps`] as `VICTORY_DEBUG_PS` set (`Some`, any
+/// value) or not; pipelines made since use it.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_debug_ps(value: Option<&str>) {
+    DEBUG_PS.store(1 + u8::from(value.is_some()), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Live controls: [`ps_fallback`] as `VICTORY_PS_FALLBACK=value` would set it.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_ps_fallback(value: Option<&str>) {
+    let on = value.is_none_or(|v| v != "0");
+    PS_FALLBACK.store(1 + u8::from(on), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether geometry whose pixel shader does not translate (or is refused)
 /// is drawn with the debug pixel shader instead of dropped: on unless
 /// `VICTORY_PS_FALLBACK=0`.
-fn ps_fallback() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PS_FALLBACK").map_or(true, |v| v != "0"))
+pub(crate) fn ps_fallback() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if PS_FALLBACK.load(Relaxed) == 0 {
+        let on = std::env::var("VICTORY_PS_FALLBACK").map_or(true, |v| v != "0");
+        let _ = PS_FALLBACK.compare_exchange(0, 1 + u8::from(on), Relaxed, Relaxed);
+    }
+    PS_FALLBACK.load(Relaxed) == 2
+}
+
+/// Whether [`HostPipeline::new`] may draw the pipeline's geometry with the
+/// debug pixel shader (graphics state drawing depth-tested geometry, and a
+/// pixel shader of the title's).
+pub(crate) fn draws_geometry(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> bool {
+    g.is_some_and(GraphicsState::draws_geometry) && shaders.iter().any(|s| s.stage == "pixel")
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -333,9 +367,7 @@ impl HostPipeline {
     /// title's where ours is refused), so its geometry is drawn rather than
     /// dropped (`VICTORY_PS_FALLBACK=0` turns that off).
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
-        let geometry = g.is_some_and(GraphicsState::draws_geometry)
-            && shaders.iter().any(|s| s.stage == "pixel");
-        if !geometry {
+        if !draws_geometry(shaders, g) {
             return Self::make(shaders, g, false);
         }
         let first = debug_ps();
@@ -391,19 +423,19 @@ impl HostPipeline {
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
-        for (s, _) in &stages {
-            s.translated()?;
-        }
+        let translations: Vec<Arc<Translated>> =
+            stages.iter().map(|(s, _)| s.translated()).collect::<Option<_>>()?;
         let host = host()?;
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
-        for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+        for (&(shader, visibility), translation) in stages.iter().zip(&translations) {
+            let t = &translation.host;
             let mut stage = Stage {
                 shader: shader.clone(),
+                translation: translation.clone(),
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
@@ -494,7 +526,7 @@ impl HostPipeline {
                     BytecodeLength: d.dxil.len(),
                 };
             }
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            translations.get(i).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
                     pShaderBytecode: t.host.dxil.as_ptr().cast(),
@@ -537,6 +569,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rect_gs: false,
+                debug_ps: debug.is_some(),
             });
         }
         let Some(g) = g else {
@@ -570,6 +603,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rect_gs: false,
+                debug_ps: debug.is_some(),
             });
         }
 
@@ -663,6 +697,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             rect_gs: gs.is_some(),
+            debug_ps: debug.is_some(),
         })
     }
 }

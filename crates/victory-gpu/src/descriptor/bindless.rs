@@ -83,10 +83,15 @@ fn with<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
 /// Whether every bindless submission brings every range up to date
 /// (`VICTORY_BINDLESS_REFRESH=submission`), not once per frame.
 pub(crate) fn every_submission() -> bool {
-    static EVERY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
-        std::env::var("VICTORY_BINDLESS_REFRESH").is_ok_and(|v| v.trim() == "submission")
-    })
+    EVERY.get(|| std::env::var("VICTORY_BINDLESS_REFRESH").is_ok_and(|v| v.trim() == "submission"))
+}
+
+static EVERY: crate::live::Flag = crate::live::Flag::new();
+
+/// Live controls: `VICTORY_BINDLESS_REFRESH=submission` or not, from now on.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_every_submission(on: bool) {
+    EVERY.set(on);
 }
 
 /// What one submission brings up to date for bindless reads.

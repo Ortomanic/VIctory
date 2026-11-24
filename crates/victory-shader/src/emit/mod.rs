@@ -130,13 +130,47 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// 32-lane hosts (otherwise they keep needing 64-lane waves, which such
 /// hosts refuse). With the `diagnostics` feature, `VICTORY_WAVE64_UNIFORM=0`
 /// turns it off, to tell whether that form is behind a host GPU hang. Part
-/// of the translation: the shader cache keys on it.
+/// of the translation: the shader cache keys on it, and a translation that
+/// asked notes [`SETTING_WAVE64_UNIFORM`] in [`HostShader::settings`].
+/// [`set_wave64_uniform`] changes it at run time (live controls).
 pub fn wave64_uniform() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !cfg!(feature = "diagnostics")
-            || std::env::var("VICTORY_WAVE64_UNIFORM").map_or(true, |v| v.trim() != "0")
-    })
+    use std::sync::atomic::Ordering::Relaxed;
+    note_setting(SETTING_WAVE64_UNIFORM);
+    // 0: not read yet, 1: off, 2: on.
+    match WAVE64_UNIFORM.load(Relaxed) {
+        0 => {
+            let on = !cfg!(feature = "diagnostics")
+                || std::env::var("VICTORY_WAVE64_UNIFORM").map_or(true, |v| v.trim() != "0");
+            let _ = WAVE64_UNIFORM.compare_exchange(0, 1 + u8::from(on), Relaxed, Relaxed);
+            WAVE64_UNIFORM.load(Relaxed) == 2
+        }
+        v => v == 2,
+    }
+}
+
+static WAVE64_UNIFORM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets [`wave64_uniform`] from now on (`diagnostics` builds only: others
+/// keep it on). Translations made before keep the old form; the caller
+/// translates those that asked ([`SETTING_WAVE64_UNIFORM`]) again.
+pub fn set_wave64_uniform(on: bool) {
+    let on = on || !cfg!(feature = "diagnostics");
+    WAVE64_UNIFORM.store(1 + u8::from(on), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`HostShader::settings`]: the translation asked [`wave64_uniform`].
+pub const SETTING_WAVE64_UNIFORM: u8 = 1;
+/// [`HostShader::settings`]: the translation asked [`loop_limit`] (it has
+/// loops).
+pub const SETTING_LOOP_LIMIT: u8 = 2;
+
+thread_local! {
+    /// The run-time settings the translation running on this thread asked.
+    static SETTINGS_READ: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn note_setting(bit: u8) {
+    SETTINGS_READ.with(|s| s.set(s.get() | bit));
 }
 
 /// Scalar buffer loads through a descriptor fetched from the heap read its
@@ -144,11 +178,35 @@ pub fn wave64_uniform() -> bool {
 /// puts a constant buffer view in a heap slot (a title CBV becomes a raw SRV
 /// there), so a CBV handle on such a slot has the wrong descriptor type. On by
 /// default; `VICTORY_SMEM_HEAP_RAW=0` restores the CBV handle for A/B. Part of
-/// the translation: the shader cache keys on it.
+/// the translation: the shader cache keys on it, and a translation that asked
+/// notes [`SETTING_SMEM_HEAP_RAW`] in [`HostShader::settings`].
+/// [`set_smem_heap_raw`] changes it at run time (live controls).
 pub fn smem_heap_raw() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_SMEM_HEAP_RAW").map_or(true, |v| v.trim() != "0"))
+    use std::sync::atomic::Ordering::Relaxed;
+    note_setting(SETTING_SMEM_HEAP_RAW);
+    // 0: not read yet, 1: off, 2: on.
+    match SMEM_HEAP_RAW.load(Relaxed) {
+        0 => {
+            let on = std::env::var("VICTORY_SMEM_HEAP_RAW").map_or(true, |v| v.trim() != "0");
+            let _ = SMEM_HEAP_RAW.compare_exchange(0, 1 + u8::from(on), Relaxed, Relaxed);
+            SMEM_HEAP_RAW.load(Relaxed) == 2
+        }
+        v => v == 2,
+    }
 }
+
+static SMEM_HEAP_RAW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets [`smem_heap_raw`] from now on. Translations made before keep the
+/// old reads; the caller translates those that asked
+/// ([`SETTING_SMEM_HEAP_RAW`]) again.
+pub fn set_smem_heap_raw(on: bool) {
+    SMEM_HEAP_RAW.store(1 + u8::from(on), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`HostShader::settings`]: the translation asked [`smem_heap_raw`] (it
+/// has a scalar load through a heap-fetched descriptor).
+pub const SETTING_SMEM_HEAP_RAW: u8 = 4;
 
 /// `VICTORY_STRICT_PHIS=1`: a program that lowers only without upstream
 /// #612's transitive phi liveness is refused, as upstream does, instead of
@@ -169,14 +227,37 @@ pub fn strict_phis() -> bool {
 /// such loops are what makes a frame slow. The value is part of the
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
 pub fn loop_limit() -> u32 {
-    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
-        } else {
-            lower::LOOP_LIMIT
+    use std::sync::atomic::Ordering::Relaxed;
+    note_setting(SETTING_LOOP_LIMIT);
+    match LOOP_LIMIT.load(Relaxed) {
+        0 => {
+            let limit = if cfg!(feature = "diagnostics") {
+                parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
+            } else {
+                lower::LOOP_LIMIT
+            };
+            let _ = LOOP_LIMIT.compare_exchange(0, limit, Relaxed, Relaxed);
+            LOOP_LIMIT.load(Relaxed)
         }
-    })
+        limit => limit,
+    }
+}
+
+/// 0: not read yet.
+static LOOP_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Sets [`loop_limit`] from now on as `VICTORY_SHADER_LOOP_LIMIT=value`
+/// would (unset or unreadable: the default; `diagnostics` builds only), and
+/// returns it. Translations made before keep the old limit; the caller
+/// translates those that asked ([`SETTING_LOOP_LIMIT`]) again.
+pub fn set_loop_limit(value: Option<&str>) -> u32 {
+    let limit = if cfg!(feature = "diagnostics") {
+        parse_loop_limit(value)
+    } else {
+        lower::LOOP_LIMIT
+    };
+    LOOP_LIMIT.store(limit, std::sync::atomic::Ordering::Relaxed);
+    limit
 }
 
 /// How the host runs compute waves, which decides how console wave64
@@ -333,6 +414,11 @@ pub struct HostShader {
     /// Translated only with joins zero-filled that upstream #612 refuses
     /// (a stopgap, `lower::lower_as`; probably wrong data on those paths).
     pub zero_filled_phis: bool,
+    /// The run-time settings the translation depends on
+    /// ([`SETTING_WAVE64_UNIFORM`], [`SETTING_LOOP_LIMIT`],
+    /// [`SETTING_SMEM_HEAP_RAW`]): what to
+    /// translate again when one changes.
+    pub settings: u8,
 }
 
 /// [`HostShader::bindless`]: reads through descriptors from data.
@@ -570,6 +656,7 @@ fn emit_program(
         }
         _ => 0,
     };
+    let outer = SETTINGS_READ.with(|s| s.replace(0));
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -583,7 +670,9 @@ fn emit_program(
         host_wave32: opts.host_wave32,
         root_bounds: opts.root_bounds,
         heap_views: opts.heap_views,
-    })?;
+    });
+    let settings = SETTINGS_READ.with(|s| s.replace(outer));
+    let l = l?;
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -606,6 +695,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         bindless: bindless(p, res, &native.layout),
         zero_filled_phis: l.zero_filled_phis,
+        settings,
     })
 }
 
@@ -781,6 +871,7 @@ pub fn debug_ps(targets: u32) -> HostShader {
         root_uavs: Vec::new(),
         bindless: 0,
         zero_filled_phis: false,
+        settings: 0,
     }
 }
 
@@ -1274,6 +1365,7 @@ mod tests {
             root_uavs: Vec::new(),
             bindless: 0,
             zero_filled_phis: false,
+            settings: 0,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1287,6 +1379,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 bindless: 0,
                 zero_filled_phis: false,
+                settings: 0,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

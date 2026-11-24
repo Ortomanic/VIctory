@@ -441,8 +441,16 @@ pub(crate) fn dred_on() -> bool {
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+    TIMING.get(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+}
+
+#[cfg(feature = "diagnostics")]
+static TIMING: crate::live::Flag = crate::live::Flag::new();
+
+/// Live controls: `VICTORY_GPU_TIMING` from now on.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_timing(on: bool) {
+    TIMING.set(on);
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -2847,11 +2855,28 @@ unsafe impl Send for Crumbs {}
 unsafe impl Sync for Crumbs {}
 
 #[cfg(feature = "diagnostics")]
+static BREADCRUMBS: crate::live::Flag = crate::live::Flag::new();
+
+/// Live controls: `VICTORY_GPU_BREADCRUMBS` from now on (lists recorded
+/// from now on); its buffer is made once, at the first use.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_breadcrumbs(on: bool) -> String {
+    BREADCRUMBS.set(on);
+    if on && !dred_on() {
+        return "no effect: VICTORY_D3D12_DRED was not set at start".into();
+    }
+    String::new()
+}
+
+#[cfg(feature = "diagnostics")]
 fn breadcrumbs() -> Option<&'static Crumbs> {
+    if !BREADCRUMBS.get(|| std::env::var_os("VICTORY_GPU_BREADCRUMBS").is_some()) {
+        return None;
+    }
     static CRUMBS: OnceLock<Option<Crumbs>> = OnceLock::new();
     CRUMBS
         .get_or_init(|| {
-            if !dred_on() || std::env::var_os("VICTORY_GPU_BREADCRUMBS").is_none() {
+            if !dred_on() {
                 return None;
             }
             let device = &host()?.device;

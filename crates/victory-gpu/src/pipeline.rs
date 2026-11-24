@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -61,8 +61,14 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// The translation once made (`None` inside: it does not translate).
+    /// Live controls clear it to have the shader translated again; host
+    /// pipelines keep the translation they were made from.
     #[cfg(windows)]
-    translated: OnceLock<Option<Translated>>,
+    translated: std::sync::RwLock<Option<Option<Arc<Translated>>>>,
+    /// Held while translating, so a shader is translated once at a time.
+    #[cfg(windows)]
+    translating: Mutex<()>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -87,7 +93,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
-                translated: OnceLock::new(),
+                translated: std::sync::RwLock::new(None),
+                #[cfg(windows)]
+                translating: Mutex::new(()),
             })
         })
         .clone()
@@ -103,46 +111,81 @@ pub(crate) struct Translated {
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
-    /// translate is logged once.
-    pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
-            .get_or_init(|| {
-                let patches = code_patches(&self.hash);
-                let done = if bvh_skinning(&self.hash) {
-                    Err(BVH_SKINNING.to_owned())
-                } else if !patches.is_empty() {
-                    tracing::warn!(hash = %self.hash, ?patches, "VICTORY_PATCH_CODE: console words replaced");
-                    translate_patched(&self.container, &patches)
-                } else {
-                    translate(&self.container)
-                };
-                match &done {
-                    Ok(t) => {
-                        tracing::info!(
-                            stage = self.stage,
-                            hash = %self.hash,
-                            user_data = t.host.user_data.len(),
-                            samplers = t.host.samplers.len(),
-                            "shader translated"
-                        );
-                        if t.host.zero_filled_phis {
-                            tracing::info!(
-                                stage = self.stage,
-                                hash = %self.hash,
-                                "#612 fallback: zero-filled live phi"
-                            );
-                        }
-                    }
-                    Err(e) => tracing::warn!(
+    /// translate is logged once (per translation: live controls may have
+    /// it translated again).
+    pub(crate) fn translated(&self) -> Option<Arc<Translated>> {
+        if let Some(done) = &*self.translated.read().unwrap_or_else(|e| e.into_inner()) {
+            return done.clone();
+        }
+        let _translating = self.translating.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(done) = &*self.translated.read().unwrap_or_else(|e| e.into_inner()) {
+            return done.clone();
+        }
+        let done = self.translate().map(Arc::new);
+        *self.translated.write().unwrap_or_else(|e| e.into_inner()) = Some(done.clone());
+        done
+    }
+
+    /// Whether the shader was translated and failed (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn failed(&self) -> bool {
+        matches!(&*self.translated.read().unwrap_or_else(|e| e.into_inner()), Some(None))
+    }
+
+    /// Live controls: forgets the translation (after one in progress), so
+    /// the next use translates again with the settings of now. Whether
+    /// there was one.
+    #[cfg(feature = "diagnostics")]
+    fn forget(&self) -> bool {
+        let _translating = self.translating.lock().unwrap_or_else(|e| e.into_inner());
+        self.translated.write().unwrap_or_else(|e| e.into_inner()).take().is_some()
+    }
+
+    /// The run-time translation settings its translation asked
+    /// (`victory_shader::emit::SETTING_*`; 0 if not translated).
+    #[cfg(feature = "diagnostics")]
+    fn settings(&self) -> u8 {
+        match &*self.translated.read().unwrap_or_else(|e| e.into_inner()) {
+            Some(Some(t)) => t.host.settings,
+            _ => 0,
+        }
+    }
+
+    fn translate(&self) -> Option<Translated> {
+        let patches = code_patches(&self.hash);
+        let done = if bvh_skinning(&self.hash) {
+            Err(BVH_SKINNING.to_owned())
+        } else if !patches.is_empty() {
+            tracing::warn!(hash = %self.hash, ?patches, "VICTORY_PATCH_CODE: console words replaced");
+            translate_patched(&self.container, &patches)
+        } else {
+            translate(&self.container)
+        };
+        match &done {
+            Ok(t) => {
+                tracing::info!(
+                    stage = self.stage,
+                    hash = %self.hash,
+                    user_data = t.host.user_data.len(),
+                    samplers = t.host.samplers.len(),
+                    "shader translated"
+                );
+                if t.host.zero_filled_phis {
+                    tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                        "#612 fallback: zero-filled live phi"
+                    );
                 }
-                done.ok()
-            })
-            .as_ref()
+            }
+            Err(e) => tracing::warn!(
+                stage = self.stage,
+                hash = %self.hash,
+                error = %e,
+                "shader does not translate; its pipelines' draws are dropped"
+            ),
+        }
+        done.ok()
     }
 }
 
@@ -219,10 +262,12 @@ const BVH_SKINNING: &str =
 /// they are not to run (unless `VICTORY_BVH_SKINNING=1`).
 #[cfg(windows)]
 fn bvh_skinning(hash: &str) -> bool {
-    static RUN: OnceLock<bool> = OnceLock::new();
-    let run = *RUN.get_or_init(|| std::env::var("VICTORY_BVH_SKINNING").is_ok_and(|v| v == "1"));
-    !run && BVH_SKINNING_SHADERS.contains(&hash)
+    !BVH_RUN.get(|| std::env::var("VICTORY_BVH_SKINNING").ok().as_deref() == Some("1"))
+        && BVH_SKINNING_SHADERS.contains(&hash)
 }
+
+#[cfg(windows)]
+static BVH_RUN: crate::live::Flag = crate::live::Flag::new();
 
 /// With the `diagnostics` feature, `VICTORY_PATCH_CODE` replaces console
 /// code words before translation: `hash@offset=old>new` entries (hex: the
@@ -232,38 +277,46 @@ fn bvh_skinning(hash: &str) -> bool {
 /// Patched shaders bypass the shader cache.
 #[cfg(windows)]
 fn code_patches(hash: &str) -> Vec<(usize, u32, u32)> {
-    static ALL: OnceLock<Vec<(String, usize, u32, u32)>> = OnceLock::new();
-    let all = ALL.get_or_init(|| {
-        if !cfg!(feature = "diagnostics") {
-            return Vec::new();
-        }
-        let value = std::env::var("VICTORY_PATCH_CODE").unwrap_or_default();
-        value
-            .split(',')
-            .filter(|e| !e.trim().is_empty())
-            .filter_map(|e| {
-                let parse = || {
-                    let (hash, rest) = e.trim().split_once('@')?;
-                    let (at, words) = rest.split_once('=')?;
-                    let (old, new) = words.split_once('>')?;
-                    Some((
-                        hash.to_ascii_lowercase(),
-                        usize::from_str_radix(at.trim_start_matches("0x"), 16).ok()?,
-                        u32::from_str_radix(old.trim_start_matches("0x"), 16).ok()?,
-                        u32::from_str_radix(new.trim_start_matches("0x"), 16).ok()?,
-                    ))
-                };
-                let p = parse();
-                if p.is_none() {
-                    tracing::warn!(entry = e, "VICTORY_PATCH_CODE expects hash@offset=old>new");
-                }
-                p
-            })
-            .collect()
-    });
+    let all = PATCHES.get(|| parse_patches(&std::env::var("VICTORY_PATCH_CODE").unwrap_or_default()));
     all.iter()
         .filter(|(h, ..)| h == hash)
         .map(|&(_, at, old, new)| (at, old, new))
+        .collect()
+}
+
+/// `VICTORY_PATCH_CODE`'s entries (none without the `diagnostics` feature).
+#[cfg(windows)]
+type Patches = Vec<(String, usize, u32, u32)>;
+
+#[cfg(windows)]
+static PATCHES: crate::live::Value<Patches> = crate::live::Value::new();
+
+#[cfg(windows)]
+fn parse_patches(value: &str) -> Patches {
+    if !cfg!(feature = "diagnostics") {
+        return Vec::new();
+    }
+    value
+        .split(',')
+        .filter(|e| !e.trim().is_empty())
+        .filter_map(|e| {
+            let parse = || {
+                let (hash, rest) = e.trim().split_once('@')?;
+                let (at, words) = rest.split_once('=')?;
+                let (old, new) = words.split_once('>')?;
+                Some((
+                    hash.to_ascii_lowercase(),
+                    usize::from_str_radix(at.trim_start_matches("0x"), 16).ok()?,
+                    u32::from_str_radix(old.trim_start_matches("0x"), 16).ok()?,
+                    u32::from_str_radix(new.trim_start_matches("0x"), 16).ok()?,
+                ))
+            };
+            let p = parse();
+            if p.is_none() {
+                tracing::warn!(entry = e, "VICTORY_PATCH_CODE expects hash@offset=old>new");
+            }
+            p
+        })
         .collect()
 }
 
@@ -386,18 +439,41 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
-    });
-    if hashes.is_empty() {
+    // Per draw: the common case (nothing skipped) without the lock.
+    if !SKIP_ANY.get(|| !skip_hashes().is_empty()) {
         return None;
     }
+    let hashes = skip_hashes();
     p.shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+static SKIP: crate::live::Value<Vec<String>> = crate::live::Value::new();
+#[cfg(all(windows, feature = "diagnostics"))]
+static SKIP_ANY: crate::live::Flag = crate::live::Flag::new();
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skip_hashes() -> Arc<Vec<String>> {
+    SKIP.get(|| parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default()))
+}
+
+/// The shader hashes skipped now (diagnostics).
+#[cfg(all(windows, feature = "diagnostics", test))]
+pub(crate) fn skip_list() -> Arc<Vec<String>> {
+    skip_hashes()
+}
+
+/// Live controls: `VICTORY_SKIP_PIPELINES` from now on.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn set_skip_pipelines(value: Option<&str>) -> usize {
+    let hashes = parse_skip_hashes(value.unwrap_or_default());
+    let n = hashes.len();
+    SKIP.set(hashes);
+    SKIP_ANY.set(n > 0);
+    n
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -483,6 +559,8 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
+    #[cfg(windows)]
+    make::register(&host);
     make::early(&host);
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
@@ -662,6 +740,155 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+
+/// A host pipeline replaced by a remake: released by [`sweep`] (without
+/// diagnostics, where nothing is remade, once running submissions finish).
+#[cfg(windows)]
+fn replaced(old: Box<Option<host::HostPipeline>>) {
+    #[cfg(feature = "diagnostics")]
+    live::bury(old);
+    #[cfg(not(feature = "diagnostics"))]
+    crate::host::retire(Grave(old));
+}
+
+/// A replaced host pipeline on its way out.
+#[cfg(windows)]
+struct Grave(#[allow(dead_code)] Box<Option<host::HostPipeline>>);
+// SAFETY: D3D12 objects are free-threaded; nothing else reaches it.
+#[cfg(windows)]
+unsafe impl Send for Grave {}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) use live::{
+    remake_for_debug_ps, retranslate_asking, set_bvh_skinning, set_patch_code, set_pipeline_wait,
+    sweep,
+};
+
+/// Live controls (`crate::live`): switches that change translations or
+/// host pipelines.
+#[cfg(all(windows, feature = "diagnostics"))]
+mod live {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Presented frames a replaced host pipeline is kept for: lists
+    /// recorded with it before the remake are submitted by then (the title
+    /// records and submits a frame's lists within it).
+    const KEEP_FRAMES: u64 = 4;
+
+    static GRAVES: Mutex<Vec<(u64, Grave)>> = Mutex::new(Vec::new());
+    static REPLACED: AtomicU64 = AtomicU64::new(0);
+    static RELEASED: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn bury(old: Box<Option<host::HostPipeline>>) {
+        REPLACED.fetch_add(1, Relaxed);
+        let due = crate::queue::presented() + KEEP_FRAMES;
+        GRAVES.lock().unwrap_or_else(|e| e.into_inner()).push((due, Grave(old)));
+    }
+
+    /// At presented frame `frame`: replaced host pipelines kept long enough
+    /// go to [`crate::host::retire`] (dropped once the submissions running
+    /// now have finished).
+    pub(crate) fn sweep(frame: u64) {
+        let due: Vec<Grave> = {
+            let mut graves = GRAVES.lock().unwrap_or_else(|e| e.into_inner());
+            if graves.is_empty() {
+                return;
+            }
+            let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *graves).into_iter().partition(|(at, _)| *at <= frame);
+            *graves = keep;
+            due.into_iter().map(|(_, g)| g).collect()
+        };
+        if due.is_empty() {
+            return;
+        }
+        let released = RELEASED.fetch_add(due.len() as u64, Relaxed) + due.len() as u64;
+        tracing::info!(
+            "live: {} replaced host pipelines released at frame {frame} ({} replaced, {released} released so far)",
+            due.len(),
+            REPLACED.load(Relaxed)
+        );
+        crate::host::retire(due);
+    }
+
+    /// Forgets the translations of the shaders `which` picks and queues a
+    /// remake of the host pipelines made from them: (shaders, pipelines).
+    fn retranslate(which: impl Fn(&Shader) -> bool) -> (usize, usize) {
+        let shaders: Vec<Arc<Shader>> = SHADERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flat_map(|m| m.values())
+            .filter(|s| which(s))
+            .cloned()
+            .collect();
+        let forgotten: std::collections::HashSet<*const Shader> =
+            shaders.iter().filter(|s| s.forget()).map(Arc::as_ptr).collect();
+        if forgotten.is_empty() {
+            return (0, 0);
+        }
+        let pipelines = make::remake_where(|p, _| p.shaders().iter().any(|s| forgotten.contains(&Arc::as_ptr(s))));
+        (forgotten.len(), pipelines)
+    }
+
+    fn summary((shaders, pipelines): (usize, usize)) -> String {
+        format!("{shaders} shaders to translate again, {pipelines} host pipelines remade")
+    }
+
+    /// The translation setting `bit` (`victory_shader::emit::SETTING_*`)
+    /// changed: shaders whose translation asked it are translated again.
+    pub(crate) fn retranslate_asking(bit: u8) -> String {
+        summary(retranslate(|s| s.settings() & bit != 0))
+    }
+
+    /// `VICTORY_PIPELINE_WAIT_MS` from now on: the per-frame pipeline wait
+    /// in milliseconds.
+    pub(crate) fn set_pipeline_wait(value: Option<&str>) -> u64 {
+        make::set_budget(value)
+    }
+
+    /// `VICTORY_PATCH_CODE` from now on: shaders whose patches changed are
+    /// translated again.
+    pub(crate) fn set_patch_code(value: Option<&str>) -> String {
+        let new = parse_patches(value.unwrap_or_default());
+        // Read from the environment first if no translation has yet.
+        code_patches("");
+        let old = PATCHES.set(new.clone()).unwrap_or_default();
+        let entries = |all: &Patches, h: &str| -> Vec<(usize, u32, u32)> {
+            all.iter().filter(|(x, ..)| x == h).map(|&(_, a, o, n)| (a, o, n)).collect()
+        };
+        let mut changed: Vec<String> = old.iter().chain(&new).map(|(h, ..)| h.clone()).collect();
+        changed.sort();
+        changed.dedup();
+        changed.retain(|h| entries(&old, h) != entries(&new, h));
+        format!("{} patch entries; {}", new.len(), summary(retranslate(|s| changed.contains(&s.hash))))
+    }
+
+    /// `VICTORY_BVH_SKINNING` from now on: the BVH skinning shaders are
+    /// translated again (or refused again).
+    pub(crate) fn set_bvh_skinning(value: Option<&str>) -> String {
+        BVH_RUN.set(value == Some("1"));
+        summary(retranslate(|s| BVH_SKINNING_SHADERS.contains(&s.hash.as_str())))
+    }
+
+    /// `VICTORY_DEBUG_PS` (`fallback` false) or `VICTORY_PS_FALLBACK`
+    /// changed: remakes the geometry pipelines whose pixel shader that
+    /// changes (all of them; with `fallback`, those refused or drawing with
+    /// the debug pixel shader though it is off).
+    pub(crate) fn remake_for_debug_ps(fallback: bool) -> String {
+        let debug = host::debug_ps();
+        let n = make::remake_where(|p, made| {
+            host::draws_geometry(p.shaders(), p.graphics.as_deref())
+                && (!fallback
+                    || match made {
+                        Some(None) => true,
+                        Some(Some(h)) => h.debug_ps != debug,
+                        None => false,
+                    })
+        });
+        format!("{n} host pipelines remade")
+    }
+}
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

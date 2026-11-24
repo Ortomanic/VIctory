@@ -63,58 +63,76 @@ pub(crate) fn options() -> victory_shader::emit::Options {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit and root view
-/// bounds, which a diagnostics build can change at run time, and the
-/// host's wave sizes and view heap size).
-fn build() -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
-        let wave32 = options().host_wave32;
-        let root_bounds = options().root_bounds;
-        let heap_views = options().heap_views;
-        let limit = victory_shader::emit::loop_limit();
-        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+/// the translation settings it runs with (the loop limit, uniform wave64
+/// form, raw heap scalar loads and root view bounds, which a diagnostics
+/// build can change at run time, live controls included, and the host's
+/// wave sizes and view heap size).
+fn build() -> [u8; 32] {
+    static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+    let exe = EXE.get_or_init(|| match std::env::current_exe().and_then(std::fs::read) {
+        Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
+        Err(e) => {
+            // Without it no entry can be trusted: a fresh key per run.
+            tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
+            None
+        }
+    });
+    let Some(exe) = exe else {
+        static FRESH: OnceLock<[u8; 32]> = OnceLock::new();
+        return *FRESH.get_or_init(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
+        });
+    };
+    let wave32 = options().host_wave32;
+    let root_bounds = options().root_bounds;
+    let heap_views = options().heap_views;
+    let limit = victory_shader::emit::loop_limit();
+    let uniform = victory_shader::emit::wave64_uniform();
+    let strict = victory_shader::emit::strict_phis();
+    let smem_raw = victory_shader::emit::smem_heap_raw();
+    // Warned once per value seen.
+    static WARNED: std::sync::Mutex<(u32, bool, bool, bool)> =
+        std::sync::Mutex::new((victory_shader::emit::DEFAULT_LOOP_LIMIT, true, false, true));
+    {
+        let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        if warned.0 != limit {
+            tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner");
+        }
+        if warned.1 != uniform && !uniform {
+            tracing::warn!("VICTORY_WAVE64_UNIFORM=0: no uniform wave64 form");
+        }
+        if warned.2 != strict {
+            tracing::warn!("VICTORY_STRICT_PHIS=1: no zero-filled joins (#612 stopgap off)");
+        }
+        if warned.3 != smem_raw && !smem_raw {
             tracing::warn!(
-                limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+                "VICTORY_SMEM_HEAP_RAW=0: scalar loads read heap-fetched descriptors through a CBV handle"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                bytes.extend_from_slice(&heap_views.to_le_bytes());
-                if wave32 {
-                    bytes.extend_from_slice(b"wave32");
-                }
-                if !root_bounds {
-                    bytes.extend_from_slice(b"unbounded root views");
-                }
-                if !victory_shader::emit::wave64_uniform() {
-                    tracing::warn!("VICTORY_WAVE64_UNIFORM=0: no uniform wave64 form");
-                    bytes.extend_from_slice(b"no uniform wave64");
-                }
-                if victory_shader::emit::smem_heap_raw() {
-                    bytes.extend_from_slice(b"smem heap raw");
-                } else {
-                    tracing::warn!("VICTORY_SMEM_HEAP_RAW=0: scalar loads read heap-fetched descriptors through a CBV handle");
-                }
-                if victory_shader::emit::strict_phis() {
-                    tracing::warn!("VICTORY_STRICT_PHIS=1: no zero-filled joins (#612 stopgap off)");
-                    bytes.extend_from_slice(b"strict phis");
-                }
-                *blake3::hash(&bytes).as_bytes()
-            }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
-        }
-    })
+        *warned = (limit, uniform, strict, smem_raw);
+    }
+    let mut bytes = exe.to_vec();
+    bytes.extend_from_slice(&limit.to_le_bytes());
+    bytes.extend_from_slice(&heap_views.to_le_bytes());
+    if wave32 {
+        bytes.extend_from_slice(b"wave32");
+    }
+    if !root_bounds {
+        bytes.extend_from_slice(b"unbounded root views");
+    }
+    if !uniform {
+        bytes.extend_from_slice(b"no uniform wave64");
+    }
+    if smem_raw {
+        bytes.extend_from_slice(b"smem heap raw");
+    }
+    if strict {
+        bytes.extend_from_slice(b"strict phis");
+    }
+    *blake3::hash(&bytes).as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
@@ -124,7 +142,7 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate =
         move |c: &[u8]| victory_shader::emit::translate_with(c, opts).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
 }
@@ -183,7 +201,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -264,6 +282,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     }
     word(&mut out, u32::from(s.bindless));
     word(&mut out, u32::from(s.zero_filled_phis));
+    word(&mut out, u32::from(s.settings));
     out
 }
 
@@ -323,6 +342,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_uavs = r.list()?;
     let bindless = u8::try_from(r.word()?).ok()?;
     let zero_filled_phis = r.word()? != 0;
+    let settings = u8::try_from(r.word()?).ok()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -334,6 +354,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         bindless,
         zero_filled_phis,
+        settings,
     })
 }
 
@@ -363,6 +384,7 @@ mod tests {
             root_uavs: vec![5],
             bindless: victory_shader::emit::BINDLESS_WRITES,
             zero_filled_phis: true,
+            settings: victory_shader::emit::SETTING_LOOP_LIMIT,
         }
     }
 

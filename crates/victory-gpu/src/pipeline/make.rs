@@ -16,7 +16,7 @@
 //! `VICTORY_PIPELINE_WAIT_MS`) is a guess; a pass the title runs only once
 //! and whose pipeline takes longer is lost.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -28,7 +28,14 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
-    made: OnceLock<Option<HostPipeline>>,
+    /// The host pipeline once made (null before; `None` inside: none can
+    /// be made). Live controls replace it: a replaced one is released a
+    /// few frames later, once no draw being recorded or submission running
+    /// can use it (`super::sweep`), so a reference to it stays valid for
+    /// the recording of a command.
+    made: AtomicPtr<Option<HostPipeline>>,
+    /// Held while making: a remake waits for a make in progress.
+    making: Mutex<()>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     key: String,
@@ -40,6 +47,16 @@ pub(crate) struct Pending {
 unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let made = *self.made.get_mut();
+        if !made.is_null() {
+            // SAFETY: our box; the title released the pipeline.
+            drop(unsafe { Box::from_raw(made) });
+        }
+    }
+}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
@@ -53,15 +70,33 @@ impl Pending {
             shaders,
             graphics,
             queued: AtomicBool::new(false),
-            made: OnceLock::new(),
+            made: AtomicPtr::new(std::ptr::null_mut()),
+            making: Mutex::new(()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
     }
 
+    /// What was made, if it was.
+    fn made(&self) -> Option<&Option<HostPipeline>> {
+        let made = self.made.load(Ordering::Acquire);
+        // SAFETY: set from a box that lives until the pending is dropped or
+        // (replaced) until no recording or submission can use it.
+        unsafe { made.as_ref() }
+    }
+
+    /// Makes the host pipeline from the shaders' translations of now,
+    /// replacing one made before.
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        {
+            let _making = self.making.lock().unwrap_or_else(|e| e.into_inner());
+            let made = Box::new(HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+            let old = self.made.swap(Box::into_raw(made), Ordering::AcqRel);
+            if !old.is_null() {
+                // SAFETY: a box of ours, no longer reachable from `made`.
+                super::replaced(unsafe { Box::from_raw(old) });
+            }
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -72,14 +107,14 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
-    match p.made.get() {
+    match p.made() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
                 .iter()
-                .filter(|s| matches!(s.translated.get(), Some(None)))
+                .filter(|s| s.failed())
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
             Some(if failed.is_empty() {
@@ -98,14 +133,38 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 /// `VICTORY_PIPELINE_WAIT_MS` says otherwise (0: never wait, a draw whose
 /// pipeline is not made yet is dropped until it is; one-off passes such as
 /// a colour-grading bake may then be lost).
+/// Live controls change it (`set_budget`).
 fn budget() -> Duration {
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        std::env::var("VICTORY_PIPELINE_WAIT_MS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .map_or(Duration::from_millis(500), Duration::from_millis)
-    })
+    let ms = match BUDGET_MS.load(Ordering::Relaxed) {
+        u64::MAX => {
+            let ms = parse_budget(std::env::var("VICTORY_PIPELINE_WAIT_MS").ok().as_deref());
+            let _ = BUDGET_MS.compare_exchange(u64::MAX, ms, Ordering::Relaxed, Ordering::Relaxed);
+            BUDGET_MS.load(Ordering::Relaxed)
+        }
+        ms => ms,
+    };
+    Duration::from_millis(ms)
+}
+
+/// [`budget`] in milliseconds; `u64::MAX`: not read yet.
+static BUDGET_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// `VICTORY_PIPELINE_WAIT_MS`'s value in milliseconds (unset or unreadable:
+/// 500).
+fn parse_budget(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&ms| ms != u64::MAX)
+        .unwrap_or(500)
+}
+
+/// Sets [`budget`] from now on as `VICTORY_PIPELINE_WAIT_MS=value` would
+/// (live controls) and returns it in milliseconds.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_budget(value: Option<&str>) -> u64 {
+    let ms = parse_budget(value);
+    BUDGET_MS.store(ms, Ordering::Relaxed);
+    ms
 }
 
 /// Pipelines queued and not made yet.
@@ -119,11 +178,11 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    if p.made.get().is_none() {
+    if p.made().is_none() {
         start(p);
         wait(p, crate::frame::current());
     }
-    let made = p.made.get()?.as_ref();
+    let made = p.made()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
@@ -201,7 +260,7 @@ fn wait_in(p: &Pending, frame: u64, spent: &Mutex<Spent>) {
     }
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made().is_none() {
         let rest = budget().saturating_sub(spent().used(Instant::now()));
         if rest.is_zero() {
             break;
@@ -224,9 +283,14 @@ fn wait_in(p: &Pending, frame: u64, spent: &Mutex<Spent>) {
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
 fn queue(p: Arc<Pending>) {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
+    queue_job(p, false);
+}
+
+/// [`queue`]; `remake`: a live controls remake (counted apart).
+fn queue_job(p: Arc<Pending>, remake: bool) {
+    static SENDER: OnceLock<std::sync::mpsc::Sender<(Arc<Pending>, bool)>> = OnceLock::new();
     let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
+        let (sender, receiver) = std::sync::mpsc::channel::<(Arc<Pending>, bool)>();
         let receiver = Arc::new(Mutex::new(receiver));
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
@@ -242,8 +306,14 @@ fn queue(p: Arc<Pending>) {
                     }
                     loop {
                         let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
+                        let Ok((p, remake)) = next else { return };
                         p.make();
+                        #[cfg(feature = "diagnostics")]
+                        if remake {
+                            remade();
+                        }
+                        #[cfg(not(feature = "diagnostics"))]
+                        let _ = remake;
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -257,10 +327,82 @@ fn queue(p: Arc<Pending>) {
         }
         sender
     });
-    if let Err(e) = sender.send(p) {
+    if let Err(e) = sender.send((p, remake)) {
         // No worker: made here instead.
-        e.0.make();
+        e.0.0.make();
         WAITING.fetch_sub(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if remake {
+            remade();
+        }
+    }
+}
+
+/// Every title pipeline (diagnostics: for live controls), pruned of
+/// released ones as it grows.
+#[cfg(feature = "diagnostics")]
+static ALL: Mutex<Vec<std::sync::Weak<Pending>>> = Mutex::new(Vec::new());
+
+/// Notes a title pipeline created (diagnostics).
+pub(crate) fn register(p: &Arc<Pending>) {
+    #[cfg(feature = "diagnostics")]
+    {
+        let mut all = ALL.lock().unwrap_or_else(|e| e.into_inner());
+        if all.len() == all.capacity() {
+            all.retain(|w| w.strong_count() > 0);
+        }
+        all.push(Arc::downgrade(p));
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = p;
+}
+
+/// Live controls: queues a remake of every title pipeline whose host
+/// pipeline was started (made or being made) and that `which` picks; how
+/// many.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn remake_where(which: impl Fn(&Pending, Option<&Option<HostPipeline>>) -> bool) -> usize {
+    let picked: Vec<Arc<Pending>> = {
+        let mut all = ALL.lock().unwrap_or_else(|e| e.into_inner());
+        all.retain(|w| w.strong_count() > 0);
+        all.iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter(|p| p.queued.load(Ordering::Relaxed) && which(p, p.made()))
+            .collect()
+    };
+    let n = picked.len();
+    if n > 0 {
+        REMAKING.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    for p in picked {
+        PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        queue_job(p, true);
+    }
+    n
+}
+
+#[cfg(feature = "diagnostics")]
+impl Pending {
+    pub(crate) fn shaders(&self) -> &[Arc<Shader>] {
+        &self.shaders
+    }
+}
+
+/// Live controls remakes queued and not done.
+#[cfg(feature = "diagnostics")]
+static REMAKING: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static REMADE: AtomicU64 = AtomicU64::new(0);
+
+/// A remake is done: the last of a batch is logged.
+#[cfg(feature = "diagnostics")]
+fn remade() {
+    let total = REMADE.fetch_add(1, Ordering::Relaxed) + 1;
+    if REMAKING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        tracing::info!(
+            "live: host pipelines remade (all queued done) at frame {}, {total} remade so far",
+            crate::queue::presented()
+        );
     }
 }
 
@@ -294,10 +436,10 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.queued.load(Ordering::Relaxed));
         let started = Instant::now();
-        while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
+        while p.made().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
         }
-        assert!(matches!(p.made.get(), Some(None)));
+        assert!(matches!(p.made(), Some(None)));
     }
 
     /// Threads waiting at once share the frame's budget: two waits for

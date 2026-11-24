@@ -135,6 +135,26 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 /// copied itself ([`host::HostHeap::sync`]), before a submission runs.
 /// `VICTORY_SYNC_HEAPS=0` turns it off (diagnostics A/B).
 #[cfg(windows)]
+static SYNC_MODE: crate::live::Number = crate::live::Number::new();
+
+#[cfg(windows)]
+fn sync_mode(value: Option<&str>) -> u64 {
+    match value.map(str::trim) {
+        Some("0") => 0,
+        Some("all") => 2,
+        _ => 1,
+    }
+}
+
+/// Live controls: `VICTORY_SYNC_HEAPS` from now on (`0`, `all`, `full`, or
+/// unset).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn set_sync_heaps(value: Option<&str>) {
+    SYNC_MODE.set(sync_mode(value));
+    host::set_full_scans(value.is_some_and(|v| v.trim() == "full"));
+}
+
+#[cfg(windows)]
 pub(crate) fn sync_shader_heaps(bindless: bool) {
     // `VICTORY_SYNC_HEAPS`: 0 never, `all` before every submission; by
     // default only before submissions whose shaders index the heap from
@@ -143,12 +163,7 @@ pub(crate) fn sync_shader_heaps(bindless: bool) {
     // and is mirrored at the next such submission. Each sync reads every
     // slot of every heap (~1 million, 2-4 ms): at ~30 submissions a world
     // frame, ~90 ms of it.
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_SYNC_HEAPS").as_deref().map(str::trim) {
-        Ok("0") => 0,
-        Ok("all") => 2,
-        _ => 1,
-    });
+    let mode = SYNC_MODE.get(|| sync_mode(std::env::var("VICTORY_SYNC_HEAPS").ok().as_deref()));
     if mode == 0 || (mode == 1 && !bindless) {
         return;
     }

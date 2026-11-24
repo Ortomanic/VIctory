@@ -37,6 +37,7 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+mod live;
 pub mod object;
 pub mod pipeline;
 #[cfg(all(windows, feature = "diagnostics"))]

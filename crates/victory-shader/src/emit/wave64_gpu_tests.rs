@@ -288,6 +288,7 @@ fn build(words: &[u32], threads: [u32; 3], host_wave32: bool) -> (HostShader, lo
         root_uavs: lowered.root_uavs.clone(),
         bindless: 0,
         zero_filled_phis: false,
+        settings: 0,
     };
     (shader, lowered)
 }

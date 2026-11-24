@@ -16,7 +16,7 @@
 //! normal composition comes back.
 
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering::Relaxed},
 };
 
@@ -78,9 +78,10 @@ pub(crate) fn parse(value: &str) -> Option<View> {
 }
 
 fn view() -> Option<View> {
-    static VIEW: OnceLock<Option<View>> = OnceLock::new();
-    *VIEW.get_or_init(|| {
-        let raw = std::env::var("VICTORY_DEBUG_VIEW").ok()?;
+    decode(VIEW.get(|| {
+        let Ok(raw) = std::env::var("VICTORY_DEBUG_VIEW") else {
+            return 0;
+        };
         let view = parse(&raw);
         match view {
             Some(view) => tracing::info!(?view, "debug view: the G-buffer is shown instead of the scene"),
@@ -89,8 +90,47 @@ fn view() -> Option<View> {
                 "VICTORY_DEBUG_VIEW: not albedo, normals, depth, cycle or rt0-rt7"
             ),
         }
-        view
-    })
+        encode(view)
+    }))
+}
+
+/// The view, as [`encode`] gives it (read per binding: an atomic).
+static VIEW: crate::live::Number = crate::live::Number::new();
+
+/// 0 none, 1 depth, 2 cycle, 3 + 2 * slot + normals.
+fn encode(view: Option<View>) -> u64 {
+    match view {
+        None => 0,
+        Some(View::Depth) => 1,
+        Some(View::Cycle) => 2,
+        Some(View::Slot(n, normals)) => 3 + 2 * n as u64 + u64::from(normals),
+    }
+}
+
+fn decode(v: u64) -> Option<View> {
+    match v {
+        0 => None,
+        1 => Some(View::Depth),
+        2 => Some(View::Cycle),
+        v => Some(View::Slot(((v - 3) / 2) as usize, (v - 3) % 2 == 1)),
+    }
+}
+
+/// Live controls: `VICTORY_DEBUG_VIEW` from now on (`None`: off); the pass
+/// tracked so far is let go (it holds the title's textures).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set(value: Option<&str>) -> Result<String, String> {
+    let view = match value {
+        Some(v) => Some(parse(v).ok_or("not albedo, normals, depth, cycle or rt0-rt7")?),
+        None => None,
+    };
+    VIEW.set(encode(view));
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    state.building = None;
+    state.shown = None;
+    state.logged = None;
+    FIRST_SHOWN.store(0, Relaxed);
+    Ok(String::new())
 }
 
 /// Whether a debug view is on (cheap after the first call).
@@ -324,5 +364,14 @@ mod tests {
         assert_eq!(parse("rt4"), Some(View::Slot(4, false)));
         assert_eq!(parse("rt8"), None);
         assert_eq!(parse("lit"), None);
+    }
+
+    #[test]
+    fn views_round_trip_their_encoding() {
+        for v in ["albedo", "normals", "depth", "cycle", "rt0", "rt4", "rt7"] {
+            let view = parse(v);
+            assert_eq!(decode(encode(view)), view, "{v}");
+        }
+        assert_eq!(decode(encode(None)), None);
     }
 }

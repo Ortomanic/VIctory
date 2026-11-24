@@ -532,6 +532,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_uavs: Vec::new(),
         bindless: 0,
         zero_filled_phis: false,
+        settings: 0,
     }
 }
 

@@ -1248,8 +1248,15 @@ impl HostHeap {
 /// `VICTORY_SYNC_HEAPS=full`: heap syncs read every slot, not only those
 /// in pages written since the last.
 fn full_scans() -> bool {
-    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FULL.get_or_init(|| std::env::var("VICTORY_SYNC_HEAPS").is_ok_and(|v| v.trim() == "full"))
+    FULL.get(|| std::env::var("VICTORY_SYNC_HEAPS").is_ok_and(|v| v.trim() == "full"))
+}
+
+static FULL: crate::live::Flag = crate::live::Flag::new();
+
+/// Live controls: `VICTORY_SYNC_HEAPS=full` or not, from now on.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_full_scans(on: bool) {
+    FULL.set(on);
 }
 
 /// Logs `what` the first time it happens.

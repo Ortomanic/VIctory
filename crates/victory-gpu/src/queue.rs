@@ -322,6 +322,8 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     let _presenting = crate::copystat::timed(crate::copystat::C::PresentUs);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::live::poll(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

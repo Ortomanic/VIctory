@@ -419,8 +419,7 @@ fn pass_log(_: This, _: This, _: (u32, u32), _: (u32, u32)) {}
 /// listed frame.
 #[cfg(feature = "diagnostics")]
 fn pass_log(color: This, output: This, render: (u32, u32), size: (u32, u32)) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PASS_LOG").is_some())
+    if !crate::draw::pass_log().0
         || !crate::capture::listed(crate::queue::presented() + 1)
     {
         return;

@@ -20,17 +20,56 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level.
+/// too, and their draws traced at debug level; also frames `k` after the
+/// first scene (`VICTORY_CAPTURE_AFTER_SCENE`) and live controls'
+/// snapshots.
 pub(crate) fn listed(n: u64) -> bool {
-    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    let fixed = LIST.get_or_init(|| {
-        let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
-        list.split(',')
-            .filter_map(|f| f.trim().parse().ok())
-            .collect()
-    })
-    .contains(&n);
-    fixed || after_scene(n)
+    snapshot_of(n)
+        || (FRAMES_ANY.get(|| !fixed().is_empty()) && fixed().contains(&n))
+        || after_scene(n)
+}
+
+fn frame_list(value: Option<&str>) -> Vec<u64> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|f| f.trim().parse().ok())
+        .collect()
+}
+
+static FRAMES: crate::live::Value<Vec<u64>> = crate::live::Value::new();
+static FRAMES_ANY: crate::live::Flag = crate::live::Flag::new();
+static AFTER: crate::live::Value<Vec<u64>> = crate::live::Value::new();
+
+fn fixed() -> Arc<Vec<u64>> {
+    FRAMES.get(|| frame_list(std::env::var("VICTORY_CAPTURE_FRAMES").ok().as_deref()))
+}
+
+/// Live controls: `VICTORY_CAPTURE_FRAMES` from now on.
+pub(crate) fn set_frames(value: Option<&str>) {
+    let list = frame_list(value);
+    FRAMES_ANY.set(!list.is_empty());
+    FRAMES.set(list);
+}
+
+/// Live controls: `VICTORY_CAPTURE_AFTER_SCENE` from now on.
+pub(crate) fn set_after_scene(value: Option<&str>) {
+    AFTER.set(frame_list(value));
+}
+
+/// Live controls' snapshot: frames `SNAPSHOT.0..=SNAPSHOT.1` are listed and
+/// their targets dumped.
+static SNAPSHOT: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
+
+fn snapshot_of(n: u64) -> bool {
+    SNAPSHOT[0].load(Relaxed) <= n && n <= SNAPSHOT[1].load(Relaxed)
+}
+
+/// Live controls: frames `from..=to` listed, their targets dumped.
+pub(crate) fn snapshot(from: u64, to: u64) {
+    SNAPSHOT[0].store(u64::MAX, Relaxed);
+    SNAPSHOT[1].store(to, Relaxed);
+    SNAPSHOT[0].store(from, Relaxed);
 }
 
 /// The frame of the first usable scene depth preview (0 before one).
@@ -40,17 +79,11 @@ static FIRST_SCENE: AtomicU64 = AtomicU64::new(0);
 /// whose scene depth preview was usable count as listed too (the world's
 /// first frame varies from run to run).
 fn after_scene(n: u64) -> bool {
-    static AFTER: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let first = FIRST_SCENE.load(Relaxed);
     first != 0
         && n > first
         && AFTER
-            .get_or_init(|| {
-                let list = std::env::var("VICTORY_CAPTURE_AFTER_SCENE").unwrap_or_default();
-                list.split(',')
-                    .filter_map(|f| f.trim().parse().ok())
-                    .collect()
-            })
+            .get(|| frame_list(std::env::var("VICTORY_CAPTURE_AFTER_SCENE").ok().as_deref()))
             .contains(&(n - first))
 }
 
@@ -269,9 +302,18 @@ fn save_color_readback(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
-fn dump_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+/// Whether frame `n`'s targets are dumped: listed frames with
+/// `VICTORY_DUMP_TARGETS`, live controls' snapshots.
+fn dump_wanted(n: u64) -> bool {
+    folder().is_some()
+        && (snapshot_of(n) || DUMP.get(|| std::env::var_os("VICTORY_DUMP_TARGETS").is_some()) && listed(n))
+}
+
+static DUMP: crate::live::Flag = crate::live::Flag::new();
+
+/// Live controls: `VICTORY_DUMP_TARGETS` from now on.
+pub(crate) fn set_dump(on: bool) {
+    DUMP.set(on);
 }
 
 /// `VICTORY_SHOW_TARGET=<w>x<h>-f<format>[-<n>]`: each frame, the `n`th
@@ -281,17 +323,52 @@ fn dump_on() -> bool {
 /// albedo, say) while the final image is still black. Names as in the
 /// `VICTORY_DUMP_TARGETS` files (`frame-<n>-<i>-<resource>-<w>x<h>-f<f>`).
 fn show_spec() -> Option<(u64, u32, i32, usize)> {
-    static SPEC: std::sync::OnceLock<Option<(u64, u32, i32, usize)>> = std::sync::OnceLock::new();
-    *SPEC.get_or_init(|| {
-        let v = std::env::var("VICTORY_SHOW_TARGET").ok()?;
-        let mut parts = v.split('-');
-        let (w, h) = parts.next()?.split_once('x')?;
-        let f = parts.next()?.strip_prefix('f')?.parse().ok()?;
-        let n = parts.next().map_or(Some(1), |n| n.parse().ok())?;
-        let spec = (w.parse().ok()?, h.parse().ok()?, f, n.max(1));
-        tracing::info!(?spec, "presenting an intermediate target (VICTORY_SHOW_TARGET)");
-        Some(spec)
+    if !SHOW_ANY.get(|| show().is_some()) {
+        return None;
+    }
+    *show()
+}
+
+type ShowSpec = Option<(u64, u32, i32, usize)>;
+static SHOW: crate::live::Value<ShowSpec> = crate::live::Value::new();
+static SHOW_ANY: crate::live::Flag = crate::live::Flag::new();
+
+fn show() -> Arc<ShowSpec> {
+    SHOW.get(|| {
+        let spec = parse_show(&std::env::var("VICTORY_SHOW_TARGET").ok()?);
+        if let Some(spec) = spec {
+            tracing::info!(?spec, "presenting an intermediate target (VICTORY_SHOW_TARGET)");
+        }
+        spec
     })
+}
+
+fn parse_show(v: &str) -> ShowSpec {
+    let mut parts = v.split('-');
+    let (w, h) = parts.next()?.split_once('x')?;
+    let f = parts.next()?.strip_prefix('f')?.parse().ok()?;
+    let n = parts.next().map_or(Some(1), |n| n.parse().ok())?;
+    Some((w.parse().ok()?, h.parse().ok()?, f, n.max(1)))
+}
+
+/// Live controls: `VICTORY_SHOW_TARGET` from now on.
+pub(crate) fn set_show(value: Option<&str>) -> Result<String, String> {
+    let spec = match value {
+        Some(v) => Some(parse_show(v).ok_or("expects <w>x<h>-f<format>[-<n>]")?),
+        None => None,
+    };
+    SHOW.set(spec);
+    SHOW_ANY.set(spec.is_some());
+    // Targets held for a spec no longer wanted are let go.
+    SHOWN.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    Ok(String::new())
+}
+
+static FAST: crate::live::Flag = crate::live::Flag::new();
+
+/// Live controls: `VICTORY_CAPTURE_FAST` from now on.
+pub(crate) fn set_fast(on: bool) {
+    FAST.set(on);
 }
 
 /// The frame being built's targets matching [`show_spec`], in order.
@@ -327,7 +404,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
             }
         }
     }
-    if !dump_on() || !listed(crate::queue::presented() + 1) {
+    if !dump_wanted(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -702,8 +779,7 @@ pub(crate) fn probe(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<ID3D12Resource> {
-    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *FAST.get_or_init(|| matches!(std::env::var("VICTORY_CAPTURE_FAST").as_deref(), Ok("1"))) {
+    if FAST.get(|| matches!(std::env::var("VICTORY_CAPTURE_FAST").as_deref(), Ok("1"))) {
         return None;
     }
     // SAFETY: a live resource.

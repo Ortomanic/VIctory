@@ -162,6 +162,7 @@ fn build_test_cs(body: &[u32], compute: ComputeIo, result_store: &[u32]) -> Host
         root_uavs: lowered.root_uavs,
         bindless: 0,
         zero_filled_phis: false,
+        settings: 0,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
