@@ -840,6 +840,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn computed_barycentrics_interpolate_from_vertices() {
+        // TEXCOORD.x interpolated with I copied through v4, then exported:
+        // GetAttributeAtVertex of a constant-interpolated row and the
+        // perspective-center SV_Barycentrics for I and J.
+        let words = [
+            0x7E08_0300u32, // v_mov_b32 v4, v0
+            0xC808_0004,    // v_interp_p1_f32 v2, v4, attr0.x
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 5,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 1,
+                    mask: 0b11,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 1,
+                }],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        };
+        let element = |name: &str, kind, row| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: if kind == 0 { 2 } else { 4 },
+            usage: 0,
+            half: false,
+        };
+        let inputs = container::signature(
+            &[element("SV_Position", 3, 0), element("TEXCOORD", 0, 1)],
+            true,
+        );
+        let outputs = container::signature(&[element("SV_Target", 16, 0)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &inputs), (FourCC::OSG1, &outputs)]);
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        assert_eq!(io.per_vertex, [1]);
+        let shader = emit(
+            &Container::parse(&bytes).unwrap(),
+            &native,
+            &p,
+            &structure::structure(&p).unwrap(),
+            &io,
+            &resource::track(&p, &native.layout, native.stage).unwrap(),
+        )
+        .unwrap();
+        let container = Container::parse(&shader.dxil).unwrap();
+        let features = u64::from_le_bytes(
+            container
+                .part(FourCC::SFI0)
+                .unwrap()
+                .data
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(features & 0x2_0000, 0x2_0000);
+        let inputs = container.part(FourCC::ISG1).unwrap().data;
+        // SV_Position, TEXCOORD (x read), SV_Barycentrics (y and z read).
+        assert_eq!(crate::dxbc::u32_at(inputs, 0).unwrap(), 3);
+        assert_eq!(inputs[8 + 32 + 25], 0b1);
+        assert_eq!(crate::dxbc::u32_at(inputs, 8 + 64 + 12).unwrap(), 23);
+        assert_eq!(inputs[8 + 64 + 25], 0b110);
+        #[cfg(windows)]
+        {
+            let path = validator::Validator::default_path();
+            if let Ok(mut validator) = validator::Validator::load(path.as_deref()) {
+                validator.validate(&mut shader.dxil.clone()).unwrap();
+            }
+        }
+    }
+
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {

@@ -138,6 +138,11 @@ pub enum Interp {
     /// One vertex's value (`v_interp_mov_f32`), as encoded: 0 for P10,
     /// 1 for P20, 2 for P0 (the provoking vertex).
     Vertex { attribute: Attribute, vertex: u8 },
+    /// One half of an interpolation of an attribute in [`Io::per_vertex`],
+    /// done as the hardware does it from the operands as read: the first
+    /// (`v_interp_p1_f32`) `P0 + I * (P1 - P0)`, the second
+    /// (`v_interp_p2_f32`) `D + J * (P2 - P0)`.
+    Half { attribute: Attribute, second: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +190,10 @@ pub struct Io {
     /// Compute: how many SGPRs the hardware initializes
     /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
     pub initialized_sgprs: Option<u8>,
+    /// Input rows some interpolation reads with barycentrics the program
+    /// computes (not the I and J the hardware loads): every interpolation
+    /// of these rows is [`Interp::Half`], from each vertex's value.
+    pub per_vertex: Vec<u8>,
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
@@ -325,6 +334,8 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
+    // Every 32-bit interpolation half: (site, attribute, second half).
+    let mut f32_halves: Vec<(Site, Attribute, bool)> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -338,21 +349,32 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => {
+                            f32_halves.push((site, attribute, false));
+                        }
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
                             };
+                            f32_halves.push((site, attribute, true));
                             // The first half's result is this one's old dst.
-                            let interp = halves
-                                .pair(
-                                    attr,
-                                    inst.read(Reg::V(d)),
-                                    inst.read(Reg::V(reg)),
-                                    &barycentric,
-                                )
-                                .map_err(|what| unsupported(at, what))?;
-                            io.interps.push((site, interp.with(attribute)));
+                            match halves.pair(
+                                attr,
+                                inst.read(Reg::V(d)),
+                                inst.read(Reg::V(reg)),
+                                &barycentric,
+                            ) {
+                                Ok(interp) => io.interps.push((site, interp.with(attribute))),
+                                // I or J from an instruction or a join (a
+                                // branch that overwrote them in other lanes):
+                                // interpolated from each vertex's value.
+                                Err(COMPUTED) => {
+                                    if !io.per_vertex.contains(&attribute.row) {
+                                        io.per_vertex.push(attribute.row);
+                                    }
+                                }
+                                Err(what) => return Err(unsupported(at, what)),
+                            }
                         }
                         _ => return Err(unsupported(at, "an interpolation form")),
                     }
@@ -416,8 +438,18 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    if !io.per_vertex.is_empty() {
+        for (site, attribute, second) in f32_halves {
+            if io.per_vertex.contains(&attribute.row) {
+                io.interps.retain(|i| i.0 != site);
+                io.interps.push((site, Interp::Half { attribute, second }));
+            }
+        }
+    }
     Ok(io)
 }
+
+const COMPUTED: &str = "an interpolation with computed barycentrics";
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
 fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
@@ -480,7 +512,7 @@ impl Halves<'_> {
             &mut first,
         )?;
         let Some((kind, 1)) = barycentric(j) else {
-            return Err("an interpolation with computed barycentrics");
+            return Err(COMPUTED);
         };
         for &(b, i) in &first {
             let inst = &self.p.blocks[b].insts[i];
@@ -500,7 +532,7 @@ impl Halves<'_> {
                 return Err("interpolation halves of different attributes");
             }
             if barycentric(i) != Some((kind, 0)) {
-                return Err("an interpolation with computed barycentrics");
+                return Err(COMPUTED);
             }
         }
         Ok(Pair {
@@ -622,6 +654,45 @@ mod tests {
             (Target::Color(0), true, false)
         );
         assert_eq!(e.values[0], p.blocks[0].insts[1].write(Reg::V(2)));
+    }
+
+    #[test]
+    fn computed_barycentrics_interpolate_from_vertices() {
+        // I through a copy (as when a branch overwrote it in other lanes):
+        // both halves are done from each vertex's value, and so is the
+        // ordinary interpolation of the same row.
+        let p = program(&[
+            0x7E08_0300, // v_mov_b32 v4, v0
+            0xC808_0004, // v_interp_p1_f32 v2, v4, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xC80C_0100, // v_interp_p1_f32 v3, v0, attr0.y
+            0xC80D_0101, // v_interp_p2_f32 v3, v1, attr0.y
+            0xF800_180F,
+            0x0302_0302, // exp mrt0, v2, v3, v2, v3 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.per_vertex, [1]);
+        let half = |channel, second| Interp::Half {
+            attribute: Attribute {
+                usage: Usage::Generic,
+                row: 1,
+                channel,
+                high: false,
+            },
+            second,
+        };
+        let mut interps = io.interps.clone();
+        interps.sort_by_key(|i| i.0);
+        assert_eq!(
+            interps,
+            [
+                ((0, 1), half(0, false)),
+                ((0, 2), half(0, true)),
+                ((0, 3), half(1, false)),
+                ((0, 4), half(1, true)),
+            ]
+        );
     }
 
     #[test]

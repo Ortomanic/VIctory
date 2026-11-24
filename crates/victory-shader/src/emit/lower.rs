@@ -14,7 +14,7 @@ use super::container::{BARYCENTRICS, SigElement};
 use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
+use crate::io::{Attribute, Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
@@ -6464,6 +6464,9 @@ impl<'a> Lower<'a> {
                 vertex: 2,
             } => (attribute, 1),
             Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
+            Interp::Half { attribute, second } => {
+                return self.interp_half(inst, *attribute, *second);
+            }
         };
         let dst = match &inst.fields {
             Fields::Vintrp { dst, .. } => *dst,
@@ -6545,6 +6548,85 @@ impl<'a> Lower<'a> {
         };
         // A pixel interpolates in every lane; guards only hide inactive ones.
         self.write(inst, Reg::V(reg), x, None);
+        Ok(())
+    }
+
+    /// One half of an interpolation from each vertex's value
+    /// (`GetAttributeAtVertex`), as the hardware computes it: the first
+    /// `P0 + I * (P1 - P0)`, the second `D + J * (P2 - P0)`, with I, J and
+    /// D as the program reads them. The host's vertex order is the one its
+    /// barycentrics have, so I and J from the hardware inputs (which load
+    /// the host's) interpolate as the host would.
+    fn interp_half(&mut self, inst: &Inst, attribute: Attribute, second: bool) -> Result<(), Why> {
+        let Fields::Vintrp {
+            dst: Operand::Vector { reg: d, .. },
+            src: Operand::Vector { reg: s, .. },
+            ..
+        } = inst.fields
+        else {
+            return Err("an interpolation operand");
+        };
+        if let StageIo::Ps { inputs, .. } = &self.x.native.io
+            && inputs.iter().any(|i| i.row == attribute.row && i.fp16)
+        {
+            return Err("computed barycentrics with a 16-bit input");
+        }
+        if attribute.high {
+            return Err("a 16-bit read of a 32-bit input");
+        }
+        let (id, col) = self
+            .find_input(u8::from(attribute.row), attribute.channel)
+            .ok_or("an input the signature lacks")?;
+        // Every element in the row is constant-interpolated: the host's
+        // signature rows have one mode.
+        let row = self.s.inputs[id].row;
+        for e in self.s.inputs.iter_mut().filter(|e| e.row == row) {
+            if e.interp != 1 && e.usage != 0 {
+                return Err("one input interpolated two ways");
+            }
+            e.interp = 1;
+        }
+        if self.s.inputs[id].comp != 9 {
+            return Err("an interpolated integer input");
+        }
+        self.s.inputs[id].usage |= 1 << col;
+        self.s.flags |= flags::BARYCENTRICS;
+        let entry = self.s.entry;
+        let f32t = self.s.t.f32;
+        let vertex = |l: &mut Self, k: u8| {
+            let args = [
+                l.s.m.i32(id as u32),
+                l.s.m.i32(0),
+                l.s.m.i8(col),
+                l.s.m.i8(k),
+            ];
+            l.s.op(
+                entry,
+                "attributeAtVertex.f32",
+                Attr::ReadNone,
+                f32t,
+                137,
+                &args,
+            )
+        };
+        let p0 = vertex(self, 0);
+        let pk = vertex(self, if second { 2 } else { 1 });
+        let c = self.cur;
+        let delta = self.s.m.bin(c, Bin::Sub, pk, p0);
+        let w = inst.read(Reg::V(s)).ok_or("an interpolation operand")?;
+        let w = self.float_of(w)?;
+        let base = if second {
+            let old = inst
+                .read(Reg::V(d))
+                .ok_or("an interpolation without its first half")?;
+            self.float_of(old)?
+        } else {
+            p0
+        };
+        let r = self.fmad(w, delta, base);
+        let x = self.as_int(r);
+        // A pixel interpolates in every lane; guards only hide inactive ones.
+        self.write(inst, Reg::V(d), x, None);
         Ok(())
     }
 
@@ -8350,7 +8432,10 @@ mod tests {
         let l = lowered_on(&w, true, true).unwrap();
         // Split, or (a group of at most 32 threads) one 32-lane wave: either
         // way no WaveSize(64).
-        assert!(matches!((l.wave_size, l.split), (None, true) | (Some(32), false)));
+        assert!(matches!(
+            (l.wave_size, l.split),
+            (None, true) | (Some(32), false)
+        ));
         assert!(l.split_refused.is_none());
         let native = lowered_on(&w, true, false).unwrap();
         assert_eq!((native.wave_size, native.split), (Some(64), false));
@@ -8368,7 +8453,10 @@ mod tests {
         let l = lowered_on(&w, true, true).unwrap();
         // A group of at most 32 threads runs as one 32-lane wave (400fa50);
         // larger groups keep WaveSize(64).
-        assert!(matches!((l.wave_size, l.split), (Some(64) | Some(32), false)));
+        assert!(matches!(
+            (l.wave_size, l.split),
+            (Some(64) | Some(32), false)
+        ));
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
