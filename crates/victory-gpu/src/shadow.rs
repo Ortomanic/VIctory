@@ -364,19 +364,22 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        self.update_if(address, len, &mut |a, b| Some((a, b))).0
+        self.update_if(address, len, &mut |a, b, _| Some((a, b))).0
     }
 
     /// [`Shadow::update`] copying of a run of stale pages (title `[from,
     /// to)`) only what `copy_ok` gives (bindless ranges: memory all
     /// committed, asked only of what is to be copied); `None`: none of it.
+    /// Its third argument: every page of the run was copied before and is
+    /// stale only because a write to it was reported since (so it was
+    /// committed when written).
     /// Pages left out stay stale. Returns the bytes copied and the runs
     /// left out (in whole or in part).
     pub(crate) fn update_if(
         &self,
         address: usize,
         len: usize,
-        copy_ok: &mut dyn FnMut(usize, usize) -> Option<(usize, usize)>,
+        copy_ok: &mut dyn FnMut(usize, usize, bool) -> Option<(usize, usize)>,
     ) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
@@ -413,8 +416,8 @@ impl Shadow {
         self.update_free(from, to, copy_ok)
     }
 
-    /// Whether the title memory is known to be write-watched (asked of the
-    /// kernel, not guarded).
+    /// Whether writes to its title memory are known to be tracked (by the
+    /// kernel's write watch, or guards on view memory).
     pub(crate) fn write_watched(&self) -> bool {
         self.watched.load(Ordering::Relaxed) == 1
     }
@@ -425,7 +428,7 @@ impl Shadow {
         &self,
         from: usize,
         to: usize,
-        copy_ok: &mut dyn FnMut(usize, usize) -> Option<(usize, usize)>,
+        copy_ok: &mut dyn FnMut(usize, usize, bool) -> Option<(usize, usize)>,
     ) -> (usize, usize) {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
@@ -441,7 +444,7 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
-        match copy_ok(from, to) {
+        match copy_ok(from, to, false) {
             Some((a, b)) if a < b => (self.copy(a, b), usize::from((a, b) != (from, to))),
             _ => (0, 1),
         }
@@ -458,15 +461,16 @@ impl Shadow {
         to: usize,
         now: u64,
         written: &[(usize, u64)],
-        copy_ok: &mut dyn FnMut(usize, usize) -> Option<(usize, usize)>,
+        copy_ok: &mut dyn FnMut(usize, usize, bool) -> Option<(usize, usize)>,
     ) -> (usize, usize) {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        // Runs of stale pages: [first, past).
+        // Runs of stale pages: [first, past), and whether one was never
+        // copied.
         let mut runs = Vec::new();
-        let mut run = None;
+        let mut run: Option<(usize, bool)> = None;
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -478,19 +482,21 @@ impl Shadow {
             };
             let at = copied[page - base];
             if at == 0 || write > at {
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                runs.push((first, page));
+                run.get_or_insert((page, false)).1 |= at == 0;
+            } else if let Some((first, fresh)) = run.take() {
+                runs.push((first, page, fresh));
             }
         }
-        if let Some(first) = run {
-            runs.push((first, last + 1));
+        if let Some((first, fresh)) = run {
+            runs.push((first, last + 1, fresh));
         }
         let (mut bytes, mut left) = (0, 0);
-        for (first, past) in runs {
+        for (first, past, fresh) in runs {
             // Cut to the range: next to it shaders may be writing the copy.
             let (a, b) = ((first * PAGE).max(from), (past * PAGE).min(to));
-            let Some((a2, b2)) = copy_ok(a, b).map(|(c, d)| (c.max(a), d.min(b))).filter(|(c, d)| c < d)
+            let Some((a2, b2)) = copy_ok(a, b, !fresh)
+                .map(|(c, d)| (c.max(a), d.min(b)))
+                .filter(|(c, d)| c < d)
             else {
                 left += 1;
                 continue;

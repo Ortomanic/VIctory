@@ -582,6 +582,11 @@ pub(crate) fn new_frame() {
     FRAME.fetch_add(1, Ordering::AcqRel);
 }
 
+/// Frames presented so far ([`new_frame`]).
+pub(crate) fn presented() -> u64 {
+    FRAME.load(Ordering::Acquire)
+}
+
 /// Whether `block` is a hole: found so this frame, or found uncommitted
 /// now (then so are the holes after it in the same region, noted with it).
 /// A hole found committed is a hole no longer.

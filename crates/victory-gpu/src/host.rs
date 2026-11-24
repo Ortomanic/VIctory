@@ -688,11 +688,13 @@ impl Host {
             // What the lists refresh first, then the ranges one by one (not
             // merged per copy as the batch merges: the gaps may be unmapped).
             batch.flush();
-            // The ranges read once per frame (`bindless`, shortcut), the
-            // unordered ones whenever shaders may write them.
+            // The ranges read once per presented frame (`bindless`,
+            // shortcut; the title's frame token advanced ~3 times per
+            // present in the world), the unordered ones whenever shaders
+            // may write them.
             use std::sync::atomic::AtomicU64;
             static REFRESHED: AtomicU64 = AtomicU64::new(u64::MAX);
-            let frame = crate::frame::current();
+            let frame = crate::watch::presented();
             let all = crate::descriptor::bindless::every_submission()
                 || REFRESHED.swap(frame, Ordering::Relaxed) != frame;
             if all || writes_bindless {

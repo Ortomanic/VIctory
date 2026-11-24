@@ -459,7 +459,7 @@ pub(crate) fn log(frames: f64) {
          {:.1} merges {:.2} ms, prepared {:.2} ms \
          (copy-back of all ranges {:.2} ms, {:.1} MB compared); sweep {:.2} ms in {:.1} \
          ({:.0} ranges, {:.1} MB copied; watch {:.2} ms, {:.0} kernel calls, {:.0} ahead \
-         {:.2} ms for {:.0} of {:.0} write-watched copies; committed {:.2} ms, {:.0} queries; fallbacks {:.2} ms)",
+         {:.2} ms for {:.0} of {:.0} tracked copies; committed {:.2} ms, {:.0} queries; fallbacks {:.2} ms)",
         span as f64 / 1e6,
         written as f64 / 1e6,
         c[C::BindlessReadSubmissions as usize],

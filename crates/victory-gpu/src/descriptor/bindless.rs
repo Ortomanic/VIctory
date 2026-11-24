@@ -274,6 +274,15 @@ pub(crate) fn refresh(m: &Merged, all: bool, writes: bool) {
             (false, true) => unordered,
             (false, false) => continue,
         };
+        // Private memory the kernel reported written was committed then:
+        // not asked again (if it was decommitted since, the copy's slow
+        // fallback reads it as it is). Views are asked (a guard reports a
+        // block remapped as written), mostly answered from what is known.
+        let private = ranges
+            .first()
+            .and_then(|&(from, _)| crate::watch::allocation(from as usize))
+            .is_some_and(|(_, _, view)| !view)
+            && shadow.write_watched();
         for &(from, to) in ranges {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -286,7 +295,10 @@ pub(crate) fn refresh(m: &Merged, all: bool, writes: bool) {
             // whether committed, at every sweep.
             let page = crate::watch::PAGE;
             let (start, end) = (from / page * page, to.next_multiple_of(page));
-            let (copied, _left) = shadow.update_if(start, end - start, &mut |a, b| {
+            let (copied, _left) = shadow.update_if(start, end - start, &mut |a, b, reported| {
+                if reported && private {
+                    return Some((a, b));
+                }
                 #[cfg(feature = "diagnostics")]
                 let checking = std::time::Instant::now();
                 // Else the part in the range itself: next to it may lie a
