@@ -99,7 +99,10 @@ fn build() -> [u8; 32] {
     {
         let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
         if warned.0 != limit {
-            tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner");
+            tracing::warn!(
+                limit,
+                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+            );
         }
         if warned.1 != uniform && !uniform {
             tracing::warn!("VICTORY_WAVE64_UNIFORM=0: no uniform wave64 form");
@@ -142,7 +145,7 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate =
         move |c: &[u8]| victory_shader::emit::translate_with(c, opts).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached_while(cache, &build(), container, translate, |key| build() == *key),
         None => translate(container),
     }
 }
@@ -169,11 +172,26 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
 }
 
+#[cfg(test)]
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<HostShader, String> {
+    cached_while(cache, build, container, translate, |_| true)
+}
+
+/// [`cached`], but a new translation is not kept on disk if `current` says
+/// `build` no longer holds after it: a live control changed a translation
+/// setting while it ran, so it may have read the new value under the old
+/// key (the caller translates it again).
+fn cached_while(
+    cache: &Cache,
+    build: &[u8; 32],
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+    current: impl Fn(&[u8; 32]) -> bool,
 ) -> Result<HostShader, String> {
     let input = [&build[..], container].concat();
     let converter = Translate {
@@ -192,6 +210,10 @@ fn cached(
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
+            if converter.ran.load(Ordering::Relaxed) && !current(build) {
+                tracing::debug!(path = %path.display(), "settings changed while translating; entry dropped");
+                let _ = std::fs::remove_file(&path);
+            }
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
@@ -419,6 +441,22 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+
+        // A translation whose settings changed while it ran is not kept.
+        let changed = b"changed meanwhile".as_slice();
+        let stale = |_: &[u8; 32]| false;
+        assert_eq!(
+            cached_while(&cache, &build, changed, translate, stale),
+            Ok(shader())
+        );
+        assert_eq!(cached(&cache, &build, changed, translate), Ok(shader()));
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            5,
+            "not kept, translated again"
+        );
+        assert_eq!(cached(&cache, &build, changed, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 5, "kept this time");
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
