@@ -69,8 +69,13 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-/// Compiles a compute shader with DXC (`dxcompiler.dll` from the DLL search path).
-fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
+/// Compiles HLSL with DXC (`dxcompiler.dll` from the DLL search path) for
+/// `profile` (such as `cs_6_0`), from entry point `entry`.
+pub(crate) fn dxc_compile(
+    source: &str,
+    profile: windows::core::PCWSTR,
+    entry: windows::core::PCWSTR,
+) -> windows::core::Result<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Dxc::*;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     use windows::core::{Interface, w};
@@ -95,7 +100,7 @@ fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
             Size: source.len(),
             Encoding: DXC_CP_UTF8.0,
         };
-        let arguments = [w!("-T"), w!("cs_6_0"), w!("-E"), w!("main"), w!("-O3")];
+        let arguments = [w!("-T"), profile, w!("-E"), entry, w!("-O3")];
         let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
         result.GetStatus()?.ok()?;
         let blob = result.GetResult()?;
@@ -164,8 +169,12 @@ fn make() -> windows::core::Result<Clamp> {
             };
             tracing::info!(error = %e, "argument clamp: the system compiler refused it ({}); trying DXC", String::from_utf8_lossy(text).trim());
         }
-        fallback = dxc_compile(SOURCE)
-            .inspect_err(|e| tracing::warn!(error = %e, "argument clamp: DXC failed too"))?;
+        fallback = dxc_compile(
+            SOURCE,
+            windows::core::w!("cs_6_0"),
+            windows::core::w!("main"),
+        )
+        .inspect_err(|e| tracing::warn!(error = %e, "argument clamp: DXC failed too"))?;
     } else {
         fallback = Vec::new();
     }
