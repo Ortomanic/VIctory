@@ -442,7 +442,7 @@ pub fn emit_with(
     let p = ir::thread_edges(p, &edges)?;
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
+    let res = resource::track_lanes(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res, opts)
 }
 
@@ -884,7 +884,7 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = resource::track_lanes(&p, &native.layout, native.stage, None).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         let container = crate::dxbc::build(&[]);
@@ -937,7 +937,7 @@ mod tests {
             &p,
             &structure::structure(&p).unwrap(),
             &io::raise(&p, &native).unwrap(),
-            &resource::track(&p, &native.layout, native.stage).unwrap(),
+            &resource::track_lanes(&p, &native.layout, native.stage, None).unwrap(),
         )
         .unwrap();
         let container = Container::parse(&shader.dxil).unwrap();
@@ -1031,7 +1031,7 @@ mod tests {
             &p,
             &structure::structure(&p).unwrap(),
             &io,
-            &resource::track(&p, &native.layout, native.stage).unwrap(),
+            &resource::track_lanes(&p, &native.layout, native.stage, None).unwrap(),
         )
         .unwrap();
         let container = Container::parse(&shader.dxil).unwrap();
@@ -1348,7 +1348,7 @@ mod atomic_tests {
                 &p,
                 &structure::structure(&p).unwrap(),
                 &io::raise(&p, &native).unwrap(),
-                &resource::track(&p, &native.layout, native.stage).unwrap(),
+                &resource::track_lanes(&p, &native.layout, native.stage, None).unwrap(),
             )
             .unwrap();
             let container = Container::parse(&shader.dxil).unwrap();

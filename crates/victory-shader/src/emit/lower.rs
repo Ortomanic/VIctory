@@ -9949,7 +9949,7 @@ mod tests {
             code,
         };
         let p = ir::build(&native.code, false, 16).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = resource::track_lanes(&p, &native.layout, native.stage, None).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
@@ -10089,7 +10089,7 @@ mod tests {
             code,
         };
         let p = ir::build(&native.code, false, 8).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = resource::track_lanes(&p, &native.layout, native.stage, None).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
