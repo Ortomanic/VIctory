@@ -397,10 +397,27 @@ fn record(
     true
 }
 
+/// Without diagnostics there is no probe.
+#[cfg(not(feature = "diagnostics"))]
+mod probe {
+    use super::*;
+
+    pub(super) fn due(_: u64) -> bool {
+        false
+    }
+
+    pub(super) fn take(_: &crate::host::HostList, _: This, _: &ID3D12Resource, _: u64, _: &str) {}
+}
+
 static UPSCALES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Without diagnostics there is no pass log.
+#[cfg(not(feature = "diagnostics"))]
+fn pass_log(_: This, _: This, _: (u32, u32), _: (u32, u32)) {}
 
 /// With `VICTORY_PASS_LOG`, the stand-in's pass among the title's in a
 /// listed frame.
+#[cfg(feature = "diagnostics")]
 fn pass_log(color: This, output: This, render: (u32, u32), size: (u32, u32)) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_PASS_LOG").is_some())
@@ -423,6 +440,7 @@ fn pass_log(color: This, output: This, render: (u32, u32), size: (u32, u32)) {
 /// upscales, those of listed frames and every 40th, and summarized 30
 /// upscales later (largest finite value, set, negative and non-finite
 /// texels per channel).
+#[cfg(feature = "diagnostics")]
 mod probe {
     use super::*;
 
