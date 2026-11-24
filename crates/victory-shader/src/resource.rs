@@ -987,6 +987,9 @@ impl<'a> Tracer<'a> {
                 words: [w2, w3],
             });
         }
+        if let Some(source) = self.raw_view(words) {
+            return Ok(source);
+        }
         let loaded = |w: &Term| {
             matches!(*w, Term::Value(v)
                 if self.def(v).is_some_and(|i| i.name().starts_with("s_load_")))
@@ -1722,6 +1725,48 @@ impl<'a> Tracer<'a> {
             return Err(RETRY);
         }
         Ok(out)
+    }
+
+    /// A loaded buffer descriptor the code views as a raw buffer, as the
+    /// FidelityFX upscaler's programs do before byte-addressed access: the
+    /// stride cleared (dword 1 bits 16-29), the record count multiplied (by
+    /// the stride, into bytes), the out-of-bounds mode set (dword 3 bits
+    /// 28-29). The base address and everything else stay as loaded, so it
+    /// is the loaded descriptor; the host reads it raw through its view.
+    fn raw_view(&self, words: &[Term]) -> Option<Source> {
+        const STRIDE: u32 = 0x3FFF_0000;
+        const OOB: u32 = 0x3000_0000;
+        let [w0, w1, w2, w3] = *words else {
+            return None;
+        };
+        let value = |t: Term| match t {
+            Term::Value(v) => Some(v),
+            Term::Const(_) => None,
+        };
+        let w1 = match self.sop2(value(w1)?, &["s_and_b32"]) {
+            Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) if m | STRIDE == !0 => x,
+            _ => w1,
+        };
+        let w2 = match self.sop2(value(w2)?, &["s_mul_i32"]) {
+            Some((_, [x, _])) if self.loaded(&[w0, w1, x]).is_some() => x,
+            Some((_, [_, y])) => y,
+            None => w2,
+        };
+        let mut w3 = w3;
+        if let Some((_, [x, Term::Const(o)] | [Term::Const(o), x])) =
+            self.sop2(value(w3)?, &["s_or_b32"])
+            && o & !OOB == 0
+        {
+            w3 = x;
+        }
+        if let Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) =
+            self.sop2(value(w3)?, &["s_and_b32"])
+            && m | OOB == !0
+        {
+            w3 = x;
+        }
+        let source = self.loaded(&[w0, w1, w2, w3])?;
+        (words != [w0, w1, w2, w3]).then_some(source)
     }
 
     /// Consecutive dwords of one scalar load.
