@@ -336,6 +336,8 @@ extern "system" fn present(
         }
         crate::capture::dump_targets(frame);
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::sample_scene_depth(frame);
     #[cfg(windows)]
     if planes == 2
         && forced_plane().is_none()
