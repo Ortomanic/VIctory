@@ -481,6 +481,17 @@ pub(crate) fn committed(at: usize, len: usize) -> bool {
 /// [`committed`], and whether the host was asked (some of the range was not
 /// known committed views).
 pub(crate) fn committed_asking(at: usize, len: usize) -> (bool, bool) {
+    committed_in(at, len, None)
+}
+
+/// Regions found by [`committed_in`] in one pass: start → (end, committed).
+pub(crate) type Regions = BTreeMap<usize, (usize, bool)>;
+
+/// [`committed_asking`], also answering from and adding to `pass`: what
+/// region queries found earlier in the same pass (a bindless sweep asks
+/// about many runs in the same regions; a change between is a race either
+/// way, and a copy meeting a hole falls back to slow reads).
+pub(crate) fn committed_in(at: usize, len: usize, mut pass: Option<&mut Regions>) -> (bool, bool) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -508,6 +519,17 @@ pub(crate) fn committed_asking(at: usize, len: usize) -> (bool, bool) {
         if p >= end {
             break;
         }
+        if let Some(pass) = pass.as_deref_mut()
+            && let Some((_, &(e, committed))) = pass.range(..=p).next_back().filter(|(_, (e, _))| p < *e)
+        {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BindlessPassHits, 1);
+            if !committed {
+                return (false, asked);
+            }
+            p = e;
+            continue;
+        }
         asked = true;
         let remappings = REMAPPINGS.load(Ordering::Acquire);
         // SAFETY: plain data filled in by the query.
@@ -516,13 +538,22 @@ pub(crate) fn committed_asking(at: usize, len: usize) -> (bool, bool) {
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::CommitQueries, 1);
-        if n == 0 || info.State != MEM_COMMIT || info.RegionSize == 0 {
+        if n == 0 || info.RegionSize == 0 {
             return (false, true);
         }
         let (from, to) = (
             info.BaseAddress as usize,
             (info.BaseAddress as usize).saturating_add(info.RegionSize),
         );
+        if let Some(pass) = pass.as_deref_mut()
+            && from <= p
+        {
+            forget(pass, from, to, |&(e, _)| e);
+            pass.insert(from, (to, info.State == MEM_COMMIT));
+        }
+        if info.State != MEM_COMMIT {
+            return (false, true);
+        }
         if info.Type == MEM_MAPPED {
             let mut known = COMMITTED.lock().unwrap_or_else(|e| e.into_inner());
             // A remapping since the query may have changed what it found.
@@ -580,6 +611,16 @@ fn keep_committed(known: &mut BTreeMap<usize, usize>, mut from: usize, mut to: u
 /// every submission), in case memory was committed there unreported.
 pub(crate) fn new_frame() {
     FRAME.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Whether the guards found a block of `[at, end)` to be a hole (nothing
+/// committed) this frame: it is not all committed, without a query.
+pub(crate) fn hole_in(at: usize, end: usize) -> bool {
+    let frame = FRAME.load(Ordering::Acquire);
+    guards()
+        .holes
+        .range(at / BLOCK..end.div_ceil(BLOCK))
+        .any(|(_, &seen)| seen == frame)
 }
 
 /// Frames presented so far ([`new_frame`]).

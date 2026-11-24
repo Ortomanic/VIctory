@@ -268,6 +268,7 @@ pub(crate) fn refresh(m: &Merged, all: bool, writes: bool) {
     #[cfg(feature = "diagnostics")]
     let mut ranges_asked = 0u64;
     let mut copied_all = 0usize;
+    let mut regions = crate::watch::Regions::new();
     for (shadow, reads, unordered) in &m.shadows {
         let ranges = match (all, writes) {
             (true, _) => reads,
@@ -302,11 +303,20 @@ pub(crate) fn refresh(m: &Merged, all: bool, writes: bool) {
                 #[cfg(feature = "diagnostics")]
                 let checking = std::time::Instant::now();
                 // Else the part in the range itself: next to it may lie a
-                // hole.
+                // hole. Blocks the guards found holes this frame need no
+                // query, nor regions this sweep asked about already.
+                let mut committed = |a: usize, b: usize| {
+                    if crate::watch::hole_in(a, b) {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::BindlessHoleRuns, 1);
+                        return false;
+                    }
+                    crate::watch::committed_in(a, b - a, Some(&mut regions)).0
+                };
                 let (c, d) = (a.max(from), b.min(to));
-                let ok = if crate::watch::committed(a, b - a) {
+                let ok = if committed(a, b) {
                     Some((a, b))
-                } else if c < d && (c, d) != (a, b) && crate::watch::committed(c, d - c) {
+                } else if c < d && (c, d) != (a, b) && committed(c, d) {
                     Some((c, d))
                 } else {
                     None

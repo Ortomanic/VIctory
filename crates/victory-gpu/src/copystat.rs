@@ -185,8 +185,12 @@ pub(crate) enum C {
     /// ones in an allocation asked about ahead.
     BindlessWatchedCopies,
     BindlessAheadCopies,
+    /// Committed checks of the sweep answered from its own earlier region
+    /// queries, and runs left out on blocks the guards found holes.
+    BindlessPassHits,
+    BindlessHoleRuns,
 }
-const COUNTERS: usize = C::BindlessAheadCopies as usize + 1;
+const COUNTERS: usize = C::BindlessHoleRuns as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -459,7 +463,8 @@ pub(crate) fn log(frames: f64) {
          {:.1} merges {:.2} ms, prepared {:.2} ms \
          (copy-back of all ranges {:.2} ms, {:.1} MB compared); sweep {:.2} ms in {:.1} \
          ({:.0} ranges, {:.1} MB copied; watch {:.2} ms, {:.0} kernel calls, {:.0} ahead \
-         {:.2} ms for {:.0} of {:.0} tracked copies; committed {:.2} ms, {:.0} queries; fallbacks {:.2} ms)",
+         {:.2} ms for {:.0} of {:.0} tracked copies; committed {:.2} ms, {:.0} queries, {:.0} answered by the sweep's, {:.0} runs on holes; \
+         fallbacks {:.2} ms)",
         span as f64 / 1e6,
         written as f64 / 1e6,
         c[C::BindlessReadSubmissions as usize],
@@ -482,6 +487,8 @@ pub(crate) fn log(frames: f64) {
         c[C::BindlessWatchedCopies as usize],
         ms(c[C::BindlessCommitUs as usize]),
         c[C::BindlessCommitQueries as usize],
+        c[C::BindlessPassHits as usize],
+        c[C::BindlessHoleRuns as usize],
         ms(c[C::BindlessFallbackUs as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
