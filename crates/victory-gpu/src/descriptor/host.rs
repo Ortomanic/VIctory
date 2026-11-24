@@ -25,6 +25,8 @@ pub(crate) struct HostHeap {
     /// The record (view index and generation, 0: none) the title had at
     /// each slot when we last looked ([`HostHeap::sync`]).
     seen: Mutex<Vec<u64>>,
+    /// The watch's asking at the last [`HostHeap::sync`] (0: none yet).
+    synced: Mutex<u64>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -624,6 +626,7 @@ impl HostHeap {
             strides,
             made: Mutex::new(vec![0; count as usize]),
             seen: Mutex::new(vec![0; count as usize]),
+            synced: Mutex::new(0),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new(Slots::new(extra as usize)),
             state: Mutex::new(vec![SLOT_NONE; count as usize]),
@@ -1052,7 +1055,7 @@ impl HostHeap {
             return 0;
         }
         // The slots whose record differs from the one last seen, among
-        // `seen[a..b]`.
+        // `seen[a..a + seen.len()]`.
         fn scan(seen: &[u64], a: usize, start: u64, step: u64) -> Vec<u32> {
             seen.iter()
                 .enumerate()
@@ -1072,25 +1075,68 @@ impl HostHeap {
         }
         #[cfg(feature = "diagnostics")]
         let _scanning = crate::copystat::timed(crate::copystat::C::HeapSyncUs);
-        // Every slot, at every submission (~1 million on NVIDIA, 32 MB of
-        // title memory read: ~2-4 ms each, ~100 ms a world frame on one
-        // thread): in parts on several threads.
+        // One sync of this heap at a time: the asking below takes the
+        // pages' written bits, and the slots in them are mirrored before
+        // the next sync asks again.
+        let mut synced = self.synced.lock().unwrap_or_else(|e| e.into_inner());
+        // Only the slots in the pages written since the last sync (frame-perf3):
+        // reading every slot (~1 million, 32 MB of title memory, 2-4 ms) at
+        // each of ~30 syncs a world frame was ~80 ms of it. The heap is
+        // title memory, write-watched or guarded like any copy's
+        // (`crate::watch`): the title's own descriptor copies, our records
+        // and remaps are all found there. `VICTORY_SYNC_HEAPS=full` reads
+        // every slot every time.
+        let slots = self.count as usize;
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let (from, to) = (start as usize, (start + len) as usize);
+        let asked = (!full_scans()).then(|| crate::watch::writes_fresh(from, to, true)).flatten();
+        match asked {
+            Some((now, pages)) if *synced != 0 => {
+                let since = *synced;
+                *synced = now;
+                use crate::watch::PAGE;
+                for (page, _) in pages.into_iter().filter(|&(_, w)| w > since) {
+                    let a = (page * PAGE).max(from) - from;
+                    let b = ((page + 1) * PAGE).min(to) - from;
+                    let (a, b) = (a / step as usize, b.div_ceil(step as usize).min(slots));
+                    match ranges.last_mut() {
+                        Some(last) if last.1 >= a => last.1 = last.1.max(b),
+                        _ => ranges.push((a, b)),
+                    }
+                }
+            }
+            Some((now, _)) => {
+                *synced = now;
+                ranges.push((0, slots));
+            }
+            None => ranges.push((0, slots)),
+        }
+        // In parts on several threads where many.
         const PART: usize = 1 << 16;
+        let parts: Vec<(usize, usize)> = ranges
+            .iter()
+            .flat_map(|&(a, b)| (a..b).step_by(PART).map(move |x| (x, (x + PART).min(b))))
+            .collect();
+        let total: usize = ranges.iter().map(|&(a, b)| b - a).sum();
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::HeapSyncs, 1);
+            crate::copystat::add(crate::copystat::C::HeapSyncScanned, total as u64);
+        }
         let changed: Vec<u32> = {
             let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-            if seen.len() < 2 * PART {
-                scan(&seen, 0, start, step)
+            if total < 2 * PART {
+                parts.iter().flat_map(|&(a, b)| scan(&seen[a..b], a, start, step)).collect()
             } else {
-                let parts = seen.len().div_ceil(PART);
                 let found: std::sync::Arc<Vec<Mutex<Vec<u32>>>> =
-                    std::sync::Arc::new((0..parts).map(|_| Mutex::default()).collect());
-                let (at, len) = (seen.as_ptr() as usize, seen.len());
-                let tasks = (0..parts)
-                    .map(|k| {
+                    std::sync::Arc::new((0..parts.len()).map(|_| Mutex::default()).collect());
+                let at = seen.as_ptr() as usize;
+                let tasks = parts
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &(a, b))| {
                         let found = found.clone();
                         Box::new(move || {
-                            let a = k * PART;
-                            let b = (a + PART).min(len);
                             // SAFETY: `seen` stays locked (and alive) until
                             // every part is done; only read.
                             let seen = unsafe { std::slice::from_raw_parts((at as *const u64).add(a), b - a) };
@@ -1106,9 +1152,14 @@ impl HostHeap {
                     .collect()
             }
         };
+        #[cfg(feature = "diagnostics")]
+        let _mirroring = crate::copystat::timed(crate::copystat::C::HeapSyncMirrorUs);
         for &index in &changed {
             self.mirror(index, start + u64::from(index) * step, false);
         }
+        drop(synced);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::HeapSyncMirrored, changed.len() as u64);
         changed.len()
     }
 
@@ -1129,6 +1180,13 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// `VICTORY_SYNC_HEAPS=full`: heap syncs read every slot, not only those
+/// in pages written since the last.
+fn full_scans() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| std::env::var("VICTORY_SYNC_HEAPS").is_ok_and(|v| v.trim() == "full"))
 }
 
 /// Logs `what` the first time it happens.
