@@ -99,7 +99,7 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
-pub use lower::{HEAP_SAMPLERS, HEAP_VIEWS};
+pub use lower::{HEAP_SAMPLERS, HEAP_VIEWS, stride_table_slot};
 mod sampler;
 mod shader;
 mod threading;

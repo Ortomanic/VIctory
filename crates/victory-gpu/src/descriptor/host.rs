@@ -37,6 +37,81 @@ pub(crate) struct HostHeap {
     /// What each mirrored slot holds (`SLOT_*`), and how many hold each.
     state: Mutex<Vec<u8>>,
     states: [std::sync::atomic::AtomicU32; 6],
+    /// View heaps: the stride table ([`StrideTable`]).
+    strides: Option<StrideTable>,
+}
+
+/// One dword per slot of a view heap: the element size of the buffer view
+/// the host made there (0: none or not a buffer view), in upload memory
+/// the CPU writes as slots are made, read by translated shaders through a
+/// raw view in the heap's slot `victory_shader::emit::stride_table_slot`.
+/// The console's buffer descriptors carry their stride, and shaders taking
+/// one from the heap by data index it with that stride (the world's
+/// instance culling, `CS_*_BatchCull`); the host's descriptors cannot be
+/// read by shaders, so the table says it.
+/// shortcut: written when a slot is made, not in submission order; a list
+/// still running reads the new stride of a slot remade since it was
+/// recorded, as it reads the new descriptor.
+struct StrideTable {
+    buffer: ID3D12Resource,
+    mapped: *mut u32,
+    len: u32,
+}
+
+// SAFETY: `mapped` points into the buffer the table holds (mapped for its
+// life); dword writes from several threads are plain stores.
+unsafe impl Send for StrideTable {}
+// SAFETY: as above.
+unsafe impl Sync for StrideTable {}
+
+impl StrideTable {
+    fn new(len: u32) -> Option<StrideTable> {
+        let host = host()?;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: u64::from(len) * 4,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: plain creation; the buffer is mapped for its life.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut buffer,
+                )
+                .ok()?;
+            let buffer = buffer?;
+            buffer.Map(0, None, Some(&mut mapped)).ok()?;
+            let mapped = mapped.cast::<u32>();
+            std::ptr::write_bytes(mapped, 0, len as usize);
+            Some(StrideTable { buffer, mapped, len })
+        }
+    }
+
+    fn set(&self, index: u32, stride: u32) {
+        if index < self.len {
+            // SAFETY: inside the mapped buffer.
+            unsafe { self.mapped.add(index as usize).write_volatile(stride) };
+        }
+    }
 }
 
 /// Mirrored slots: no view; a view of a texture or a sampler; a buffer
@@ -510,7 +585,9 @@ impl HostHeap {
                     "host view heap capped at {total}"
                 );
             }
-            (heap, mirrored, total - mirrored)
+            // The last two slots are no table's: the stride table's and the
+            // one indices past the heap are clamped to (`victory_shader`).
+            (heap, mirrored, total - mirrored - 2)
         };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -528,6 +605,15 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        let strides = if sampler {
+            None
+        } else {
+            let made = StrideTable::new(count + extra + 2);
+            if made.is_none() {
+                tracing::warn!("no stride table: shaders indexing buffers of unknown stride read element 0");
+            }
+            made
+        };
         let h = HostHeap {
             heap,
             cpu,
@@ -535,6 +621,7 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
+            strides,
             made: Mutex::new(vec![0; count as usize]),
             seen: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
@@ -554,8 +641,19 @@ impl HostHeap {
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        let all = if sampler { count + extra } else { count + extra + 2 };
+        if let Err(e) = h.fill_null(kind, all) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
+        }
+        if let Some(t) = &h.strides {
+            let slot = victory_shader::emit::stride_table_slot(all);
+            let desc = raw_srv_desc(t.len);
+            // SAFETY: a live buffer and a slot of our heap.
+            unsafe {
+                host.device
+                    .CreateShaderResourceView(&t.buffer, Some(&desc), h.cpu(slot))
+            };
+            tracing::info!(slot, slots = t.len, "host stride table");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
@@ -724,7 +822,15 @@ impl HostHeap {
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
+        self.stride(index, kept.is_some().then_some(view));
         self.keep(index, kept.flatten());
+    }
+
+    /// Notes in the stride table what slot `index` now holds.
+    fn stride(&self, index: u32, view: Option<&View>) {
+        if let Some(t) = &self.strides {
+            t.set(index, view.map_or(0, view_stride));
+        }
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -734,6 +840,7 @@ impl HostHeap {
         } else {
             null_view(self.cpu(index));
         }
+        self.stride(index, None);
         self.keep(index, None);
     }
 
@@ -752,6 +859,7 @@ impl HostHeap {
     /// Slot `index` (a dynamic one) is made by the caller, which writes
     /// its view at [`HostHeap::slot_handles`] and holds `resource` there.
     pub(crate) fn hold(&self, index: u32, resource: ID3D12Resource) {
+        self.stride(index, None);
         self.keep(index, Some(resource));
     }
 
@@ -852,6 +960,7 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
+            self.stride(index, kept.is_some().then_some(&view));
             let state = match (range, later, kept.is_some()) {
                 (_, true, _) => SLOT_DEFERRED,
                 (Some(_), _, false) => SLOT_FAILED,
@@ -1057,6 +1166,42 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
     ))
+}
+
+/// The element size of a buffer shader or unordered access view (its
+/// structure stride, 4 for a raw view, the format's for a typed one), what
+/// the console's descriptor holds as its stride; 0 for any other view.
+/// Shaders that index a buffer whose stride only its descriptor has read
+/// it from the heap's stride table (`victory_shader::emit::stride_table_slot`).
+fn view_stride(view: &View) -> u32 {
+    let srv = |words: &[u32; 10]| element_size(&srv_desc(words));
+    let uav = |words: &[u32; 10]| {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        if buffer.StructureByteStride > 0 {
+            u64::from(buffer.StructureByteStride)
+        } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        }
+    };
+    let words = |desc: &[u32]| -> Option<[u32; 10]> { desc.get(..10)?.try_into().ok() };
+    let bytes = match view {
+        View::Shader(r, Some(desc)) if crate::resource::buffer_bytes(*r as crate::object::This).is_some() => {
+            srv(desc)
+        }
+        View::Unordered(r, _, Some(desc))
+            if crate::resource::buffer_bytes(*r as crate::object::This).is_some() =>
+        {
+            uav(desc)
+        }
+        View::Placed(false, resource, desc) if resource[0] == 1 => words(&desc[..]).map_or(0, |w| srv(&w)),
+        View::Placed(true, resource, desc) if resource[0] == 1 => words(&desc[..]).map_or(0, |w| uav(&w)),
+        _ => 0,
+    };
+    u32::try_from(bytes).unwrap_or(0)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.

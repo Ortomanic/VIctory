@@ -454,6 +454,17 @@ fn table_cbv(used: Option<&UsedResource>) -> bool {
 pub const HEAP_VIEWS: u32 = 1_000_000;
 pub const HEAP_SAMPLERS: u32 = 2048;
 
+/// The view heap slot of the host's stride table in a heap of
+/// `heap_views` slots: a raw view of one dword per heap slot, the element
+/// size of the buffer view the host made there (0: none). A program that
+/// indexes a buffer whose stride only the run-time descriptor has (taken
+/// from the heap by data: the world's instance culling) reads its stride
+/// there and the buffer raw. The last slot stays the clamp's (see
+/// [`Lower::heap_index`]), so the table is the one before it.
+pub fn stride_table_slot(heap_views: u32) -> u32 {
+    heap_views.max(2) - 2
+}
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -4473,6 +4484,43 @@ impl<'a> Lower<'a> {
         self.as_int(x)
     }
 
+    /// A buffer access by element `index` at byte `off` of the element:
+    /// the handle and its two coordinates. With the stride known (the
+    /// used-resource entry), a structured handle; without it (a descriptor
+    /// taken from the heap by data: only the run-time descriptor has it,
+    /// and stripped bitcode does not say), a raw handle at
+    /// `index * stride + off`, the stride read from the host's stride table
+    /// ([`stride_table_slot`]) at the view's heap slot.
+    fn indexed_buffer(
+        &mut self,
+        site: Site,
+        src: &Source,
+        used: Option<&UsedResource>,
+        u: u32,
+        index: V,
+        off: V,
+    ) -> Result<(V, V, V), Why> {
+        let stride = used.map_or(0, |u| u.stride);
+        if stride >= 4 && stride.is_multiple_of(4) {
+            let h = self.handle(site, src, false, (12 | u, stride))?;
+            return Ok((h, index, off));
+        }
+        let slot = self
+            .lane_heap_index(src, false)
+            .map_err(|_| "a structured buffer of unknown stride")?;
+        let c = self.cur;
+        let table = self.s.m.i32(stride_table_slot(self.x.heap_views));
+        let th = self.s.heap_handle(c, table, false, false, (11, 0));
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Mul, slot, four);
+        let stride = self.raw_dword(th, at);
+        let c = self.cur;
+        let start = self.s.m.bin(c, Bin::Mul, index, stride);
+        let byte = self.s.m.bin(c, Bin::Add, start, off);
+        let h = self.handle(site, src, false, (11 | u, 0))?;
+        Ok((h, byte, self.s.m.undef(self.s.t.i32)))
+    }
+
     /// The dword at a computed byte address of a constant buffer (its
     /// 16-byte row bounds-checked through a root view).
     fn cbuffer_dword(&mut self, h: V, a: V) -> V {
@@ -8177,12 +8225,8 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    let (h, a, b) = self.indexed_buffer(site, src, used, u, index, off)?;
+                    (h, [a, b, iu])
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
@@ -8260,12 +8304,9 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
+                        let (h, a, b) = self.indexed_buffer(site, src, used, u, index, off)?;
+                        args.push(h);
+                        args.extend([a, b]);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
@@ -8323,18 +8364,14 @@ impl<'a> Lower<'a> {
             let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let (h, a, b) = self.indexed_buffer(site, src, used, u, index, off)?;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, index, off, mask, align],
+                        &[h, a, b, mask, align],
                     )
                 }
                 None => {
