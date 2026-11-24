@@ -4154,6 +4154,20 @@ impl<'a> Lower<'a> {
         matches!((first_lane_of(x), first_lane_of(y)), (Some(a), Some(b)) if a == b)
     }
 
+    /// Whether a phi or an instruction other than a memory access (which
+    /// reads a descriptor's registers as its resource) reads `v`.
+    fn read_as_data(&self, v: Value) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.phis.iter().any(|p| p.args.contains(&v))
+                || b.insts.iter().any(|i| {
+                    !matches!(
+                        i.fields,
+                        Fields::Smem { .. } | Fields::Buffer { .. } | Fields::Image { .. }
+                    ) && i.reads.iter().any(|r| r.1 == v)
+                })
+        })
+    }
+
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
@@ -4235,6 +4249,15 @@ impl<'a> Lower<'a> {
                     // when the descriptor has a stride, else in bytes; the
                     // structured view's dimension is its element count and
                     // the raw one's its size in bytes.
+                    // Only when the count is read: other dwords are not
+                    // given, and a load whose dwords are all unread needs
+                    // no query.
+                    let count_read = inst
+                        .write(Reg::S(code + first + 2))
+                        .is_some_and(|v| self.read_as_data(v));
+                    if !count_read {
+                        return Err("a scalar memory read as data");
+                    }
                     if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                         return Err("a constant buffer's descriptor read as data");
                     }
