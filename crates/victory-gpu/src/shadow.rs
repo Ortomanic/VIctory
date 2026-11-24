@@ -327,6 +327,20 @@ impl Shadow {
                     copied[page - base] = now;
                 }
             }
+        } else if from < to {
+            // Every declared range was snapshotted when submitted
+            // (`writing`), merged as the union is: a range found in none
+            // would lose what the GPU wrote there.
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BackMissed, 1);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    address = format_args!("{address:#x}"),
+                    len,
+                    "a range shaders wrote has no snapshot: not copied back"
+                );
+            });
         }
         written
     }
