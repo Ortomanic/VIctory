@@ -113,13 +113,22 @@ impl Shader {
                     translate(&self.container)
                 };
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            "shader translated"
+                        );
+                        if t.host.zero_filled_phis {
+                            tracing::info!(
+                                stage = self.stage,
+                                hash = %self.hash,
+                                "#612 fallback: zero-filled live phi"
+                            );
+                        }
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,

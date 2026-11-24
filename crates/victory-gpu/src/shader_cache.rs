@@ -94,6 +94,10 @@ fn build() -> &'static [u8; 32] {
                     tracing::warn!("VICTORY_WAVE64_UNIFORM=0: no uniform wave64 form");
                     bytes.extend_from_slice(b"no uniform wave64");
                 }
+                if victory_shader::emit::strict_phis() {
+                    tracing::warn!("VICTORY_STRICT_PHIS=1: no zero-filled joins (#612 stopgap off)");
+                    bytes.extend_from_slice(b"strict phis");
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -254,6 +258,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         out.extend(slots);
     }
     word(&mut out, u32::from(s.bindless));
+    word(&mut out, u32::from(s.zero_filled_phis));
     out
 }
 
@@ -311,6 +316,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let bindless = u8::try_from(r.word()?).ok()?;
+    let zero_filled_phis = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -320,6 +326,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         bindless,
+        zero_filled_phis,
     })
 }
 
@@ -347,6 +354,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             bindless: victory_shader::emit::BINDLESS_WRITES,
+            zero_filled_phis: true,
         }
     }
 

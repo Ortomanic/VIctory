@@ -56,6 +56,9 @@ pub(crate) struct Lowered {
     /// UAV handles made `globallycoherent` (read by tests).
     #[cfg_attr(not(test), allow(dead_code))]
     pub coherent: u32,
+    /// Lowered without upstream #612's transitive phi liveness, its dead
+    /// joins zero-filled (see [`lower_as`]).
+    pub zero_filled_phis: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -188,10 +191,50 @@ fn uniform_candidate(parts: &Parts) -> bool {
     parts.native.wave64 && (33..=64).contains(&n)
 }
 
+/// Stopgap after upstream #612 ("a phi that only another read phi
+/// consumes is live too"): a program that lowers only without that
+/// transitive liveness is lowered so, the joins it made live zero-filled as
+/// before #612 (and the result marked [`Lowered::zero_filled_phis`]). The
+/// zeros are probably wrong data on those paths (222 of the title's
+/// programs, ped skinning among them, translated so before #612); the real
+/// fix is a DXIL form for the values behind them. `VICTORY_STRICT_PHIS=1`
+/// keeps #612's refusal.
 fn lower_as(parts: &Parts, form: Form) -> Result<Lowered, ShaderError> {
+    match lower_phis(parts, form, true) {
+        Err(e @ ShaderError::Unsupported { .. }) if !strict_phis() => {
+            match lower_phis(parts, form, false) {
+                Ok(mut l) => {
+                    l.zero_filled_phis = true;
+                    Ok(l)
+                }
+                Err(_) => Err(e),
+            }
+        }
+        r => r,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: as `VICTORY_STRICT_PHIS=1`, on this thread.
+    static STRICT_PHIS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether #612's refusal stands ([`super::strict_phis`]).
+fn strict_phis() -> bool {
+    #[cfg(test)]
+    if STRICT_PHIS.get() {
+        return true;
+    }
+    super::strict_phis()
+}
+
+/// [`lower_as`], with (`strict_phis`) or without #612's transitive phi
+/// liveness.
+fn lower_phis(parts: &Parts, form: Form, strict_phis: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, form).run() {
+        match Lower::new(parts, &bad, form, strict_phis).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -292,6 +335,8 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// Phis that only another read phi consumes are live too (#612).
+    strict_phis: bool,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -797,7 +842,12 @@ fn coherent_descriptors(p: &Program, res: &Resources) -> HashSet<DescriptorAt> {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, form: Form) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        form: Form,
+        strict_phis: bool,
+    ) -> Self {
         let split_ok = form != Form::Plain;
         let p = x.p;
         let mut phi_at = HashMap::new();
@@ -960,6 +1010,7 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            strict_phis,
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -1505,6 +1556,7 @@ impl<'a> Lower<'a> {
             uniform: self.split.is_some_and(|s| s.uniform),
             split_refused: self.split_refused,
             coherent: self.coherent_handles,
+            zero_filled_phis: false,
         })
     }
 
@@ -8830,7 +8882,11 @@ impl<'a> Lower<'a> {
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
         // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
         // lowering accepts what it refuses when the same value is read directly.
-        let mut work: Vec<Value> = self.read_phis.iter().copied().collect();
+        let mut work: Vec<Value> = if self.strict_phis {
+            self.read_phis.iter().copied().collect()
+        } else {
+            Vec::new()
+        };
         while let Some(v) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
@@ -9858,7 +9914,14 @@ mod tests {
             Err(error) => panic!("{error}"),
         };
         let direct = [&words[..2], &words[8..]].concat();
+        // Upstream #612 (VICTORY_STRICT_PHIS=1): refused as the direct read.
+        super::STRICT_PHIS.set(true);
         assert_eq!(refusal(&words), refusal(&direct));
+        super::STRICT_PHIS.set(false);
+        // The stopgap: lowered with the joins zero-filled, and marked so.
+        assert!(refusal(&direct).is_some());
+        let zero_filled = lower_full(&words, false, false, vec![], vec![], group_ids_xy);
+        assert!(zero_filled.unwrap().zero_filled_phis);
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
     }

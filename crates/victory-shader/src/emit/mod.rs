@@ -134,6 +134,15 @@ pub fn wave64_uniform() -> bool {
     })
 }
 
+/// `VICTORY_STRICT_PHIS=1`: a program that lowers only without upstream
+/// #612's transitive phi liveness is refused, as upstream does, instead of
+/// lowered with those joins zero-filled (the stopgap in `lower`). Part of
+/// the translation: the shader cache keys on it.
+pub fn strict_phis() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_STRICT_PHIS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
@@ -301,6 +310,9 @@ pub struct HostShader {
     /// ([`BINDLESS_WRITES`]) memory through heap descriptors at slots it
     /// computes from data ([`bindless`]): which slots the host cannot know.
     pub bindless: u8,
+    /// Translated only with joins zero-filled that upstream #612 refuses
+    /// (a stopgap, `lower::lower_as`; probably wrong data on those paths).
+    pub zero_filled_phis: bool,
 }
 
 /// [`HostShader::bindless`]: reads through descriptors from data.
@@ -544,6 +556,7 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         bindless: bindless(p, res, &native.layout),
+        zero_filled_phis: l.zero_filled_phis,
     })
 }
 
@@ -1105,6 +1118,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             bindless: 0,
+            zero_filled_phis: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1116,6 +1130,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 bindless: 0,
+                zero_filled_phis: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
