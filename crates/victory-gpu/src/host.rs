@@ -1760,6 +1760,7 @@ impl Meter {
     fn frame(&mut self, hwnd: HWND, depth_preview: bool) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
+        crate::watch::new_frame();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {

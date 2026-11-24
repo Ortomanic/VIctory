@@ -44,8 +44,14 @@ pub(crate) enum C {
     TexQueryUs,
     TexHashUs,
     TexDetileUs,
+    /// Of the guarded askings: allocation-type queries made (the others
+    /// were known, `watch::KINDS`) and their time; guarded blocks not
+    /// reported written because nothing is committed there.
+    RegionQueries,
+    RegionQueryUs,
+    HoleSkips,
 }
-const COUNTERS: usize = 26;
+const COUNTERS: usize = 29;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -108,7 +114,8 @@ pub(crate) fn log(frames: f64) {
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+         unchanged; {:.1} fallbacks; {:.0} guard faults; {:.1} region queries {:.2} ms, {:.0} hole \
+         blocks skipped; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed; texture read {:.2} ms, committed \
          {:.2} ms, hash {:.2} ms, detile {:.2} ms",
         c[C::Submissions as usize],
@@ -131,6 +138,9 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
         c[C::GuardFaults as usize],
+        c[C::RegionQueries as usize],
+        ms(c[C::RegionQueryUs as usize]),
+        c[C::HoleSkips as usize],
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
