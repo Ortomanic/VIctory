@@ -391,6 +391,17 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+/// Whether `used` is a constant buffer in a descriptor table. Those are
+/// read as raw buffers (`ByteAddressBuffer`): the host makes the title's
+/// constant buffer views raw shader views of its copy of the memory, which
+/// need 16-byte alignment as the console's do, where host constant buffer
+/// views need 256 (a table holding one had to be made afresh per draw in
+/// dynamic slots, with the data copied, and the world's first frames ran
+/// out of them). Root constant buffers stay constant buffers.
+fn table_cbv(used: Option<&UsedResource>) -> bool {
+    used.is_some_and(|u| u.kind == ResourceType::Cbv && u.root == RootType::Table)
+}
+
 /// Heap indices are clamped below these (see [`Lower::heap_index`]): the
 /// view slots a host heap has by default (1,000,000, the D3D12 minimum for
 /// resource binding tier 2; a host whose heaps hold more says so in
@@ -4013,7 +4024,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+        if matches!(kind, Some(u) if u.kind == ResourceType::Srv || table_cbv(Some(u))) {
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -4388,6 +4399,26 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    /// The dword at byte address `a` (its low two bits ignored, as the
+    /// console's dword loads do) of the raw buffer `h`.
+    fn raw_dword(&mut self, h: V, a: V) -> V {
+        let c = self.cur;
+        let not3 = self.s.m.i32(!3);
+        let a = self.s.m.bin(c, Bin::And, a, not3);
+        let mask = self.s.m.i8(1);
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, a, u, mask, al],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        self.as_int(x)
     }
 
     /// The dword at a computed byte address of a constant buffer (its
@@ -8055,7 +8086,8 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let raw = table_cbv(used);
+            let h = self.handle(site, src, false, if raw { (11, 0) } else { (13, 0x1_0000) })?;
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -8070,7 +8102,7 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = if raw { self.raw_dword(h, a) } else { self.cbuffer_dword(h, a) };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

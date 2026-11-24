@@ -915,23 +915,25 @@ impl State {
         }
     }
 
-    /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
+    /// The descriptors a shader reads through tables. Tables reaching past
+    /// the title slots the host mirrors are made afresh for the draw in
+    /// dynamic slots. Returns those tables' new byte offsets by root
     /// parameter; the other tables' slots are made from the title's.
+    /// Constant buffers in tables are raw views of their host copy, read
+    /// as raw buffers by translated shaders and copied at submission as
+    /// other buffer views are (they were made afresh per draw with their
+    /// data copied, the host wanting constant buffer views 256-byte
+    /// aligned where the console wants 16: ~50,000 dynamic slots per world
+    /// frame, and the world's first frames dropped up to ~1,500 draws a
+    /// frame for want of slots).
     ///
     /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// once, and lists share such tables (see `HostHeap::acquire`).
     ///
     /// `None` when a table to make afresh could not be made (no free
     /// dynamic slots): the shader would index the title's slots instead,
-    /// which the host has not made (a constant buffer table) or does not
-    /// have (past the host heap: the host's dynamic slots, or memory after
-    /// the heap). Constants read from there bound the world's loops
+    /// which the host does not have (past the host heap: the host's
+    /// dynamic slots, or memory after the heap). Constants read from there bound the world's loops
     /// (CS_Visibility hung the GPU, Xid 109); descriptors read from there
     /// fault (Xid 13). The draw must not run.
     fn tables(
@@ -941,12 +943,9 @@ impl State {
         compute: bool,
     ) -> Option<Vec<(u8, u32)>> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        // Constant buffers in tables are raw views of their host copy (made
+        // from the title's slots like other views), not made afresh.
+        let mut fresh: Vec<u8> = Vec::new();
         // Tables without host slots of their own (for the count).
         let mut past: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
@@ -1015,7 +1014,7 @@ impl State {
                 rec_timed!(RecHitUs);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::RecTableHits, 1);
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in &entries {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u, &view);
@@ -1026,7 +1025,7 @@ impl State {
             }
             // Made by another list (a table without constant buffers:
             // what it holds comes from the title's records alone).
-            let shareable = share_tables() && entries.iter().all(|u| u.kind != ResourceType::Cbv);
+            let shareable = share_tables();
             let shared_key = (key.0, key.1, n);
             if shareable && let Some((first, n, token)) = host.acquire(&shared_key) {
                 SHARED_HITS.fetch_add(1, Ordering::Relaxed);
@@ -1070,22 +1069,12 @@ impl State {
             self.fresh_tables.insert(key, first);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n, token, true));
-            let mut constants = false;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
-                        constants = true;
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
-                        };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
-                    }
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
@@ -1102,7 +1091,7 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             drop(making);
-            let counts = if shareable && !constants {
+            let counts = if shareable {
                 host.share(shared_key, first, n, token);
                 &MADE_SHARED
             } else {
