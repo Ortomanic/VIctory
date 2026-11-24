@@ -111,6 +111,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+#[cfg(all(test, windows))]
+mod wave64_gpu_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
