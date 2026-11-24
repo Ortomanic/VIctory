@@ -5753,8 +5753,13 @@ impl<'a> Lower<'a> {
                 let h = 2 * attribute.channel;
                 let c = self.cur;
                 if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?
-                        .ok_or("a packed input half no element holds")?;
+                    // A half no signature element holds is the row's padding
+                    // (a float3 packed into two dwords): unspecified on the
+                    // hardware, so zero here rather than a failed program.
+                    let lo = match half(self, h + u8::from(attribute.high))? {
+                        Some(x) => x,
+                        None => self.s.m.i32(0),
+                    };
                     self.low_half(inst, reg, lo)
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
@@ -7192,7 +7197,8 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower, packed_half};
+    use crate::emit::container::SigElement;
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -7826,6 +7832,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            host_wave32: false,
         })
         .map(|_| ())
     }
@@ -7850,6 +7857,28 @@ mod tests {
         lowers_image(&[0xF094_0F08, 0x4082_0004]).unwrap();
         // The same with 32-bit coordinates: v[4:6]
         lowers_image(&[0xF094_0F08, 0x0082_0004]).unwrap();
+    }
+
+    #[test]
+    fn a_packed_half_no_element_holds_is_padding() {
+        // A half3 in row 0 packed two to a dword: halves 0..2 are x, y, z;
+        // half 3 is padding (no element holds it), which the interpolation
+        // now reads as zero instead of failing.
+        let element = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 3,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 3,
+            usage: 7,
+            half: true,
+        };
+        let elements = [element];
+        assert_eq!(packed_half(&elements, 0, None, 2), Some((0, 2)));
+        assert_eq!(packed_half(&elements, 0, None, 3), None);
     }
 
     #[test]
