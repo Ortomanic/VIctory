@@ -153,6 +153,14 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<(u64, u32)> {
     Some((gpu, bounds))
 }
 
+/// Times the rest of the scope into a recording counter (diagnostics).
+macro_rules! rec_timed {
+    ($c:ident) => {
+        #[cfg(feature = "diagnostics")]
+        let _rec_timed = crate::copystat::timed(crate::copystat::C::$c);
+    };
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -433,6 +441,7 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        rec_timed!(RecIaUs);
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -494,6 +503,7 @@ impl State {
     /// False when a stage's tables cannot be bound safely (see
     /// [`State::tables`]): the draw or dispatch is dropped.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        rec_timed!(RecBindUs);
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -536,9 +546,15 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let Some(made) = self.tables(list, &t.used, compute) else {
+            let made = {
+                rec_timed!(RecTablesUs);
+                self.tables(list, &t.used, compute)
+            };
+            let Some(made) = made else {
                 return false;
             };
+            #[cfg(feature = "diagnostics")]
+            let views_started = std::time::Instant::now();
             // Root views first: the user data holds their lengths.
             let mut lengths: Vec<(u8, u32)> = Vec::new();
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
@@ -563,6 +579,8 @@ impl State {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::since(crate::copystat::C::RecRootViewsUs, views_started);
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -719,7 +737,11 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        let view = {
+            rec_timed!(RecMirrorUs);
+            host.mirror(index, handle, true)
+        };
+        if let Some(view) = view {
             readable(list, u, &view);
         }
     }
@@ -1252,6 +1274,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
 fn readable(list: &HostList, u: &UsedResource, view: &View) {
+    rec_timed!(RecReadableUs);
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);

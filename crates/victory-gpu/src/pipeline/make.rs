@@ -155,6 +155,8 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::since(crate::copystat::C::RecWaitUs, started);
 }
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started

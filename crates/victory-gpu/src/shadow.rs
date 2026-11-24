@@ -406,6 +406,11 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    #[cfg(feature = "diagnostics")]
+    let _finding = {
+        crate::copystat::add(crate::copystat::C::RecFinds, 1);
+        crate::copystat::timed(crate::copystat::C::RecFindUs)
+    };
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map

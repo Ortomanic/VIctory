@@ -113,8 +113,25 @@ pub(crate) enum C {
     /// committed views.
     FallbackQueries,
     FallbackKnown,
+    /// Of the recording (frame-perf): waiting for host pipelines being made
+    /// (`pipeline::make::wait`), binding (`State::bind`: heaps, root
+    /// signature, pipeline, user data), of that the tables and the root
+    /// views, the table descriptors' host slots (`HostHeap::mirror`), what
+    /// they read (`readable`: buffer ranges, texture uploads and states),
+    /// vertex and index buffers, the breadcrumb notes, and the buffer-copy
+    /// lookups (`shadow::find`, any thread) and their count.
+    RecWaitUs,
+    RecBindUs,
+    RecTablesUs,
+    RecRootViewsUs,
+    RecMirrorUs,
+    RecReadableUs,
+    RecIaUs,
+    RecNoteUs,
+    RecFindUs,
+    RecFinds,
 }
-const COUNTERS: usize = 37 + 32;
+const COUNTERS: usize = C::RecFinds as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -312,6 +329,23 @@ pub(crate) fn log(frames: f64) {
         slow_us as f64 / 1e3,
         // The present's own execute counts in both.
         (wall - us(C::ExecUs) - us(C::PresentUs) + us(C::PresentExecUs)).max(0.0),
+    );
+    tracing::info!(
+        "recording per frame: {:.1} ms in {:.0} draws and dispatches: pipeline waits {:.1}, bind \
+         {:.1} (tables {:.1}: host slots {:.1}, what they read {:.1}; root views {:.1}), vertex \
+         and index {:.1}, notes {:.1}; buffer lookups {:.0} in {:.1} ms (all threads)",
+        us(C::RecordUs),
+        at(C::Records),
+        us(C::RecWaitUs),
+        us(C::RecBindUs),
+        us(C::RecTablesUs),
+        us(C::RecMirrorUs),
+        us(C::RecReadableUs),
+        us(C::RecRootViewsUs),
+        us(C::RecIaUs),
+        us(C::RecNoteUs),
+        at(C::RecFinds),
+        us(C::RecFindUs),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
