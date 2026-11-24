@@ -359,6 +359,10 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Per block ending in a branch: the console takes it when every lane's
+    /// `when` holds (`s_cbranch_execz`, `vccz`, SCC of "no lane differs"),
+    /// else when some lane's does.
+    pub wave_all: Vec<bool>,
 }
 
 impl Structured {
@@ -373,7 +377,21 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, false)
+}
+
+/// [`structure`] with conditions that hold for every lane, whatever path
+/// it took: guards are EXEC's bit wherever EXEC is not all lanes, branch
+/// conditions are not narrowed by what a lane knows on arrival, and mask
+/// joins stay joins. For lowering where every lane of a console wave runs
+/// every block the wave runs (`docs/wave64-on-wave32.md`, uniform form).
+pub fn structure_absolute(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, true)
+}
+
+fn structure_as(program: &Program, absolute: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.absolute = absolute;
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -410,7 +428,7 @@ struct Lanes<'a> {
     other: Map<Key, Bool>,
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
-    scc_lane: Map<Value, Bool>,
+    scc_lane: Map<Value, (Bool, bool)>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
     /// Per block: what a lane knows on entry, over forward edges only.
@@ -421,6 +439,10 @@ struct Lanes<'a> {
     active: HashSet<Value>,
     /// The incoming masks of each join left as an [`Atom::Phi`].
     phi_args: Vec<Vec<Key>>,
+    /// Per block ending in a branch: see [`Structured::wave_all`].
+    all: Vec<bool>,
+    /// See [`structure_absolute`].
+    absolute: bool,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -485,6 +507,8 @@ impl<'a> Lanes<'a> {
             when: vec![None; blocks.len()],
             active: HashSet::new(),
             phi_args: Vec::new(),
+            all: vec![false; blocks.len()],
+            absolute: false,
         })
     }
 
@@ -549,7 +573,9 @@ impl<'a> Lanes<'a> {
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                self.when[b] = Some(self.branch(last));
+                let (when, all) = self.branch(last);
+                self.when[b] = Some(when);
+                self.all[b] = all;
             }
         }
         // A join left per lane takes each incoming mask's bit on its edge:
@@ -633,6 +659,7 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
+                        (&Some(e), _) if self.absolute => (e != Bool::TRUE).then_some(e),
                         (&Some(e), _) if b.implies(cond[n], e) => None,
                         (&Some(e), _) => Some(b.given(e, cond[n])),
                     })
@@ -647,7 +674,10 @@ impl<'a> Lanes<'a> {
                 Exit::End => LaneExit::End,
                 Exit::Indirect => LaneExit::Indirect,
                 Exit::Branch { taken, not_taken } => LaneExit::Branch {
-                    when: b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]),
+                    when: match self.when[n].unwrap_or(Bool::FALSE) {
+                        w if self.absolute => w,
+                        w => b.given(w, cond[n]),
+                    },
                     taken,
                     not_taken,
                 },
@@ -667,6 +697,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            wave_all: self.all,
             bools: self.b,
             exits,
             guards,
@@ -781,7 +812,7 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        if !self.unresolved.contains(&id) && !self.absolute {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
@@ -974,7 +1005,7 @@ impl<'a> Lanes<'a> {
                         }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
-                        self.scc_lane.insert(scc, m);
+                        self.scc_lane.insert(scc, (m, false));
                     }
                 }
                 // `s_cmp_eq/lg` of a mask: "no lane differs" per lane.
@@ -990,12 +1021,10 @@ impl<'a> Lanes<'a> {
                         (self.operand(inst, a), self.operand(inst, c))
                 {
                     let ne = self.b.xor(a, c);
-                    let m = if rest.starts_with("eq") {
-                        self.b.not(ne)
-                    } else {
-                        ne
-                    };
-                    self.scc_lane.insert(scc, m);
+                    let eq = rest.starts_with("eq");
+                    let m = if eq { self.b.not(ne) } else { ne };
+                    // Equal: no lane differs (every lane); else some lane.
+                    self.scc_lane.insert(scc, (m, eq));
                 }
             }
             Fields::Valu(v) => {
@@ -1035,12 +1064,14 @@ impl<'a> Lanes<'a> {
         }
     }
 
-    /// The per-lane condition under which a block's closing branch is taken.
-    fn branch(&mut self, inst: &Inst) -> Bool {
+    /// The per-lane condition under which a block's closing branch is
+    /// taken, and whether the console takes it when every lane's holds
+    /// (else some lane's: [`Structured::wave_all`]).
+    fn branch(&mut self, inst: &Inst) -> (Bool, bool) {
         let exec = self.exec(inst);
         match inst.name() {
-            "s_cbranch_execz" => self.b.not(exec),
-            "s_cbranch_execnz" => exec,
+            "s_cbranch_execz" => (self.b.not(exec), true),
+            "s_cbranch_execnz" => (exec, false),
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
                 let vcc = match self.key(|r| inst.read(r), VCC) {
                     Some(k) => self.mask(k).0,
@@ -1048,26 +1079,26 @@ impl<'a> Lanes<'a> {
                 };
                 let any = self.b.and(vcc, exec);
                 if n.ends_with("nz") {
-                    any
+                    (any, false)
                 } else {
-                    self.b.not(any)
+                    (self.b.not(any), true)
                 }
             }
             n => {
                 let Some(scc) = inst.read(Reg::Scc) else {
-                    return Bool::FALSE;
+                    return (Bool::FALSE, false);
                 };
-                let set = match self.scc_lane.get(&scc) {
+                let (set, all) = match self.scc_lane.get(&scc) {
                     Some(&m) => m,
                     None => {
                         let born = self.born(scc);
-                        self.b.atom(Atom::Uniform(scc), born)
+                        (self.b.atom(Atom::Uniform(scc), born), false)
                     }
                 };
                 if n == "s_cbranch_scc1" {
-                    set
+                    (set, all)
                 } else {
-                    self.b.not(set)
+                    (self.b.not(set), !all)
                 }
             }
         }
