@@ -75,9 +75,9 @@ pub(crate) struct State {
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count, owner
-    /// token; lent back when a run of the list has finished, given back
-    /// when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32, u32)>,
+    /// token, and whether it holds them now; lent back when a run of the
+    /// list has finished, given back when the list is reset or released.
+    dynamic: Vec<(usize, u32, u32, u32, bool)>,
     /// Runs of the list since it was recorded.
     runs: u32,
     /// Whether its dynamic slots are lent back (it has run).
@@ -89,8 +89,8 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n, token) in &self.dynamic {
-            crate::descriptor::with_host_heap(heap, |h| h.release(first, n, token));
+        for &(heap, first, n, token, held) in &self.dynamic {
+            crate::descriptor::with_host_heap(heap, |h| h.release(first, n, token, held));
         }
     }
 }
@@ -101,13 +101,32 @@ impl Drop for State {
 static LENT: AtomicU64 = AtomicU64::new(0);
 static RECLAIMED: AtomicU64 = AtomicU64::new(0);
 static LOST_RUNS: AtomicU64 = AtomicU64::new(0);
+/// Tables made afresh found made by another list (shared), since the
+/// last call.
+static SHARED_HITS: AtomicU64 = AtomicU64::new(0);
+/// Tables made afresh: shared (no constant buffers) and their slots,
+/// with constant buffers (the list's own) and their slots.
+static MADE_SHARED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static MADE_OWN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// `VICTORY_SHARE_TABLES=0`: tables made afresh are not shared between
+/// lists (each list makes its own, as before).
+fn share_tables() -> bool {
+    static SHARE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHARE.get_or_init(|| std::env::var("VICTORY_SHARE_TABLES").map_or(true, |v| v != "0"))
+}
 
 /// Since the last call: dynamic slots lent back, lent runs reclaimed,
 /// lists not run (their slots were taken), and draws and dispatches
 /// dropped because a table to make afresh could not be made.
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
-pub(crate) fn take_slot_stats() -> [u64; 4] {
+pub(crate) fn take_slot_stats() -> [u64; 9] {
     [
+        MADE_SHARED[0].swap(0, Ordering::Relaxed),
+        MADE_SHARED[1].swap(0, Ordering::Relaxed),
+        MADE_OWN[0].swap(0, Ordering::Relaxed),
+        MADE_OWN[1].swap(0, Ordering::Relaxed),
+        SHARED_HITS.swap(0, Ordering::Relaxed),
         LENT.swap(0, Ordering::Relaxed),
         RECLAIMED.swap(0, Ordering::Relaxed),
         LOST_RUNS.swap(0, Ordering::Relaxed),
@@ -243,9 +262,14 @@ impl State {
     pub(crate) fn before_run(&mut self) -> bool {
         if self.lent {
             self.lent = false;
-            for &(heap, first, n, token) in &self.dynamic {
-                let back = crate::descriptor::with_host_heap(heap, |h| h.reclaim(first, n, token));
-                if back == Some(false) {
+            for (heap, first, n, token, held) in &mut self.dynamic {
+                if *held {
+                    continue;
+                }
+                let (first, n, token) = (*first, *n, *token);
+                *held = crate::descriptor::with_host_heap(*heap, |h| h.reclaim(first, n, token))
+                    == Some(true);
+                if !*held {
                     self.lost = true;
                 }
             }
@@ -269,8 +293,11 @@ impl State {
             return;
         }
         let mut lent = 0;
-        for &(heap, first, n, token) in &self.dynamic {
-            lent += crate::descriptor::with_host_heap(heap, |h| h.lend(first, n, token)).unwrap_or(0);
+        for (heap, first, n, token, held) in &mut self.dynamic {
+            if std::mem::replace(held, false) {
+                let (first, n, token) = (*first, *n, *token);
+                lent += crate::descriptor::with_host_heap(*heap, |h| h.lend(first, n, token)).unwrap_or(0);
+            }
         }
         LENT.fetch_add(u64::from(lent), Ordering::Relaxed);
         self.lent = true;
@@ -312,7 +339,7 @@ impl State {
             (!heap.samplers()).then(|| heap.host()).flatten().map(|host| (h, host))
         })?;
         let (first, token) = host.dynamic(n)?;
-        self.dynamic.push((title, first, n, token));
+        self.dynamic.push((title, first, n, token, true));
         if self.host_heaps != self.heaps {
             let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
@@ -924,6 +951,24 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            // Made by another list (a table without constant buffers:
+            // what it holds comes from the title's records alone).
+            let shareable = share_tables() && entries.iter().all(|u| u.kind != ResourceType::Cbv);
+            let shared_key = (key.0, key.1, n);
+            if shareable && let Some((first, n, token)) = host.acquire(&shared_key) {
+                SHARED_HITS.fetch_add(1, Ordering::Relaxed);
+                self.fresh_tables.insert(key, first);
+                self.dynamic
+                    .push((std::ptr::from_ref(heap) as usize, first, n, token, true));
+                for u in &entries {
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    if let Some(view) = crate::descriptor::view(handle) {
+                        readable(list, u, &view);
+                    }
+                }
+                made.push((slot, first * 32));
+                continue;
+            }
             let first = {
                 rec_timed!(RecDynamicUs);
                 host.dynamic(n)
@@ -944,7 +989,8 @@ impl State {
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n, token));
+                .push((std::ptr::from_ref(heap) as usize, first, n, token, true));
+            let mut constants = false;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -952,6 +998,7 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        constants = true;
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -975,6 +1022,14 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             drop(making);
+            let counts = if shareable && !constants {
+                host.share(shared_key, first, n, token);
+                &MADE_SHARED
+            } else {
+                &MADE_OWN
+            };
+            counts[0].fetch_add(1, Ordering::Relaxed);
+            counts[1].fetch_add(u64::from(n), Ordering::Relaxed);
             made.push((slot, first * 32));
         }
         Some(made)

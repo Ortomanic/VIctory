@@ -61,7 +61,19 @@ struct Slots {
     high: usize,
     /// Runs taken from lent slots (the lender can no longer run again).
     stolen: u64,
+    /// Runs shared by lists (tables made afresh without constant buffers:
+    /// what they hold comes from the title's records alone), by content:
+    /// first slot, count, token.
+    cache: std::collections::HashMap<TableKey, (usize, usize, u32)>,
+    /// Of those, by token: the lists holding the run now (0: lent back)
+    /// and its key.
+    shared: std::collections::HashMap<u32, (u32, TableKey)>,
 }
+
+/// What a table made afresh holds: the title table's address, a hash of
+/// the records (view index and generation) of its entries, and their
+/// count. A record changes when the title writes the slot again.
+pub(crate) type TableKey = (u64, u64, u32);
 
 impl Slots {
     fn new(n: usize) -> Slots {
@@ -76,7 +88,82 @@ impl Slots {
             free: n,
             high: 0,
             stolen: 0,
+            cache: std::collections::HashMap::new(),
+            shared: std::collections::HashMap::new(),
         }
+    }
+
+    /// A run just made from `key` is shared: other lists may use it while
+    /// its slots stay this one's ([`Slots::acquire`]). Its maker holds it.
+    /// Kept private if another run of the same content is shared already.
+    fn share(&mut self, key: TableKey, first: usize, n: usize, token: u32) {
+        if self.cache.contains_key(&key) || self.owned(first, n, token).count() != n {
+            return;
+        }
+        self.cache.insert(key, (first, n, token));
+        self.shared.insert(token, (1, key));
+    }
+
+    /// The shared run made from `key`, held for one more list: taken back
+    /// first if every list had lent it back. `None` if there is none (or
+    /// another list took its slots since).
+    fn acquire(&mut self, key: &TableKey) -> Option<(usize, usize, u32)> {
+        let &(first, n, token) = self.cache.get(key)?;
+        if self.take_back(first, n, token) {
+            Some((first, n, token))
+        } else {
+            None
+        }
+    }
+
+    /// A shared run's slots were taken by another: it is gone.
+    fn forget(&mut self, token: u32) {
+        if let Some((_, key)) = self.shared.remove(&token) {
+            self.cache.remove(&key);
+        }
+    }
+
+    /// A list that holds the run has run: the run is lent back once no
+    /// list holds it. The slots lent.
+    fn put_down(&mut self, first: usize, n: usize, token: u32) -> usize {
+        if let Some(s) = self.shared.get_mut(&token) {
+            s.0 = s.0.saturating_sub(1);
+            if s.0 > 0 {
+                return 0;
+            }
+        }
+        self.lend(first, n, token)
+    }
+
+    /// The run held again by a list about to run (again): false if
+    /// another took its slots since it was lent back.
+    fn take_back(&mut self, first: usize, n: usize, token: u32) -> bool {
+        match self.shared.get(&token).map(|s| s.0) {
+            Some(users) if users > 0 => {}
+            Some(_) if self.reclaim(first, n, token) => {}
+            Some(_) => {
+                self.forget(token);
+                return false;
+            }
+            None => return self.reclaim(first, n, token),
+        }
+        if let Some(s) = self.shared.get_mut(&token) {
+            s.0 += 1;
+        }
+        true
+    }
+
+    /// The list that took or acquired the run was reset or released
+    /// (`held`: it holds the run now, it was not lent back). A run of its
+    /// own is free for good; a shared one is put down, and stays cached.
+    fn drop_run(&mut self, first: usize, n: usize, token: u32, held: bool) {
+        if self.shared.contains_key(&token) {
+            if held {
+                self.put_down(first, n, token);
+            }
+            return;
+        }
+        self.release(first, n, token);
     }
 
     #[cfg(test)]
@@ -225,6 +312,13 @@ impl Slots {
                     .find(next, end, n, false)
                     .or_else(|| self.find(0, next, n, false))?;
                 self.stolen += 1;
+                // Shared runs whose slots these were are gone.
+                let mut owners: Vec<u32> = self.owner[first..first + n].to_vec();
+                owners.sort_unstable();
+                owners.dedup();
+                for token in owners {
+                    self.forget(token);
+                }
                 first
             }
         };
@@ -490,27 +584,48 @@ impl HostHeap {
         (self.dynamic, now as u32, high as u32, stolen)
     }
 
-    /// The run of `n` from `first` (an index [`dynamic`] returned with
-    /// `token`) has finished running: lent back, its descriptors kept
-    /// until another list needs the slots. The slots lent.
+    /// A run a list holds (an index [`dynamic`] or [`acquire`] returned
+    /// with `token`) has finished running: lent back once no list holds
+    /// it, its descriptors kept until another list needs the slots. The
+    /// slots lent.
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    /// [`acquire`]: HostHeap::acquire
     pub(crate) fn lend(&self, first: u32, n: u32, token: u32) -> u32 {
         let Some(at) = first.checked_sub(self.count) else {
             return 0;
         };
         let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        slots.lend(at as usize, n as usize, token) as u32
+        slots.put_down(at as usize, n as usize, token) as u32
     }
 
-    /// A lent run taken back to run its list again; false if another list
+    /// A lent run held again to run its list again; false if another list
     /// took any of its slots.
     pub(crate) fn reclaim(&self, first: u32, n: u32, token: u32) -> bool {
         let Some(at) = first.checked_sub(self.count) else {
             return false;
         };
         let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        slots.reclaim(at as usize, n as usize, token)
+        slots.take_back(at as usize, n as usize, token)
+    }
+
+    /// A run just made from `key` (no constant buffers in it) may be used
+    /// by other lists' draws.
+    pub(crate) fn share(&self, key: TableKey, first: u32, n: u32, token: u32) {
+        let Some(at) = first.checked_sub(self.count) else {
+            return;
+        };
+        let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        slots.share(key, at as usize, n as usize, token);
+    }
+
+    /// The shared run made from `key`, held for the caller's list until
+    /// [`HostHeap::lend`] or [`HostHeap::release`]: first index, count,
+    /// token.
+    pub(crate) fn acquire(&self, key: &TableKey) -> Option<(u32, u32, u32)> {
+        let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let (at, n, token) = slots.acquire(key)?;
+        Some((self.count + at as u32, n as u32, token))
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -519,17 +634,18 @@ impl HostHeap {
         self.count
     }
 
-    /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned with `token`) for good: those another list took since it
-    /// was lent are left to that list.
+    /// The list holding `n` dynamic slots from `first` (an index
+    /// [`dynamic`] returned with `token`; `held`: not lent back) is reset
+    /// or released: a run of its own is given back for good (slots another
+    /// list took since are left to that list), a shared run put down.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32, token: u32) {
+    pub(crate) fn release(&self, first: u32, n: u32, token: u32, held: bool) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
         let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        slots.release(at as usize, n as usize, token);
+        slots.drop_run(at as usize, n as usize, token, held);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -1396,7 +1512,7 @@ mod tests {
         assert_eq!((a, b), (4, 4 + all - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50, ta);
+        heap.release(a, 50, ta, true);
         assert_eq!(heap.dynamic(50).map(|d| d.0), Some(4));
         assert_eq!(heap.dynamic(40).map(|d| d.0), Some(4 + all - 40));
     }
@@ -1442,6 +1558,42 @@ mod tests {
         assert_eq!(slots.lend(b, 100, tb), 100);
         assert_eq!(slots.free, 256 - 50);
         assert_eq!(slots.high, 256 - 6);
+    }
+
+    /// A shared run is held by every list using it, lent back when the
+    /// last puts it down, found again while its slots are untouched, and
+    /// forgotten once another run takes them.
+    #[test]
+    fn shared_runs_are_held_by_their_users_and_forgotten_when_taken() {
+        let mut slots = Slots::new(128);
+        let key = (0x1000, 77, 64);
+        let (a, ta) = slots.take_run(64).unwrap();
+        slots.share(key, a, 64, ta);
+        // Another list finds it while its maker holds it.
+        assert_eq!(slots.acquire(&key), Some((a, 64, ta)));
+        assert_eq!(slots.put_down(a, 64, ta), 0, "still held by one list");
+        assert_eq!(slots.put_down(a, 64, ta), 64, "lent once nobody holds it");
+        assert!(slots.is_lent(0) && !slots.is_taken(0));
+        // Found again (taken back) while lent and untouched.
+        assert_eq!(slots.acquire(&key), Some((a, 64, ta)));
+        assert!(slots.is_taken(0));
+        // A list reset while holding it puts it down; it stays cached.
+        slots.drop_run(a, 64, ta, true);
+        assert!(slots.is_lent(0));
+        // A list reset after lending it does nothing more.
+        slots.drop_run(a, 64, ta, false);
+        assert!(slots.is_lent(0));
+        // Another run needs its slots: it is gone.
+        let (b, _) = slots.take_run(64).unwrap();
+        assert_eq!(b, 64);
+        assert_eq!(slots.stolen, 0);
+        let (c, _) = slots.take_run(10).unwrap();
+        assert!(c < 64);
+        assert_eq!(slots.stolen, 1);
+        assert_eq!(slots.acquire(&key), None);
+        assert!(slots.cache.is_empty() && slots.shared.is_empty());
+        // Its old holders cannot take it back either.
+        assert!(!slots.take_back(a, 64, ta));
     }
 
     /// A structured view whose start in its host copy is not on an element
