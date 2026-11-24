@@ -210,6 +210,8 @@ pub fn track_lanes(
                         descriptor(s, Role::Sampler)?;
                     }
                 }
+                // Cache invalidations name no resource.
+                Fields::Buffer { .. } if inst.name().ends_with("_inv") => {}
                 Fields::Buffer { rsrc, .. } => descriptor(rsrc, Role::Resource)?,
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
                     descriptor(base, Role::Resource)?;

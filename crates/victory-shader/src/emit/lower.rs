@@ -50,6 +50,9 @@ pub(crate) struct Lowered {
     pub split: bool,
     /// Split lowering met an operation that needs the whole console wave.
     split_refused: Option<Why>,
+    /// UAV handles made `globallycoherent` (read by tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub coherent: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -315,6 +318,15 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// UAVs the code reads or writes past the per-CU cache (`glc`), by
+    /// where their descriptors are loaded from: declared `globallycoherent`
+    /// (see [`coherent_descriptors`]).
+    coherent: HashSet<DescriptorAt>,
+    /// The code invalidates the vector caches (`buffer_gl0_inv`,
+    /// `buffer_gl1_inv`): every UAV is `globallycoherent`.
+    all_coherent: bool,
+    /// Handles annotated `globallycoherent` so far.
+    coherent_handles: u32,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -622,6 +634,50 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// `dx.types.ResourceProperties` word 0 bits: a UAV, and a
+/// `globallycoherent` one.
+const UAV: u32 = 0x1000;
+const GLOBALLY_COHERENT: u32 = 0x4000;
+
+/// Where a descriptor is loaded from (root parameter, byte offset of its
+/// first dword, dynamic term, read from the first lane): the same resource
+/// however often the code reloads it.
+type DescriptorAt = (usize, u32, Option<Value>, bool);
+
+fn descriptor_at(scalar: &HashMap<Site, Address>, src: &Source) -> Option<DescriptorAt> {
+    let Source::Loaded { load, first } = src else {
+        return None;
+    };
+    let a = scalar.get(load)?;
+    let offset = a.offset.wrapping_add(4 * u32::from(*first));
+    Some((a.param, offset, a.dynamic, a.first_lane))
+}
+
+/// The descriptors of resources the code loads or stores with `glc`: past
+/// the per-CU vector cache, so the access sees (or makes visible) what
+/// other thread groups write. Atomics are left out: they always run in the
+/// device cache, and their `glc` asks for the old value.
+// shortcut: `dlc` and `slc` alone are not taken as coherence (they choose
+// GL1 and streaming policies; the CU cache still serves the access).
+fn coherent_descriptors(p: &Program, res: &Resources) -> HashSet<DescriptorAt> {
+    let scalar = res.scalar.iter().copied().collect();
+    res.descriptors
+        .iter()
+        .filter(|d| d.role == Role::Resource)
+        .filter(|d| {
+            let inst = &p.blocks[d.site.0].insts[d.site.1];
+            let name = inst.name();
+            let glc = match &inst.fields {
+                Fields::Buffer { cache, .. } | Fields::Image { cache, .. } => cache.glc,
+                _ => false,
+            };
+            glc && !name.contains("atomic") && !name.ends_with("_inv")
+        })
+        .flat_map(|d| d.source.leaves())
+        .filter_map(|l| descriptor_at(&scalar, l))
+        .collect()
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, form: Form) -> Self {
         let split_ok = form != Form::Plain;
@@ -828,6 +884,9 @@ impl<'a> Lower<'a> {
             split_refused: None,
             flat: None,
             no_barrier,
+            coherent: coherent_descriptors(p, x.res),
+            all_coherent: insts().any(|i| matches!(i.name(), "buffer_gl0_inv" | "buffer_gl1_inv")),
+            coherent_handles: 0,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             half_inputs: half_inputs(&x.native.io, &x.inputs),
             mask_data: match x.native.stage {
@@ -1326,6 +1385,7 @@ impl<'a> Lower<'a> {
             wave_size,
             split: self.split.is_some(),
             split_refused: self.split_refused,
+            coherent: self.coherent_handles,
         })
     }
 
@@ -4436,6 +4496,42 @@ impl<'a> Lower<'a> {
 
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
+        &mut self,
+        site: Site,
+        src: &Source,
+        sampler: bool,
+        props: (u32, u32),
+    ) -> Result<V, Why> {
+        // A UAV the code accesses with `glc` is globally coherent in every
+        // handle to it, so the stores and loads of other thread groups meet
+        // in the device cache (a group polling a flag another one writes).
+        let props = if props.0 & UAV != 0 && self.is_coherent(src) {
+            (props.0 | GLOBALLY_COHERENT, props.1)
+        } else {
+            props
+        };
+        let made = self.handles.len();
+        let h = self.handle_with(site, src, sampler, props);
+        if h.is_ok()
+            && props.0 & GLOBALLY_COHERENT != 0
+            && (self.handles.len() > made || matches!(src, Source::Phi { .. }))
+        {
+            self.coherent_handles += 1;
+        }
+        h
+    }
+
+    /// Whether the descriptor `src` is one of a UAV to declare
+    /// `globallycoherent`.
+    fn is_coherent(&self, src: &Source) -> bool {
+        self.all_coherent
+            || src.leaves().into_iter().any(|l| {
+                descriptor_at(&self.scalar, l).is_some_and(|at| self.coherent.contains(&at))
+            })
+    }
+
+    /// [`Self::handle`] with the final `props`.
+    fn handle_with(
         &mut self,
         site: Site,
         src: &Source,
@@ -7690,6 +7786,16 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if matches!(name, "buffer_gl0_inv" | "buffer_gl1_inv") {
+            // The code reads what other groups wrote past the vector
+            // caches: a device memory barrier (every UAV is globally
+            // coherent then, see `all_coherent`).
+            let mode = self.s.m.i32(2);
+            let void = self.s.t.void;
+            self.s
+                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            return Ok(());
+        }
         if *lds || *tfe {
             return Err("a buffer access to LDS or with tfe");
         }
@@ -9874,6 +9980,124 @@ mod tests {
             why(indexed_root_load(0x0010_0000, 0x1181_4FAC)),
             "a buffer indexed by lane"
         );
+    }
+
+    /// Loads the buffer descriptor at dword 0 of the table in s0 to s[4:7]
+    /// (`s_load_dwordx4 s[4:7], s[2:3], 0`).
+    const LOAD_TABLE_DESCRIPTOR: [u32; 5] = [
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF408_0101,
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    /// `buffer_load_dword v1, v0, s[4:7], 0 offen`, glc when 0x4000 is set.
+    const BUFFER_LOAD: u32 = 0xE030_1000;
+    const BUFFER_STORE: u32 = 0xE070_1000; // buffer_store_dword v1, v0...
+    const BUFFER_ATOMIC_ADD: u32 = 0xE0C8_1000; // buffer_atomic_add v1, v0...
+    const GLC: u32 = 0x4000;
+    const MUBUF_V1_V0_S4: u32 = 0x8001_0100;
+    const DS_WRITE_V0_V1: [u32; 2] = [0xD834_0000, 0x0000_0100]; // ds_write_b32 v0, v1
+
+    /// Lowers `body` with one table (user SGPR s0) whose dword 0 holds a
+    /// buffer descriptor of `kind`.
+    fn lower_table(body: &[u32], kind: ResourceType) -> Lowered {
+        let root = RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        };
+        let used = UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let mut words = body.to_vec();
+        words.push(S_ENDPGM);
+        lower_with(&words, vec![root], vec![used]).unwrap()
+    }
+
+    /// The handles [`lower_table`] makes globally coherent.
+    fn coherent_handles(body: &[u32], kind: ResourceType) -> u32 {
+        lower_table(body, kind).coherent
+    }
+
+    /// The descriptor load, then `op` on v1 at v0 (`load`: v1 is stored to
+    /// LDS so it is needed).
+    fn one_access(op: u32, load: bool) -> Vec<u32> {
+        let mut w = LOAD_TABLE_DESCRIPTOR.to_vec();
+        w.extend([op, MUBUF_V1_V0_S4]);
+        if load {
+            w.extend(DS_WRITE_V0_V1);
+        }
+        w
+    }
+
+    #[test]
+    fn uavs_accessed_with_glc_are_globally_coherent() {
+        // A group polling a flag other groups write reads it with glc.
+        assert_eq!(
+            coherent_handles(&one_access(BUFFER_LOAD | GLC, true), ResourceType::Uav),
+            1
+        );
+        assert_eq!(
+            coherent_handles(&one_access(BUFFER_STORE | GLC, false), ResourceType::Uav),
+            1
+        );
+        // No glc: no change; an SRV has no coherent form.
+        assert_eq!(
+            coherent_handles(&one_access(BUFFER_LOAD, true), ResourceType::Uav),
+            0
+        );
+        assert_eq!(
+            coherent_handles(&one_access(BUFFER_STORE, false), ResourceType::Uav),
+            0
+        );
+        assert_eq!(
+            coherent_handles(&one_access(BUFFER_LOAD | GLC, true), ResourceType::Srv),
+            0
+        );
+        // An atomic's glc returns the old value: atomics are coherent anyway.
+        assert_eq!(
+            coherent_handles(
+                &one_access(BUFFER_ATOMIC_ADD | GLC, true),
+                ResourceType::Uav
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn every_handle_to_a_glc_accessed_uav_is_globally_coherent() {
+        // The same descriptor loaded twice: a plain store through the first
+        // load, a glc load through the second. Both handles are coherent
+        // (the other groups' reader must see this group's store).
+        let mut w = one_access(BUFFER_STORE, false);
+        w.extend(one_access(BUFFER_LOAD | GLC, true));
+        assert_eq!(coherent_handles(&w, ResourceType::Uav), 2);
+    }
+
+    #[test]
+    fn a_vector_cache_invalidation_is_a_device_memory_barrier() {
+        // buffer_gl0_inv names no resource; loads after it see other
+        // groups' writes, so every UAV is coherent.
+        let mut w = LOAD_TABLE_DESCRIPTOR.to_vec();
+        w.extend([0xE1C4_0000, 0]); // buffer_gl0_inv
+        let plain = one_access(BUFFER_LOAD, true);
+        w.extend(&plain[LOAD_TABLE_DESCRIPTOR.len()..]);
+        let l = lower_table(&w, ResourceType::Uav);
+        assert_eq!(l.coherent, 1);
+        if let Some(has) = calls(&l.dxil, "barrier") {
+            assert!(has);
+        }
     }
 
     #[test]
