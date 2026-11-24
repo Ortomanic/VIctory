@@ -1223,8 +1223,13 @@ impl State {
         } else {
             Vec::new()
         };
+        let rects = match self.topology {
+            RECTANGLES if self.rect_gs() => " rectangles (geometry stage)",
+            RECTANGLES => " rectangles",
+            _ => "",
+        };
         tracing::info!(
-            "pass {kind} {count} [{}] targets {targets:?} depth {depth:?} reads {reads:?}",
+            "pass {kind} {count} [{}] targets {targets:?} depth {depth:?} reads {reads:?}{rects}",
             crate::pipeline::describe(self.pipeline as This)
         );
     }
@@ -1365,10 +1370,12 @@ impl State {
         let _recording = crate::copystat::recording();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        if self.topology == RECTANGLES {
+        // A geometry stage completes indexed rectangles too.
+        let rects = self.topology == RECTANGLES && !self.rect_gs();
+        if rects {
             once!("indexed rectangles not drawn");
         }
-        let ran = self.topology != RECTANGLES && self.prepare(list, true);
+        let ran = !rects && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -1456,12 +1463,15 @@ impl State {
             },
             None => None,
         };
-        if kind == INDEXED && self.topology == RECTANGLES {
+        // Rectangles a geometry stage completes run as they are; the others
+        // are expanded here (`crate::rectangles`).
+        let rects = self.topology == RECTANGLES && !self.rect_gs();
+        if kind == INDEXED && rects {
             once!("indirect indexed rectangles not drawn");
             why("indexed rectangles not supported");
             return false;
         }
-        if kind == DRAW && self.topology == RECTANGLES {
+        if kind == DRAW && rects {
             let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
                 #[cfg(feature = "diagnostics")]
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -1545,12 +1555,8 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            // Rectangles run only where a geometry stage completes them:
-            // an indirect draw's vertex range is not known here to expand.
-            DRAW | INDEXED => {
-                (self.topology != RECTANGLES || (kind == DRAW && self.rect_gs()))
-                    && self.prepare(list, kind == INDEXED)
-            }
+            // Rectangles reach here only with a geometry stage.
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),

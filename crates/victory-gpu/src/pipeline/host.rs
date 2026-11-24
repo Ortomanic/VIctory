@@ -881,13 +881,18 @@ fn dxc_compile(source: &str, target: &str) -> Result<Vec<u8>, String> {
                 None => {
                     let kits = std::path::PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
                     let mut versions: Vec<std::path::PathBuf> = std::fs::read_dir(&kits)
-                        .map_err(|e| format!("no Windows SDK: {e}"))?
-                        .filter_map(Result::ok)
-                        .map(|e| e.path().join(r"x64\dxcompiler.dll"))
-                        .filter(|p| p.exists())
-                        .collect();
+                        .map(|d| {
+                            d.filter_map(Result::ok)
+                                .map(|e| e.path().join(r"x64\dxcompiler.dll"))
+                                .filter(|p| p.exists())
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     versions.sort();
-                    versions.pop().ok_or("no dxcompiler.dll in the Windows SDK")?
+                    // Else the one on the DLL search path, as shader
+                    // translation and the argument clamp load it (under
+                    // Wine, the prefix's system directory).
+                    versions.pop().unwrap_or_else(|| "dxcompiler.dll".into())
                 }
             };
             let wide = |p: &std::path::Path| -> Vec<u16> {
