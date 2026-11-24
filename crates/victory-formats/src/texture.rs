@@ -595,7 +595,7 @@ impl Layout {
         depth_pitch: usize,
     ) -> Result<(), Error> {
         self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+            copy_run(&mut linear[l..], &tiled[t..], len);
         })
     }
 
@@ -610,7 +610,7 @@ impl Layout {
         depth_pitch: usize,
     ) -> Result<(), Error> {
         self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
+            copy_run(&mut tiled[t..], &linear[l..], len);
         })
     }
 
@@ -688,6 +688,23 @@ impl Layout {
             }
         }
         Ok(())
+    }
+}
+
+/// Copies the first `len` bytes of `from` to `to`; the run lengths swizzles
+/// make (8 to 64 bytes) as fixed-size moves.
+#[inline(always)]
+fn copy_run(to: &mut [u8], from: &[u8], len: usize) {
+    fn fixed<const N: usize>(to: &mut [u8], from: &[u8]) {
+        let from: &[u8; N] = from[..N].try_into().unwrap();
+        <&mut [u8; N]>::try_from(&mut to[..N]).unwrap().copy_from_slice(from);
+    }
+    match len {
+        8 => fixed::<8>(to, from),
+        16 => fixed::<16>(to, from),
+        32 => fixed::<32>(to, from),
+        64 => fixed::<64>(to, from),
+        _ => to[..len].copy_from_slice(&from[..len]),
     }
 }
 
@@ -851,6 +868,174 @@ mod tests {
             let mut deep = desc(1, 1, 1, 16, swizzle);
             deep.depth = u32::MAX;
             assert_eq!(Layout::new(&deep), Err(Error::Invalid));
+        }
+    }
+
+    /// [`Layout::detile`] as first written (offsets of every element of a
+    /// row, then contiguous runs): the reference the faster copy must match.
+    fn detile_reference(
+        l: &Layout,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        let n = l.desc.element_bytes as usize;
+        let m = l.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let first = if l.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= l.slices {
+            return Err(Error::Invalid);
+        }
+        if !l.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let bytes = m.width as usize * n;
+        let need = (m.depth as usize - 1) * depth_pitch + (m.height as usize - 1) * row_pitch + bytes;
+        if tiled.len() < l.size as usize || linear.len() < need || row_pitch < bytes {
+            return Err(Error::TooSmall);
+        }
+        let is_linear = l.desc.swizzle == Swizzle::LINEAR;
+        let columns: Vec<u64> = (0..m.width)
+            .map(|x| if is_linear { u64::from(x) * n as u64 } else { l.column(m, x) })
+            .collect();
+        let mut offsets = vec![0u64; m.width as usize];
+        for z in 0..m.depth {
+            let (s, inner) = l.split(first + z);
+            let base = u64::from(s) * l.slice_size + m.offset;
+            for y in 0..m.height {
+                let start = if is_linear {
+                    base + u64::from(y) * u64::from(m.pitch) * n as u64
+                } else {
+                    base + l.row(m, y, inner)
+                };
+                for (o, c) in offsets.iter_mut().zip(&columns) {
+                    *o = start + c;
+                }
+                let at = z as usize * depth_pitch + y as usize * row_pitch;
+                let mut i = 0;
+                while i < offsets.len() {
+                    let first = i;
+                    i += 1;
+                    while i < offsets.len() && offsets[i] == offsets[i - 1] + n as u64 {
+                        i += 1;
+                    }
+                    let len = (i - first) * n;
+                    linear[at + first * n..][..len]
+                        .copy_from_slice(&tiled[offsets[first] as usize..][..len]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The run-based copy gives the reference's bytes, padding untouched,
+    /// for every mode, element size, mip (tail ones too), slice and 3D.
+    #[test]
+    fn detile_matches_the_reference() {
+        let mut cases = vec![];
+        for swizzle in [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ] {
+            for bpe in [1, 2, 4, 8, 16] {
+                cases.push(desc(1920, 1080, 1, bpe, swizzle));
+                cases.push(desc(333, 77, 9, bpe, swizzle));
+                cases.push(Desc { depth: 3, ..desc(70, 70, 4, bpe, swizzle) });
+            }
+            cases.push(Desc { block: 4, ..desc(1920, 1080, 3, 8, swizzle) });
+            cases.push(Desc { block: 4, ..desc(250, 130, 8, 16, swizzle) });
+        }
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_S] {
+            cases.push(Desc {
+                dimension: Dimension::Tex3d,
+                depth: 16,
+                ..desc(64, 32, 7, 4, swizzle)
+            });
+        }
+        for d in cases {
+            let Ok(l) = Layout::new(&d) else { continue };
+            if !l.addressable() {
+                continue;
+            }
+            let n = d.element_bytes as usize;
+            let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 31 + i / 4099) as u8).collect();
+            let slices = if d.dimension == Dimension::Tex3d { 1 } else { d.depth };
+            for slice in 0..slices {
+                for mip in 0..d.mips {
+                    let m = l.mips[mip as usize];
+                    let pitch = (m.width as usize * n).next_multiple_of(256) + 16;
+                    let plane = pitch * m.height as usize + 512;
+                    let len = plane * m.depth as usize;
+                    let mut a = vec![0xa5u8; len];
+                    let mut b = vec![0xa5u8; len];
+                    detile_reference(&l, &tiled, mip, slice, &mut a, pitch, plane).unwrap();
+                    l.detile(&tiled, mip, slice, &mut b, pitch, plane).unwrap();
+                    assert!(a == b, "{d:?} mip {mip} slice {slice}");
+                }
+            }
+        }
+    }
+
+    /// Movie planes (1920x1080 luma, 960x540 chroma, BC1 blocks) in the
+    /// modes titles give them. Run with
+    /// `cargo test --release -p victory-formats -- --ignored --nocapture detile_benchmark`.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    fn detile_benchmark() {
+        let planes = [
+            ("1920x1080 R8", 1920, 1080, 1, 1),
+            ("960x540 R8", 960, 540, 1, 1),
+            ("960x540 R8G8", 960, 540, 2, 1),
+            ("1920x1080 BC1", 1920, 1080, 8, 4),
+        ];
+        let modes = [
+            ("LINEAR", Swizzle::LINEAR),
+            ("4KB_S", Swizzle::SW_4KB_S),
+            ("4KB_D", Swizzle::SW_4KB_D),
+            ("64KB_S", Swizzle::SW_64KB_S),
+            ("64KB_D", Swizzle::SW_64KB_D),
+        ];
+        for (name, w, h, bpe, block) in planes {
+            for (mode, swizzle) in modes {
+                let l = Layout::new(&Desc { block, ..desc(w, h, 1, bpe, swizzle) }).unwrap();
+                let m = l.mips[0];
+                let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 31 + i / 4099) as u8).collect();
+                let pitch = (m.width as usize * bpe as usize).next_multiple_of(256);
+                let len = pitch * m.height as usize;
+                let mut a = vec![0u8; len];
+                let mut b = vec![0u8; len];
+                let time = |f: &mut dyn FnMut()| {
+                    f();
+                    let started = std::time::Instant::now();
+                    let rounds = 20;
+                    for _ in 0..rounds {
+                        f();
+                    }
+                    started.elapsed().as_secs_f64() * 1e3 / f64::from(rounds)
+                };
+                let old = time(&mut || detile_reference(&l, &tiled, 0, 0, &mut a, pitch, len).unwrap());
+                let new = time(&mut || l.detile(&tiled, 0, 0, &mut b, pitch, len).unwrap());
+                assert_eq!(a, b);
+                println!(
+                    "{name:14} {mode:7} {:6.2} MB  reference {old:7.3} ms  detile {new:7.3} ms  x{:.1}",
+                    l.size as f64 / 1e6,
+                    old / new
+                );
+            }
         }
     }
 
