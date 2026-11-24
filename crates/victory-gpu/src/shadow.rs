@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -639,49 +639,132 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
-
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+/// Read for every buffer a draw or a heap slot names (some 180,000 times a
+/// world frame of Grand Theft Auto VI, from all recording threads at
+/// once), so lookups share the lock and never walk far.
+struct Buffers {
+    all: BTreeMap<(u64, usize), Entry>,
+    /// The same buffers by length class (`class`), each with its end: a
+    /// buffer holding an address far past where it starts (a heap's buffer
+    /// with thousands of placed buffers before the address) is found by its
+    /// class, where few buffers start close enough below the address to
+    /// reach it.
+    classes: [BTreeMap<(u64, usize), u64>; 64],
+    /// A bit per class with buffers.
+    used: u64,
 }
 
-/// The longest title buffer registered so far (it stays after the buffer is
-/// released): a buffer starting further below an address than this cannot
-/// hold it. Changed under `BUFFERS`' lock.
-static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
+/// The entries starting closest below an address that a lookup tries
+/// before it asks the length classes: nearly every lookup's buffer is the
+/// first of them.
+const NEAREST: usize = 8;
+
+/// A buffer length's class: lengths in `[2^class, 2^(class + 1))`.
+fn class(len: u64) -> usize {
+    len.max(1).ilog2() as usize
+}
+
+impl Buffers {
+    const fn new() -> Self {
+        Self {
+            all: BTreeMap::new(),
+            classes: [const { BTreeMap::new() }; 64],
+            used: 0,
+        }
+    }
+
+    fn insert(&mut self, key: (u64, usize), end: u64) {
+        self.remove(key);
+        let k = class(end - key.0);
+        self.classes[k].insert(key, end);
+        self.used |= 1 << k;
+        self.all.insert(key, Entry { end, shadow: None });
+    }
+
+    fn remove(&mut self, key: (u64, usize)) {
+        if let Some(entry) = self.all.remove(&key) {
+            let k = class(entry.end - key.0);
+            self.classes[k].remove(&key);
+            if self.classes[k].is_empty() {
+                self.used &= !(1 << k);
+            }
+        }
+    }
+
+    /// The innermost entry holding `[address, end)`: the one starting
+    /// closest below `address` that reaches `end`. Big buffers hold many
+    /// smaller ones (a heap's placed buffers), so the one holding an address
+    /// past those can be any number of entries back: after the `NEAREST`
+    /// entries, the ones before them are asked per length class, where only
+    /// those starting less than the class's longest length below `end` can
+    /// reach it (two if they do not overlap).
+    fn enclosing(&self, address: u64, end: u64) -> Option<(u64, usize)> {
+        let mut before = (address, usize::MAX);
+        let mut left = NEAREST;
+        for (key, entry) in self.all.range(..=before).rev() {
+            if entry.end >= end {
+                return Some(*key);
+            }
+            before = *key;
+            left -= 1;
+            if left == 0 {
+                break;
+            }
+        }
+        if left > 0 {
+            // Every entry starting at or below the address was tried.
+            return None;
+        }
+        // Entries before `before`: they start at or below its start, so
+        // only the classes long enough to reach `end` from there can hold
+        // the range.
+        let need = end - before.0;
+        let mut found: Option<(u64, usize)> = None;
+        let mut classes = self.used & (u64::MAX << class(need));
+        while classes != 0 {
+            let k = classes.trailing_zeros() as usize;
+            classes &= classes - 1;
+            // Longest length in the class: 2^(k + 1) - 1.
+            let longest = if k == 63 { u64::MAX } else { (2u64 << k) - 1 };
+            let lowest = (end.saturating_sub(longest), 0);
+            // Only one starting after the innermost so far is more inner.
+            let from = match found {
+                Some(f) if f >= lowest => std::ops::Bound::Excluded(f),
+                _ => std::ops::Bound::Included(lowest),
+            };
+            if lowest >= before {
+                continue;
+            }
+            if let Some((key, _)) = self.classes[k]
+                .range((from, std::ops::Bound::Excluded(before)))
+                .rev()
+                .find(|&(_, &e)| e >= end)
+            {
+                found = Some(*key);
+            }
+        }
+        found
+    }
+}
+
+static BUFFERS: RwLock<Buffers> = RwLock::new(Buffers::new());
+
+fn buffers() -> std::sync::RwLockReadGuard<'static, Buffers> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_mut() -> std::sync::RwLockWriteGuard<'static, Buffers> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    let mut map = buffers();
-    MAX_SPAN.fetch_max(len, Ordering::Relaxed);
-    map.insert(
-        (start, resource),
-        Entry {
-            end: start.saturating_add(len),
-            shadow: None,
-        },
-    );
+    buffers_mut().insert((start, resource), start.saturating_add(len));
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
-}
-
-/// The innermost entry holding `[address, end)`: the one starting closest
-/// below `address` that reaches `end`, among those starting at most `span`
-/// (the longest entry's length) below `end`. Big buffers hold many smaller
-/// ones (a heap's placed buffers), so the one holding an address past
-/// those can be any number of entries back.
-fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: u64) -> Option<(u64, usize)> {
-    let lowest = end.saturating_sub(span);
-    if lowest > address {
-        return None;
-    }
-    map.range((lowest, 0)..=(address, usize::MAX))
-        .rev()
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k)
+    buffers_mut().remove((start, resource));
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
@@ -693,13 +776,26 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         crate::copystat::timed(crate::copystat::C::RecFindUs)
     };
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
+    {
+        // Nearly always the copy is there: readers do not wait for each
+        // other.
+        let map = buffers();
+        let Some(key) = map.enclosing(address, end) else {
+            drop(map);
+            return loose(address, end);
+        };
+        if let Some(shadow) = map.all.get(&key).and_then(|e| e.shadow.clone()) {
+            return Some(shadow);
+        }
+    }
+    // Its first use; the buffers may have changed since.
+    let mut map = buffers_mut();
+    let key = map.enclosing(address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end);
     };
-    let entry = map.get_mut(&key)?;
+    let entry = map.all.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -734,7 +830,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 
 /// The longest window in `LOOSE`. Changed under its lock.
 static LOOSE_SPAN: AtomicU64 = AtomicU64::new(0);
@@ -766,7 +862,15 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     let start = address & !(WINDOW - 1);
     let len = end.checked_next_multiple_of(WINDOW)? - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        // Nearly always the window is there: readers do not wait for each
+        // other.
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
+            return Some(shadow.clone());
+        }
+    }
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
         return Some(shadow.clone());
     }
@@ -792,12 +896,13 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
     let mut all: Vec<(u64, u64, u64)> = buffers()
+        .all
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
@@ -876,54 +981,126 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
-    fn entry(start: u64, len: u64) -> Entry {
-        Entry {
-            end: start + len,
-            shadow: None,
-        }
-    }
-
     /// A 256 MiB parent with `children` 64 KiB buffers placed in its first
     /// part, as a heap's placed buffers.
-    fn heap(base: u64, children: u64) -> BTreeMap<(u64, usize), Entry> {
-        let mut map = BTreeMap::new();
-        map.insert((base, 1), entry(base, 256 * MIB));
+    fn heap(base: u64, children: u64) -> Buffers {
+        let mut map = Buffers::new();
+        map.insert((base, 1), base + 256 * MIB);
         for i in 0..children {
-            map.insert((base + i * 0x10000, 100 + i as usize), entry(base + i * 0x10000, 0x10000));
+            map.insert((base + i * 0x10000, 100 + i as usize), base + (i + 1) * 0x10000);
         }
         map
+    }
+
+    /// Every entry at or below the address, the closest first.
+    fn enclosing_of_all(map: &Buffers, address: u64, end: u64) -> Option<(u64, usize)> {
+        map.all
+            .range(..=(address, usize::MAX))
+            .rev()
+            .find(|(_, e)| e.end >= end)
+            .map(|(k, _)| *k)
     }
 
     #[test]
     fn a_parent_is_found_past_many_children() {
         let base = 0x10_0000_0000;
         let map = heap(base, 200);
-        let span = 256 * MIB;
-        // Past all 200 children (and the 64 entries looked at before).
+        // Past all 200 children (and the nearest entries tried first).
         let at = base + 200 * 0x10000 + 0x100;
-        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
-        let first_64 = map.range(..=(at, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= at + 16);
-        assert!(first_64.is_none(), "the parent is more than 64 entries back");
+        assert_eq!(map.enclosing(at, at + 16), Some((base, 1)));
+        let nearest = map.all.range(..=(at, usize::MAX)).rev().take(NEAREST).find(|(_, e)| e.end >= at + 16);
+        assert!(nearest.is_none(), "the parent is further back than the nearest entries");
         // Near the parent's end.
         let at = base + 256 * MIB - 16;
-        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        assert_eq!(map.enclosing(at, at + 16), Some((base, 1)));
         // Inside a child: the child, the innermost.
         let at = base + 150 * 0x10000 + 8;
-        assert_eq!(enclosing(&map, span, at, at + 8), Some((base + 150 * 0x10000, 250)));
+        assert_eq!(map.enclosing(at, at + 8), Some((base + 150 * 0x10000, 250)));
         // Across two children: only the parent holds it.
         let at = base + 151 * 0x10000 - 8;
-        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        assert_eq!(map.enclosing(at, at + 16), Some((base, 1)));
         // Past the parent, and before it.
         let at = base + 256 * MIB;
-        assert_eq!(enclosing(&map, span, at, at + 1), None);
-        assert_eq!(enclosing(&map, span, base - 16, base + 16), None);
-        // Longer than any buffer: none, without looking.
-        assert_eq!(enclosing(&map, span, base, base + span + 1), None);
-        assert_eq!(enclosing(&map, 0, base, base + 1), None);
+        assert_eq!(map.enclosing(at, at + 1), None);
+        assert_eq!(map.enclosing(base - 16, base + 16), None);
+        // Longer than any buffer.
+        assert_eq!(map.enclosing(base, base + 256 * MIB + 1), None);
+        assert_eq!(Buffers::new().enclosing(base, base + 1), None);
     }
 
     #[test]
-    fn registered_buffers_widen_the_search() {
+    fn lookups_past_many_buffers_do_not_walk_them() {
+        // A heap's buffer with 20,000 placed buffers, and memory past it
+        // that no buffer holds (the title's own allocations): neither
+        // lookup may try the placed buffers one by one.
+        let base = 0x10_0000_0000;
+        let mut map = Buffers::new();
+        map.insert((base, 1), base + 256 * MIB);
+        for i in 0..20_000u64 {
+            map.insert((base + i * 0x1000, 100 + i as usize), base + (i + 1) * 0x1000);
+        }
+        let started = std::time::Instant::now();
+        for i in 0..20_000u64 {
+            let at = base + 20_000 * 0x1000 + i * 0x100;
+            assert_eq!(map.enclosing(at, at + 64), Some((base, 1)));
+            let at = base + 256 * MIB + i * 0x100;
+            assert_eq!(map.enclosing(at, at + 64), None);
+        }
+        // Walking would be 2 x 20,000 x 20,000 entries (seconds).
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn the_innermost_buffer_is_found_among_any() {
+        // Buffers of all lengths, nested, overlapping, at the same start
+        // and removed again: the same answer as trying every entry.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        let base = 0x30_0000_0000u64;
+        let space = 64 * MIB;
+        for round in 0..4 {
+            let mut map = Buffers::new();
+            let mut keys = Vec::new();
+            for i in 0..3000usize {
+                let len = match next(8) {
+                    0 => 1 + next(64),
+                    1..=4 => 0x100 << next(8),
+                    5 | 6 => 0x10000 << next(6),
+                    _ => MIB << next(6),
+                };
+                // Round 0 packs them at 4 KiB steps (many at one start).
+                let start = base + if round == 0 { next(256) * 0x1000 } else { next(space) };
+                map.insert((start, i), start + len);
+                keys.push((start, i));
+                if next(4) == 0 {
+                    let gone = keys.swap_remove(next(keys.len() as u64) as usize);
+                    map.remove(gone);
+                }
+            }
+            assert_eq!(map.all.len(), keys.len());
+            assert_eq!(map.classes.iter().map(|c| c.len()).sum::<usize>(), keys.len());
+            for k in 0..64 {
+                assert_eq!(map.used >> k & 1 == 1, !map.classes[k].is_empty());
+            }
+            for _ in 0..20_000 {
+                let at = base - MIB + next(space + 2 * MIB);
+                let len = if next(3) == 0 { 1 + next(4 * MIB) } else { 1 + next(0x400) };
+                assert_eq!(
+                    map.enclosing(at, at + len),
+                    enclosing_of_all(&map, at, at + len),
+                    "round {round} at {at:#x}+{len:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn registered_buffers_are_found_and_forgotten() {
         // High above anything a test maps; resource numbers no live
         // resource has.
         let base = 0x7f00_0000_0000;
@@ -932,15 +1109,16 @@ mod tests {
         for i in 0..100u64 {
             register(2 + i as usize, base + i * 0x1000, 0x1000);
         }
-        assert!(MAX_SPAN.load(Ordering::Relaxed) >= len);
         let at = base + len - 64;
-        let found = enclosing(&buffers(), MAX_SPAN.load(Ordering::Relaxed), at, at + 64);
+        let found = buffers().enclosing(at, at + 64);
         for i in 0..100u64 {
             unregister(2 + i as usize, base + i * 0x1000);
         }
         unregister(1, base);
         assert_eq!(found, Some((base, 1)));
-        assert!(buffers().range((base, 0)..=(base + len, usize::MAX)).next().is_none());
+        let map = buffers();
+        assert!(map.all.range((base, 0)..=(base + len, usize::MAX)).next().is_none());
+        assert!(map.classes.iter().all(|c| c.range((base, 0)..=(base + len, usize::MAX)).next().is_none()));
     }
 
     #[test]
