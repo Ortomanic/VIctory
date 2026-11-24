@@ -40,12 +40,27 @@ lowered *split*: each console wave runs as two host waves of 32 ("halves").
     for 3-D groups, per xcl).
 * **Uses of the console lane**: own bit of an opaque / constant lane mask
   (`lane_bit`), `v_mbcnt_lo/hi`, `v_writelane`'s target, DPP row masks.
-* **Refusal.** Lowering an operation that needs the other half sets
-  `split_refused` (`Lower::whole_wave`): a ballot read as a number
-  (`mask_dword`), `v_readlane`, a whole-wave reduction or prefix (`shape`).
-  So do one-wave groups with LDS (decided up front). Any refusal or failure
-  of the split form lowers the program again exactly as before
-  (`WaveSize(64)`), so the result is never worse than without the option.
+* **Exchanges.** An operation that needs the other half is lowered as an
+  exchange through group-shared memory (`Lower::exchange`), where every
+  thread of the group runs the code exactly once (`run_once`: the block is
+  on no cycle and on every path from the entry to an end), so a group
+  barrier there is reached by all: each half stores its value in its slot
+  (console thread / 32) of an array of its own per exchange (no reuse, one
+  barrier), barrier, then reads its partner's slot (an identity when a
+  group of e.g. 96 threads has no upper half there). Programs with any of
+  these are relabelled (`WaveSize(32)`), so each host wave is one half.
+  - ballot read as a number (`mask_dword`): each half's ballot is one dword;
+  - `v_readlane`: each half reads lane `l & 31`, the half owning `l` wins;
+  - reductions (`shape`): each half's partial combined with the other's;
+    prefix sums add the lower half's total in the upper half;
+  - `v_readfirstlane` (unguarded): the lower half's first lane.
+* **Groups of at most 32 threads** (wave64): one host wave holds all the
+  console's populated lanes, so `WaveSize(32)` is exact; no split.
+* **Refusal.** The same operations in a block some lanes skip (an `if` on
+  a lane condition, a loop) set `split_refused` (`Lower::whole_wave`), and
+  so do one-wave groups (33..64 threads) with LDS (decided up front). Any
+  refusal or failure of the split form lowers the program again exactly as
+  before (`WaveSize(64)`), so the result is never worse than without it.
 
 ## Audit of wave intrinsics in the emitter (32 vs 64)
 
@@ -55,39 +70,37 @@ lowered *split*: each console wave runs as two host waves of 32 ("halves").
 | | `lane_bit`, `v_mbcnt`, `v_writelane`, DPP row mask | split uses `console_lane` (`f & 63`) instead |
 | | split relabelling | host lane within its wave (by design) |
 | `waveReadLaneAt` (117) | DPP, `ds_swizzle` | exact (within 16 / 32 lanes) |
-| | `v_readlane` | refused (lane may be in the other half) |
-| `waveReadLaneFirst` (118) | `v_readfirstlane` | per half: exact for uniform values and waterfall loops; an election of one lane per console wave becomes one per half (risk; such code usually also ballots, which refuses) |
+| | `v_readlane` | exchanged where every lane runs it once; else refused |
+| `waveReadLaneFirst` (118) | `v_readfirstlane` | the lower half's first lane (exchanged) where every lane runs it once, unguarded; elsewhere per half: exact for uniform values and waterfall loops; an election of one lane per console wave becomes one per half (risk; such code usually also ballots, which refuses) |
 | | non-split relabel (`thread_id`) | unchanged (64-lane hosts; assumes wave-aligned runs) |
-| `waveActiveBallot` (116) | `mask_dword` (mask read as data) | refused (needs the other half's word) |
+| `waveActiveBallot` (116) | `mask_dword` (mask read as data) | exchanged (one word per half) where the mask's block runs once in every lane; else refused |
 | | split relabelling | counts the host wave's own lanes (by design) |
-| `waveActiveOp` (119), `waveActiveBit` (120), `wavePrefixOp` (121) | `shape`: whole-wave sections | refused (needs the other half's partial) |
+| `waveActiveOp` (119), `waveActiveBit` (120), `wavePrefixOp` (121) | `shape`: whole-wave sections | half partials exchanged and combined where the block runs once in every lane; else refused |
 | `quadReadLaneAt` (122) | mesh quad swizzles / DPP | mesh only; unaffected |
 | pixel / vertex (`MaskData::Host`) | ballots, `v_mbcnt`, readlane at computed lanes | already host-wave-size agnostic; unaffected |
 
-## Not done yet (TODO, emulation "B")
+## Not done yet
 
-The refused operations need an exchange between the halves through
-group-shared memory (as xcl does: `../xcl/docs/wave64-on-wave32.md`):
-ballot words (1 dword per half), `v_readlane` (owner's value), reductions /
-prefixes (each half's partial; the upper half adds the lower's total),
-`ds_bpermute` (32 dwords per half). The obstacle specific to VIctory: its
-lowering keeps console control flow per lane (masks become per-lane
-booleans), so an exchange point may be reached by one half only; a group
-barrier there is undefined behaviour. A correct design needs either
-(1) exchanges only at points whose block is reached by all lanes of the
-console wave (provable from the structurizer: the mask is written in a block
-dominated only by uniform branches), with a group barrier when the group is
-one console wave and xcl's counter-paired spin otherwise, or (2) both halves
-executing every exchange unconditionally (hoisted to uniform points with
-the value masked by the lane's activity). Until then those programs keep
-`WaveSize(64)` and are refused by 32-lane hosts, as before.
+Measured with shader-lab (`VICTORY_HOST_WAVE32=1`), 237 of 1,705 translated
+compute programs still declare `WaveSize(64)` (302 before the exchanges):
+98 one-wave groups sharing LDS and 139 with lane operations. Nearly all
+are refused because the exchange point or LDS access is in a block some
+lanes skip (`s_cbranch_execz` regions, loops): VIctory lowers console
+control flow per lane, so the halves need not both reach it and a group
+barrier there is undefined. Covering them needs control flow uniform per
+console wave (both halves enter a block when any lane of the console wave
+is active, as xcl's recompiler does), with exchanges of the masks that
+decide it, or xcl's counter-paired spin, which still needs both halves to
+arrive. `ds_bpermute` (none in the corpus) is not exchanged.
 
 ## Verify
 
 * `cargo +stable test --offline --locked -p victory-shader` — tests
   `a_lane_id_program_is_split_on_a_wave32_host`,
   `a_dpp_program_is_split_with_relabelled_threads`,
-  `whole_wave_operations_keep_wave64`, `one_wave_lds_programs_keep_wave64`,
+  `whole_wave_operations_exchange_between_halves`,
+  `exchanges_in_divergent_code_keep_wave64`, `blocks_run_once`,
+  `groups_of_one_half_declare_wave32`, `one_wave_lds_programs_keep_wave64`,
   `lane_independent_programs_are_unchanged`, `the_host_wave32_switch_parses`.
 * DXIL validation on Linux: `VICTORY_WAVE64_DUMP=/tmp/d cargo test ... wave64`
   then `LD_LIBRARY_PATH=dxc-linux/lib dxc-linux/bin/dxv /tmp/d/*.dxil`.
