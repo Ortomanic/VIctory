@@ -1197,10 +1197,15 @@ impl State {
     /// (diagnostics builds).
     #[cfg(feature = "diagnostics")]
     fn pass_log(&self, kind: &str, count: u32, compute: bool) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_PASS_LOG").is_some())
-            || !crate::capture::listed(crate::queue::presented() + 1)
-        {
+        // `VICTORY_PASS_LOG=<n>` with n > 1: every nth frame too (runs that
+        // stop early may never reach a listed one).
+        static ON: std::sync::OnceLock<(bool, u64)> = std::sync::OnceLock::new();
+        let (on, every) = *ON.get_or_init(|| match std::env::var("VICTORY_PASS_LOG") {
+            Ok(v) => (true, v.trim().parse().ok().filter(|&n: &u64| n > 1).unwrap_or(0)),
+            Err(_) => (false, 0),
+        });
+        let frame = crate::queue::presented() + 1;
+        if !on || !(crate::capture::listed(frame) || (every > 0 && frame.is_multiple_of(every))) {
             return;
         }
         let texture = |r: usize| {
@@ -1988,12 +1993,25 @@ fn describe(view: Option<&View>) -> String {
     // Which host copy of title memory a buffer view resolves to (two views
     // of the same memory in different copies do not see each other's
     // writes within a submission).
+    // Small ranges (counters): also what title memory holds there now,
+    // that is what the GPU last wrote, copied back after its submission.
     let copy = |v: &View| {
-        crate::descriptor::host::buffer_range(v)
-            .filter(|&(_, len)| len > 0)
+        let range = crate::descriptor::host::buffer_range(v).filter(|&(_, len)| len > 0);
+        let mut text = range
             .and_then(|(a, len)| crate::shadow::find(a, len))
             .map(|s| format!(" copy {:#x}+{:#x}", s.span().0, s.span().1))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some((a, len)) = range
+            && len <= 64
+            && crate::texture::committed(a as *const u8, len as usize)
+        {
+            // SAFETY: committed title memory.
+            let words: Vec<u32> = (0..len as usize / 4)
+                .map(|k| unsafe { (a as *const u32).add(k).read_unaligned() })
+                .collect();
+            text.push_str(&format!(" holds {words:?}"));
+        }
+        text
     };
     match view {
         None => "no view".into(),
