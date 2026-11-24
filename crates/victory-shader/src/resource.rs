@@ -140,6 +140,10 @@ pub struct Waterfall {
     /// Descriptor loads at a table offset among `reads` (the console
     /// compiler's form): each lane loads its own entry.
     pub loads: Vec<Site>,
+    /// The `reads` that are such table offsets: read as each lane's own
+    /// value (its entry's offset), where the other reads, descriptor
+    /// dwords, are not read as values at all.
+    pub offsets: Vec<Value>,
 }
 
 /// Traces every descriptor and scalar address of `p`, which runs as
@@ -277,6 +281,7 @@ pub fn track_lanes(
         reads.dedup();
         if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
             out.waterfall.compares.extend(proof.compares);
+            out.waterfall.offsets.extend(&proof.reads);
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.extend(loads);
         }

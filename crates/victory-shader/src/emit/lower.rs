@@ -4228,6 +4228,24 @@ impl<'a> Lower<'a> {
                     }
                     (props, None)
                 }
+                Fields::Smem { .. } if !un.starts_with("s_load") => {
+                    // A buffer read with scalar loads at offsets the code
+                    // computes from the record count (the last element of a
+                    // structured buffer). GFX10 counts records in elements
+                    // when the descriptor has a stride, else in bytes; the
+                    // structured view's dimension is its element count and
+                    // the raw one's its size in bytes.
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    let stride = used.map_or(0, |u| u.stride);
+                    let props = if stride >= 4 && stride.is_multiple_of(4) {
+                        (12 | u, stride)
+                    } else {
+                        (11 | u, 0)
+                    };
+                    (props, None)
+                }
                 _ => return Err("a scalar memory read as data"),
             };
             (first, src, props, image, uav)
@@ -5614,11 +5632,25 @@ impl<'a> Lower<'a> {
                 if inst
                     .writes
                     .first()
-                    .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
+                    .is_some_and(|w| self.x.res.waterfall.offsets.contains(&w.1)) =>
             {
-                // A waterfall loop's read of a descriptor dword: the lane's own.
+                // A waterfall loop's read of a table offset: the lane's own
+                // (each lane loads its own entry).
                 let a = s(self, 0)?;
                 int(self, a)
+            }
+            "v_readfirstlane_b32"
+                if inst
+                    .writes
+                    .first()
+                    .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
+            {
+                // A waterfall loop's read of a descriptor dword. Its uses are
+                // the loop's compares (lowered as true) and the access (each
+                // lane's own heap index), neither of which reads the value;
+                // it is left without one so the dwords (copies of descriptor
+                // loads, joined per lane) are not lowered as data.
+                Err("a waterfall loop's descriptor dword read as data")
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
@@ -10070,6 +10102,71 @@ mod tests {
             slot: 3,
         };
         lower_with(&words, vec![root], vec![used])
+    }
+
+    /// The last element of a structured buffer read with scalar loads at
+    /// an offset computed from the descriptor's record count (dword 2), as
+    /// the title's mesh programs do: the count is the view's dimension.
+    /// The console compiler's waterfall over a first-lane table offset
+    /// (`resource::tests::WATERFALL_INDEXED_WAVE32`): the offset read is
+    /// each lane's own, the entry it names a non-uniform handle.
+    #[test]
+    fn the_console_waterfall_over_a_table_offset_lowers() {
+        let range = |kind, table_offset_dwords, dwords, user_data| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords,
+            user_data,
+            slot: user_data,
+        };
+        let l = lower_lanes(
+            crate::resource::tests::WATERFALL_INDEXED_WAVE32,
+            vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)],
+            vec![
+                range(ResourceType::Srv, 0, 8, 0),
+                range(ResourceType::Uav, 16, 4, 0),
+                range(ResourceType::Sampler, 0, 4, 1),
+            ],
+        )
+        .unwrap();
+        assert_eq!(l.nonuniform_handles, 1);
+    }
+
+    #[test]
+    fn record_counts_of_buffers_read_by_scalar_loads_are_their_dimensions() {
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0101,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8108_C106, // s_add_i32 s8, s6, -1
+            0x9308_FF08,
+            0x0000_0050, // s_mul_i32 s8, s8, 0x50
+            0xF420_0242,
+            0x1000_0000, // s_buffer_load_dword s9, s[4:7], s8
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E02_0209, // v_mov_b32 v1, s9
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        for stride in [80, 0] {
+            let used = UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            };
+            lower_with(&words, vec![root(RootType::Table, 0, 0)], vec![used]).unwrap();
+        }
     }
 
     #[test]
