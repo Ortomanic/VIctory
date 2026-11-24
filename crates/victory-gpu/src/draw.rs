@@ -1478,6 +1478,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        args_probe::take(list, &args.buffer, args.offset(arguments), kind, &self.targets, self.pipeline);
         crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1487,6 +1489,147 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+}
+
+/// With `VICTORY_PASS_LOG` (diagnostics): the first record of each indirect
+/// execution of listed frames as the GPU read it (after the clamp), copied
+/// from the host copy into readback memory in the title's list, and
+/// summarized a few frames later per kind, G-buffer or not, zero or not.
+#[cfg(feature = "diagnostics")]
+mod args_probe {
+    use super::*;
+
+    const SLOTS: u64 = 16384;
+
+    struct Probe {
+        buffer: ID3D12Resource,
+        frame: u64,
+        notes: Vec<(u32, bool, String)>,
+        done: bool,
+    }
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Probe {}
+
+    static PROBE: std::sync::Mutex<Option<Probe>> = std::sync::Mutex::new(None);
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_PASS_LOG").is_some())
+    }
+
+    pub(super) fn take(
+        list: &HostList,
+        buffer: &ID3D12Resource,
+        offset: u64,
+        kind: u32,
+        targets: &[usize],
+        pipeline: usize,
+    ) {
+        if !on() {
+            return;
+        }
+        let frame = crate::queue::presented() + 1;
+        let mut probe = PROBE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = probe.as_mut()
+            && !p.done
+            && frame > p.frame + 4
+        {
+            summarize(p);
+            p.done = true;
+        }
+        if !crate::capture::listed(frame) {
+            return;
+        }
+        if probe.is_none() {
+            let Some(host) = crate::host::host() else { return };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: SLOTS * 16,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut made: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            let ok = unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut made,
+                )
+            };
+            let (Ok(()), Some(buffer)) = (ok, made) else { return };
+            *probe = Some(Probe { buffer, frame, notes: Vec::new(), done: false });
+        }
+        let Some(p) = probe.as_mut() else { return };
+        if p.done || p.frame != frame || p.notes.len() as u64 >= SLOTS {
+            return;
+        }
+        let at = p.notes.len() as u64 * 16;
+        let gbuffer = targets.len() >= 5;
+        p.notes.push((kind, gbuffer, crate::pipeline::describe(pipeline as This)));
+        list.keep(&p.buffer);
+        // SAFETY: an open list; the arguments buffer is in the indirect
+        // argument state here (after the clamp), our readback buffer in
+        // copy-dest; both live.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                buffer,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&p.buffer, at, buffer, offset, 12);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                buffer,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+    }
+
+    fn summarize(p: &Probe) {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: readback memory its copies wrote frames ago.
+        unsafe {
+            if p.buffer.Map(0, None, Some(&mut data)).is_err() {
+                return;
+            }
+        }
+        let mut counts: std::collections::BTreeMap<(u32, bool, bool), u32> = Default::default();
+        let mut groups: std::collections::BTreeMap<String, (u32, u32, u64)> = Default::default();
+        for (k, (kind, gbuffer, name)) in p.notes.iter().enumerate() {
+            // SAFETY: inside the mapped buffer.
+            let w: [u32; 3] = unsafe { (data.cast::<u8>().add(k * 16) as *const [u32; 3]).read_unaligned() };
+            let work = match kind {
+                0 | 1 => u64::from(w[0]) * u64::from(w[1]),
+                _ => u64::from(w[0]) * u64::from(w[1]) * u64::from(w[2]),
+            };
+            *counts.entry((*kind, *gbuffer, work != 0)).or_default() += 1;
+            if *gbuffer {
+                let g = groups.entry(name.clone()).or_default();
+                g.0 += 1;
+                g.1 += u32::from(work != 0);
+                g.2 += work;
+            }
+        }
+        tracing::info!(frame = p.frame, records = p.notes.len(), ?counts, "args probe: (kind, G-buffer, nonzero) -> executions");
+        for (name, (n, nonzero, work)) in groups {
+            tracing::info!(frame = p.frame, "args probe G-buffer {name}: {n} executions, {nonzero} nonzero, {work} groups/vertices");
+        }
     }
 }
 
