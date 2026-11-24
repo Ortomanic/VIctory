@@ -387,6 +387,7 @@ pub(crate) fn log(frames: f64) {
         c[C::CommitQueries as usize],
         c[C::CommitHits as usize],
     );
+    crate::host::log_gpu_times(frames);
     // Where the frame's time went, over the same frames.
     static LINE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let wall = {

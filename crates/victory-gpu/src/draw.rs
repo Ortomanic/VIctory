@@ -873,6 +873,9 @@ impl State {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
+        if crate::host::brief_notes() {
+            return text;
+        }
         let views = (self.heaps[0] != 0)
             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
             .flatten();

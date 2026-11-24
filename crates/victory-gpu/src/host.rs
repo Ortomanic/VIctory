@@ -453,6 +453,78 @@ pub(crate) fn set_timing(on: bool) {
     TIMING.set(on);
 }
 
+/// Whether commands are noted by kind and pipeline only: with
+/// `VICTORY_GPU_TIMING` and without `VICTORY_D3D12_DRED` (no markers, no
+/// view texts, which cost recording as much again as the draws).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn brief_notes() -> bool {
+    timing() && !dred_on()
+}
+
+/// With `VICTORY_GPU_TIMING`: GPU time by pipeline since the last
+/// [`log_gpu_times`] (ms, commands, the longest command's ms and text).
+#[cfg(feature = "diagnostics")]
+static GPU_TIMES: Mutex<Option<std::collections::HashMap<String, (f64, u64, f64, String)>>> = Mutex::new(None);
+
+/// What a noted command's time is summed under: its pipeline (`[...]` in
+/// the text), else its first two words (copies, uploads, resolves).
+#[cfg(feature = "diagnostics")]
+fn timing_key(text: &str) -> &str {
+    match (text.find('['), text.find(']')) {
+        (Some(a), Some(b)) if a < b => &text[a..=b],
+        _ => {
+            let second = text.match_indices(' ').nth(1).map_or(text.len(), |(i, _)| i);
+            &text[..second]
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn add_gpu_times(times: Vec<(f64, String)>) {
+    let mut all = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+    let all = all.get_or_insert_with(Default::default);
+    for (ms, text) in times {
+        let key = timing_key(&text);
+        if !all.contains_key(key) {
+            all.insert(key.to_string(), (0.0, 0, 0.0, String::new()));
+        }
+        let Some(sum) = all.get_mut(key) else { continue };
+        sum.0 += ms;
+        sum.1 += 1;
+        if ms >= sum.2 {
+            sum.2 = ms;
+            sum.3 = text.chars().take(120).collect();
+        }
+    }
+}
+
+/// With `VICTORY_GPU_TIMING`: logs the GPU time per frame by pipeline over
+/// the last `frames` frames, the most first (each list ran on its own, so
+/// the sum is more than a frame's GPU time without timing).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_gpu_times(frames: f64) {
+    let Some(all) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mut all: Vec<_> = all.into_iter().collect();
+    all.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+    let total: f64 = all.iter().map(|(_, t)| t.0).sum();
+    let commands: u64 = all.iter().map(|(_, t)| t.1).sum();
+    tracing::info!(
+        "GPU time by pipeline per frame: {:.1} ms in {:.0} commands of {} pipelines",
+        total / frames,
+        commands as f64 / frames,
+        all.len()
+    );
+    for (key, (ms, n, longest, text)) in all.iter().take(40) {
+        tracing::info!(
+            "  GPU time {:.2} ms/frame in {:.1} commands: {key}; longest {longest:.2} ms: {text}",
+            ms / frames,
+            *n as f64 / frames
+        );
+    }
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
@@ -822,6 +894,12 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
+            if groups.len() > 1 {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                add_gpu_times(runs[i].times(frequency));
+            }
+            #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
@@ -1153,6 +1231,16 @@ impl HostList {
     /// (milliseconds, text) (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+        let mut times = self.times(frequency);
+        times.sort_by(|a, b| b.0.total_cmp(&a.0));
+        times.truncate(n);
+        times
+    }
+
+    /// The GPU time of each noted command of the finished list, in ms, in
+    /// order (to the next command's timestamp, or the list's end).
+    #[cfg(feature = "diagnostics")]
+    fn times(&self, frequency: u64) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
         let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
             return Vec::new();
@@ -1168,15 +1256,12 @@ impl HostList {
             back.Unmap(0, None);
             s
         };
-        let mut times: Vec<(f64, String)> = (0..count)
+        (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
                 (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
             })
-            .collect();
-        times.sort_by(|a, b| b.0.total_cmp(&a.0));
-        times.truncate(n);
-        times
+            .collect()
     }
 
     pub(crate) fn close(&self) {
@@ -1405,7 +1490,7 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if dred_on() {
+        if dred_on() || timing() {
             let _noting = crate::copystat::timed(crate::copystat::C::RecNoteUs);
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
@@ -1431,12 +1516,14 @@ impl HostList {
                 unsafe { list.WriteBufferImmediate(2, params.as_ptr(), Some(modes.as_ptr())) };
             }
             let what = what();
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if dred_on() {
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+                const UNICODE: u32 = 0;
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe {
+                    self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
