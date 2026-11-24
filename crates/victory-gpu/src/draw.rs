@@ -853,8 +853,12 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        let viewed = view_probe::before(self, list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        view_probe::after(list, viewed);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1570,6 +1574,8 @@ impl State {
             &self.targets,
             self.pipeline,
         );
+        #[cfg(feature = "diagnostics")]
+        let viewed = if kind == DISPATCH { view_probe::before(self, list) } else { Vec::new() };
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -1615,6 +1621,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         args_probe::take(list, &args.buffer, args.offset(arguments), probe_slot);
         crate::indirect::done(list, &args.buffer);
+        #[cfg(feature = "diagnostics")]
+        view_probe::after(list, viewed);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1810,6 +1818,23 @@ mod args_probe {
         }
     }
 
+    /// `VICTORY_ARGS_PROBE_LOG=hash,...`: executions of pipelines whose
+    /// description holds one of them are logged one by one.
+    fn logged(name: &str) -> bool {
+        static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        NAMES
+            .get_or_init(|| {
+                std::env::var("VICTORY_ARGS_PROBE_LOG")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .iter()
+            .any(|h| name.contains(h.as_str()))
+    }
+
     fn summarize(p: &Probe) {
         let mut data = std::ptr::null_mut();
         // SAFETY: readback memory its copies wrote frames ago.
@@ -1837,6 +1862,13 @@ mod args_probe {
             let after = [slot[0], slot[1], slot[2]];
             let before = [slot[4], slot[5], slot[6]];
             let (wb, wa) = (work(n.kind, &before), if n.ran { work(n.kind, &after) } else { 0 });
+            if logged(&n.name) {
+                tracing::info!(
+                    frame = p.frame,
+                    "args probe #{k} {} kind {}: {:?} before the clamp, {:?} after (ran {})",
+                    n.name, n.kind, before, after, n.ran
+                );
+            }
             if n.ran {
                 max_budget = max_budget.max(slot[3]);
                 if wb != 0 && wa == 0 {
@@ -2071,4 +2103,315 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// `VICTORY_VIEW_PROBE=hash:slot+offset[:bytes],...` (diagnostics): on
+/// probed frames (`VICTORY_ARGS_PROBE`'s, or listed ones) each dispatch of
+/// a compute shader whose hash starts with `hash` copies the table view at
+/// root slot `slot`, `offset` dwords into its table (as the pass log names
+/// it, e.g. `4fb4:0+0`), from its host copy into readback memory before and
+/// after the dispatch, and takes what title memory holds there when the
+/// dispatch is recorded; a few frames later each record is logged: how the
+/// GPU's bytes compare with title memory's.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod view_probe {
+    use super::*;
+
+    const BYTES: u64 = 96 << 20;
+
+    struct Spec {
+        hash: String,
+        slot: u8,
+        offset: u32,
+        bytes: u64,
+    }
+
+    struct Rec {
+        spec: usize,
+        text: String,
+        address: u64,
+        len: u64,
+        at: u64,
+        title: Option<Vec<u8>>,
+        after: bool,
+    }
+
+    struct Probe {
+        buffer: ID3D12Resource,
+        frame: u64,
+        used: u64,
+        recs: Vec<Rec>,
+        done: bool,
+    }
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Probe {}
+
+    static PROBE: std::sync::Mutex<Option<Probe>> = std::sync::Mutex::new(None);
+
+    fn specs() -> &'static [Spec] {
+        static SPECS: std::sync::OnceLock<Vec<Spec>> = std::sync::OnceLock::new();
+        SPECS.get_or_init(|| {
+            let value = std::env::var("VICTORY_VIEW_PROBE").unwrap_or_default();
+            value
+                .split(',')
+                .filter_map(|e| {
+                    let mut parts = e.trim().split(':');
+                    let hash = parts.next()?.trim().to_ascii_lowercase();
+                    let (slot, offset) = parts.next()?.split_once('+')?;
+                    let bytes = parts.next().and_then(|b| b.trim().parse().ok()).unwrap_or(4096);
+                    (!hash.is_empty()).then_some(())?;
+                    Some(Spec {
+                        hash,
+                        slot: slot.trim().parse().ok()?,
+                        offset: offset.trim().parse().ok()?,
+                        bytes,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn every() -> u64 {
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_ARGS_PROBE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(50)
+        })
+    }
+
+    fn probed(frame: u64) -> bool {
+        crate::capture::listed(frame) || (every() > 0 && frame.is_multiple_of(every()))
+    }
+
+    fn copy(list: &HostList, dst: &ID3D12Resource, at: u64, src: &ID3D12Resource, offset: u64, n: u64) {
+        // SAFETY: an open list; the host copy is in unordered access between
+        // steps (as the arguments probe takes it), our readback buffer in
+        // copy-dest; both live.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                src,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(dst, at, src, offset, n);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                src,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+    }
+
+    /// Before a dispatch (everything bound): the matching views' bytes.
+    /// Returns the records to finish with [`after`].
+    pub(crate) fn before(state: &State, list: &HostList) -> Vec<usize> {
+        let specs = specs();
+        if specs.is_empty() {
+            return Vec::new();
+        }
+        let frame = crate::queue::presented() + 1;
+        let mut probe = PROBE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = probe.as_mut()
+            && !p.done
+            && frame > p.frame + 4
+        {
+            summarize(p);
+            p.done = true;
+        }
+        if !probed(frame) {
+            return Vec::new();
+        }
+        let Some(hp) = crate::pipeline::host_pipeline(state.pipeline as This) else {
+            return Vec::new();
+        };
+        let mut wanted = Vec::new();
+        for stage in &hp.stages {
+            let hash = format!("{}", stage.shader.hash);
+            for (k, s) in specs.iter().enumerate() {
+                if !hash.starts_with(&s.hash) {
+                    continue;
+                }
+                for u in &stage.translated().used {
+                    if u.root == RootType::Table && u.slot == s.slot && u.table_offset_dwords == s.offset {
+                        wanted.push((k, *u));
+                    }
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        if let Some(p) = probe.as_mut()
+            && p.done
+            && frame > p.frame + 4
+        {
+            p.frame = frame;
+            p.recs.clear();
+            p.used = 0;
+            p.done = false;
+        }
+        if probe.is_none() {
+            let Some(host) = crate::host::host() else { return Vec::new() };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: BYTES,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut made: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            let ok = unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut made,
+                )
+            };
+            let (Ok(()), Some(buffer)) = (ok, made) else { return Vec::new() };
+            *probe = Some(Probe { buffer, frame, used: 0, recs: Vec::new(), done: false });
+        }
+        let Some(p) = probe.as_mut() else { return Vec::new() };
+        if p.done || p.frame != frame {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let text = state.op_text(String::new(), true);
+        for (k, u) in wanted {
+            let Some(Root::Table(table)) = state.roots_ref(true).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let handle = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(view) = crate::descriptor::view(handle) else { continue };
+            let Some((address, len)) = crate::descriptor::host::buffer_range(&view) else {
+                continue;
+            };
+            let Some(shadow) = crate::shadow::find(address, len.max(1)) else { continue };
+            let n = specs[k].bytes.min(len).min(shadow.left(address)) / 4 * 4;
+            if n == 0 || p.used + 2 * n > BYTES {
+                continue;
+            }
+            let at = p.used;
+            p.used += 2 * n;
+            list.keep(&p.buffer);
+            list.keep(&shadow.buffer);
+            copy(list, &p.buffer, at, &shadow.buffer, shadow.offset(address), n);
+            let title = crate::texture::committed(address as *const u8, n as usize).then(|| {
+                let mut bytes = vec![0u8; n as usize];
+                crate::host::read_into(address as *const u8, &mut bytes).then_some(bytes)
+            });
+            p.recs.push(Rec {
+                spec: k,
+                text: text.clone(),
+                address,
+                len: n,
+                at,
+                title: title.flatten(),
+                after: false,
+            });
+            out.push(p.recs.len() - 1);
+        }
+        out
+    }
+
+    /// After the dispatch: the same views' bytes again.
+    pub(crate) fn after(list: &HostList, recs: Vec<usize>) {
+        if recs.is_empty() {
+            return;
+        }
+        let mut probe = PROBE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(p) = probe.as_mut() else { return };
+        for r in recs {
+            let Some(rec) = p.recs.get_mut(r) else { continue };
+            let Some(shadow) = crate::shadow::find(rec.address, rec.len) else { continue };
+            copy(list, &p.buffer, rec.at + rec.len, &shadow.buffer, shadow.offset(rec.address), rec.len);
+            rec.after = true;
+        }
+    }
+
+    fn words(b: &[u8]) -> Vec<u32> {
+        b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    fn stats(w: &[u32]) -> String {
+        let ones = w.iter().filter(|&&x| x == u32::MAX).count();
+        let zeros = w.iter().filter(|&&x| x == 0).count();
+        let head: Vec<String> = w.iter().take(24).map(|x| format!("{x:x}")).collect();
+        format!("{} words, {ones} -1, {zeros} zero; head [{}]", w.len(), head.join(" "))
+    }
+
+    fn diff(a: &[u32], b: &[u32]) -> String {
+        let d: Vec<usize> = (0..a.len().min(b.len())).filter(|&i| a[i] != b[i]).collect();
+        let first: Vec<String> = d.iter().take(12).map(|&i| format!("[{i}] {:x}/{:x}", a[i], b[i])).collect();
+        format!("{} differ {}", d.len(), first.join(" "))
+    }
+
+    fn summarize(p: &Probe) {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: readback memory its copies wrote frames ago.
+        unsafe {
+            if p.buffer.Map(0, None, Some(&mut data)).is_err() {
+                return;
+            }
+        }
+        let specs = specs();
+        for (i, r) in p.recs.iter().enumerate() {
+            // SAFETY: inside the mapped buffer.
+            let gpu = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(r.at as usize), 2 * r.len as usize) };
+            let (before, after) = (words(&gpu[..r.len as usize]), words(&gpu[r.len as usize..]));
+            let s = &specs[r.spec];
+            // The bytes too, into the capture folder (before, after, title).
+            if let Some(dir) = crate::capture::folder() {
+                let mut bytes = gpu.to_vec();
+                if let Some(t) = &r.title {
+                    bytes.extend_from_slice(t);
+                }
+                let file = dir.join(format!(
+                    "view-{}-{i:03}-{}-{}+{}-{:x}.bin",
+                    p.frame, s.hash, s.slot, s.offset, r.address
+                ));
+                let _ = std::fs::write(file, bytes);
+            }
+            tracing::info!(
+                frame = p.frame,
+                "view probe #{i} {}:{}+{} at {:#x} ({} bytes){}",
+                s.hash, s.slot, s.offset, r.address, r.len, r.text
+            );
+            tracing::info!(frame = p.frame, "view probe #{i} gpu before: {}", stats(&before));
+            if r.after {
+                tracing::info!(
+                    frame = p.frame,
+                    "view probe #{i} gpu after: {}; vs before: {}",
+                    stats(&after),
+                    diff(&after, &before)
+                );
+            }
+            match &r.title {
+                Some(t) => {
+                    let t = words(t);
+                    tracing::info!(
+                        frame = p.frame,
+                        "view probe #{i} title at record: {}; gpu before vs title: {}",
+                        stats(&t),
+                        diff(&before, &t)
+                    );
+                }
+                None => tracing::info!(frame = p.frame, "view probe #{i} title memory not committed"),
+            }
+        }
+        // SAFETY: mapped above.
+        unsafe { p.buffer.Unmap(0, None) };
+    }
 }
