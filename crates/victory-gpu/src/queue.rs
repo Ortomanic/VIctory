@@ -463,6 +463,7 @@ fn compose(planes: &[Plane; 2], frame: u64) -> bool {
                     .placement()
                     .filter(|&p| sensible_placement(p))
                     .unwrap_or([0.0, 0.0, 1.0, 1.0]),
+                mode: 0,
             }
         })
         .collect();

@@ -23,7 +23,7 @@ use crate::host::{host, transition};
 /// A fullscreen triangle whose texture coordinates span the source
 /// rectangle over the viewport (the plane's place on the screen).
 const SOURCE: &str = r#"
-cbuffer Source : register(b0) { float2 origin; float2 extent; };
+cbuffer Source : register(b0) { float2 origin; float2 extent; uint mode; };
 Texture2D<float4> plane : register(t0);
 SamplerState linear_clamp : register(s0);
 struct Vertex { float4 position : SV_Position; float2 uv : TEXCOORD0; };
@@ -34,7 +34,17 @@ Vertex vs(uint id : SV_VertexID) {
     v.uv = origin + corner * extent;
     return v;
 }
-float4 ps(Vertex v) : SV_Target { return plane.SampleLevel(linear_clamp, v.uv, 0); }
+// mode (crate::debug_view::Mode): 0 as it is, 1 signed [-1, 1] to [0, 1],
+// 2 reversed-Z depth (1 near, 0 far or sky) on a log scale, brighter nearer.
+float4 ps(Vertex v) : SV_Target {
+    float4 c = plane.SampleLevel(linear_clamp, v.uv, 0);
+    if (mode == 1) return float4(c.rgb * 0.5 + 0.5, 1);
+    if (mode == 2) {
+        float g = c.r > 0 ? saturate(1 + log2(c.r) / 16) : 0;
+        return float4(g, g, g, 1);
+    }
+    return c;
+}
 "#;
 
 /// The back buffer format composition draws into.
@@ -52,6 +62,8 @@ pub(crate) struct Layer<'a> {
     /// Where it is shown, as fractions of the screen: left, top, right,
     /// bottom.
     pub(crate) destination: [f32; 4],
+    /// How it is coloured: 0 as it is (see [`crate::debug_view::Mode`]).
+    pub(crate) mode: u32,
 }
 
 /// The format to sample a plane in, given the title's format for it: its
@@ -166,9 +178,9 @@ fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
     }
 }
 
-/// Four constants (the source rectangle's origin and extent in texture
-/// coordinates) for the vertex shader, one texture for the pixel shader and
-/// a linear clamping sampler.
+/// Five constants (the source rectangle's origin and extent in texture
+/// coordinates for the vertex shader, the colouring mode for the pixel
+/// shader), one texture for the pixel shader and a linear clamping sampler.
 fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
     let range = D3D12_DESCRIPTOR_RANGE {
         RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
@@ -184,10 +196,10 @@ fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSign
                 Constants: D3D12_ROOT_CONSTANTS {
                     ShaderRegister: 0,
                     RegisterSpace: 0,
-                    Num32BitValues: 4,
+                    Num32BitValues: 5,
                 },
             },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         },
         D3D12_ROOT_PARAMETER {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
@@ -428,10 +440,11 @@ impl Composer {
                 let (tw, th) = (desc.Width as f32, desc.Height as f32);
                 let [left, top, right, bottom] = l.source.map(|v| v as f32);
                 let constants = [
-                    left / tw,
-                    top / th,
-                    (right - left) / tw,
-                    (bottom - top) / th,
+                    (left / tw).to_bits(),
+                    (top / th).to_bits(),
+                    ((right - left) / tw).to_bits(),
+                    ((bottom - top) / th).to_bits(),
+                    l.mode,
                 ];
                 let [dl, dt, dr, db] = l.destination;
                 let (w, h) = (width as f32, height as f32);
@@ -450,7 +463,7 @@ impl Composer {
                     bottom: (db * h).round() as i32,
                 }]);
                 list.SetPipelineState(if i == 0 { &p.opaque } else { &p.overlay });
-                list.SetGraphicsRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                list.SetGraphicsRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
                 list.SetGraphicsRootDescriptorTable(
                     1,
                     D3D12_GPU_DESCRIPTOR_HANDLE {
@@ -482,6 +495,14 @@ mod tests {
 
     /// An 8x4 render target and its view.
     fn target(device: &ID3D12Device) -> (ID3D12Resource, ID3D12DescriptorHeap) {
+        target_in(device, OUTPUT)
+    }
+
+    /// An 8x4 render target in `format` and its view.
+    fn target_in(
+        device: &ID3D12Device,
+        format: DXGI_FORMAT,
+    ) -> (ID3D12Resource, ID3D12DescriptorHeap) {
         // SAFETY: plain object creation.
         unsafe {
             let mut texture: Option<ID3D12Resource> = None;
@@ -498,7 +519,7 @@ mod tests {
                         Height: 4,
                         DepthOrArraySize: 1,
                         MipLevels: 1,
-                        Format: OUTPUT,
+                        Format: format,
                         SampleDesc: DXGI_SAMPLE_DESC {
                             Count: 1,
                             Quality: 0,
@@ -559,6 +580,7 @@ mod tests {
                     format: OUTPUT,
                     source: [0, 0, 8, 4],
                     destination: [0.0, 0.0, 1.0, 1.0],
+                    mode: 0,
                 },
                 Layer {
                     texture: &planes[1].0,
@@ -566,6 +588,7 @@ mod tests {
                     format: OUTPUT,
                     source: [0, 0, 8, 4],
                     destination: [0.0, 0.0, 0.5, 1.0],
+                    mode: 0,
                 },
             ];
             composer.record(device, l, &back, (8, 4), &layers);
@@ -656,6 +679,129 @@ mod tests {
                 }
             }
             buffer.Unmap(0, None);
+        }
+    }
+
+    /// The debug view's colourings ([`crate::debug_view::Mode`]): as it is,
+    /// signed to unsigned, reversed-Z depth on a log scale; each source a
+    /// half-float texture drawn over its own 8x4 back buffer.
+    #[test]
+    fn debug_view_modes_color_their_source() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let device = &host.device;
+        // (mode, source value, expected output)
+        let cases: [(u32, [f32; 4], [u8; 3]); 4] = [
+            (0, [0.25, 0.5, 1.0, 1.0], [64, 128, 255]),
+            (1, [-1.0, 0.0, 1.0, 1.0], [0, 128, 255]),
+            // 1 + log2(0.25) / 16 = 0.875
+            (2, [0.25, 0.0, 0.0, 1.0], [223, 223, 223]),
+            // sky (0) is black
+            (2, [0.0, 0.0, 0.0, 0.0], [0, 0, 0]),
+        ];
+        let half = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let sources: Vec<_> = cases.iter().map(|_| target_in(device, half)).collect();
+        let backs: Vec<_> = cases.iter().map(|_| target(device)).collect();
+        let composer = Composer::new(device).unwrap();
+        let mut reads = Vec::new();
+        for (((mode, value, _), (source, heap)), (back, _)) in
+            cases.iter().zip(&sources).zip(&backs)
+        {
+            let list = host.new_list().unwrap();
+            let l = &list.list;
+            // SAFETY: an open list and live textures; the readback buffer
+            // is mapped after the list ran.
+            unsafe {
+                l.ClearRenderTargetView(heap.GetCPUDescriptorHandleForHeapStart(), value, None);
+                let layers = [Layer {
+                    texture: source,
+                    state: D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+                    format: half,
+                    source: [0, 0, 8, 4],
+                    destination: [0.0, 0.0, 1.0, 1.0],
+                    mode: *mode,
+                }];
+                composer.record(device, l, back, (8, 4), &layers);
+                let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                let mut total = 0;
+                device.GetCopyableFootprints(
+                    &back.GetDesc(),
+                    0,
+                    1,
+                    0,
+                    Some(&mut footprint),
+                    None,
+                    None,
+                    Some(&mut total),
+                );
+                let mut buffer: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_READBACK,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: total,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut buffer,
+                    )
+                    .unwrap();
+                let buffer = buffer.unwrap();
+                l.ResourceBarrier(&[transition(
+                    back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyTextureRegion(
+                    &D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&buffer),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: footprint,
+                        },
+                    },
+                    0,
+                    0,
+                    0,
+                    &D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(back),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: 0,
+                        },
+                    },
+                    None,
+                );
+                list.close();
+                host.execute(&[&list]);
+                let mut data = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut data)).unwrap();
+                let pitch = footprint.Footprint.RowPitch as usize;
+                let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * 4);
+                reads.push(<[u8; 3]>::try_from(&rows[2 * pitch + 3 * 4..][..3]).unwrap());
+                buffer.Unmap(0, None);
+            }
+        }
+        for ((mode, value, want), got) in cases.iter().zip(reads) {
+            assert!(
+                got.iter().zip(want).all(|(&g, &w)| g.abs_diff(w) <= 1),
+                "mode {mode} of {value:?}: {got:?}, not {want:?}"
+            );
         }
     }
 
